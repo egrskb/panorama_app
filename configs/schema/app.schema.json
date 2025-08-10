@@ -1,0 +1,109 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "app": {
+      "type": "object",
+      "properties": {
+        "org": {"type": "string"},
+        "name": {"type": "string"},
+        "version": {"type": "string"}
+      },
+      "required": ["org", "name", "version"]
+    },
+    "sdr": {
+      "type": "object",
+      "properties": {
+        "method": {"type": "string"},
+        "device_serials": {
+          "type": "object",
+          "properties": {
+            "master": {"type": "string"},
+            "slave1": {"type": "string"},
+            "slave2": {"type": "string"}
+          },
+          "required": ["master", "slave1", "slave2"]
+        },
+        "params": {
+          "type": "object",
+          "properties": {
+            "f_start_mhz": {"type": "number"},
+            "f_stop_mhz": {"type": "number"},
+            "bin_hz": {"type": "number"},
+            "lna_db": {"type": "number"},
+            "vga_db": {"type": "number"}
+          },
+          "required": ["f_start_mhz", "f_stop_mhz", "bin_hz", "lna_db", "vga_db"]
+        }
+      },
+      "required": ["method", "device_serials", "params"]
+    },
+    "visual": {
+      "type": "object",
+      "properties": {
+        "colormap": {"type": "string"},
+        "level_min_dbm": {"type": "number"},
+        "level_max_dbm": {"type": "number"},
+        "smooth": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "window": {"type": "integer"}
+          },
+          "required": ["enabled", "window"]
+        },
+        "persistence": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "decay": {"type": "number"}
+          },
+          "required": ["enabled", "decay"]
+        },
+        "wf_rows": {"type": "integer"}
+      },
+      "required": ["colormap", "level_min_dbm", "level_max_dbm", "smooth", "persistence", "wf_rows"]
+    },
+    "peaks": {
+      "type": "object",
+      "properties": {
+        "threshold_dbm": {"type": "number"},
+        "min_separation_khz": {"type": "number"}
+      },
+      "required": ["threshold_dbm", "min_separation_khz"]
+    },
+    "roi_ranges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "start_mhz": {"type": "number"},
+          "stop_mhz": {"type": "number"}
+        },
+        "required": ["start_mhz", "stop_mhz"]
+      }
+    },
+    "map": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"}
+      },
+      "required": ["enabled"]
+    },
+    "ui": {
+      "type": "object",
+      "properties": {
+        "window": {
+          "type": "object",
+          "properties": {
+            "width": {"type": "integer"},
+            "height": {"type": "integer"}
+          },
+          "required": ["width", "height"]
+        }
+      },
+      "required": ["window"]
+    }
+  },
+  "required": ["app", "sdr", "visual", "peaks", "roi_ranges", "map", "ui"]
+}

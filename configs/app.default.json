@@ -1,0 +1,18 @@
+{
+  "app": { "org": "PANORAMA", "name": "PANORAMA", "version": "0.1" },
+  "sdr": {
+    "method": "hackrf_sweep",
+    "device_serials": { "master": "(auto)", "slave1": "(auto)", "slave2": "(auto)" },
+    "params": { "f_start_mhz": 50.0, "f_stop_mhz": 6000.0, "bin_hz": 2000000, "lna_db": 24, "vga_db": 20 }
+  },
+  "visual": {
+    "colormap": "qsa", "level_min_dbm": -110.0, "level_max_dbm": -20.0,
+    "smooth": { "enabled": false, "window": 5 },
+    "persistence": { "enabled": false, "decay": 0.01 },
+    "wf_rows": 600
+  },
+  "peaks": { "threshold_dbm": -80.0, "min_separation_khz": 30.0 },
+  "roi_ranges": [ { "start_mhz": 2400.0, "stop_mhz": 2483.5 } ],
+  "map": { "enabled": true },
+  "ui":  { "window": { "width": 1380, "height": 860 } }
+}
