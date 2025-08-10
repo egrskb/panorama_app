@@ -20,7 +20,18 @@ def _load_qsettings() -> Dict[str, Any]:
     settings = QtCore.QSettings("PANORAMA", "PANORAMA")
     data: Dict[str, Any] = {}
     for key in settings.allKeys():
-        data[key] = settings.value(key)
+        val = settings.value(key)
+        if isinstance(val, QtCore.QByteArray):
+            try:
+                val = bytes(val).decode("utf-8", "ignore")
+            except Exception:
+                val = list(bytes(val))
+        else:
+            try:
+                json.dumps(val)
+            except TypeError:
+                val = str(val)
+        data[key] = val
     return data
 
 
