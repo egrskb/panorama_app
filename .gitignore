@@ -1,0 +1,33 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# --- Virtualenv ---
+.venv/
+env/
+venv/
+ENV/
+
+# --- Build artifacts ---
+*.so
+*.dll
+*.dylib
+*.o
+*.a
+
+# --- Specific to project ---
+libhackrf_qsa.so
+
+# --- Editor / OS files ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Logs / temp ---
+*.log
+*.tmp
+*.bak
+*.swp
