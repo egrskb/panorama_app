@@ -4,12 +4,15 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable
 
+import logging
 from PyQt5 import QtCore
 
 APP_DIR = {
     "win32": Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "PANORAMA",
 }.get(sys.platform, Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "PANORAMA")
 USER_PATH = APP_DIR / "user.json"
+
+LOGGER = logging.getLogger("panorama")
 
 
 def _ensure_dir():
@@ -36,11 +39,27 @@ def _load_qsettings() -> Dict[str, Any]:
 
 
 def load_user() -> Dict[str, Any]:
-    """Load user state from JSON, migrating from QSettings if needed."""
+    """Load user state from JSON, migrating from QSettings if needed.
+
+    Any JSON parsing problems result in the corrupted file being renamed to
+    ``user.json.bak`` and an empty state returned (with a best-effort
+    migration from legacy QSettings).
+    """
+
     _ensure_dir()
     if USER_PATH.exists():
-        with USER_PATH.open("r", encoding="utf-8") as fh:
-            return json.load(fh)
+        try:
+            with USER_PATH.open("r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except json.JSONDecodeError as exc:
+            LOGGER.warning("corrupted user.json: %s", exc)
+            try:
+                backup = USER_PATH.with_name(USER_PATH.name + ".bak")
+                USER_PATH.replace(backup)
+            except OSError:
+                pass
+        except Exception as exc:
+            LOGGER.warning("failed to read user.json: %s", exc)
     data = _load_qsettings()
     save_user(data)
     return data

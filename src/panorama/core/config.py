@@ -3,6 +3,8 @@ import logging
 from pathlib import Path
 from copy import deepcopy
 
+from .settings_store import USER_PATH
+
 LOGGER = logging.getLogger("panorama")
 
 CONFIG_DIR = Path(__file__).resolve().parents[3] / "configs"
@@ -20,10 +22,19 @@ def load_default() -> dict:
 
 
 def load_user_override() -> dict:
-    user_path = Path.home() / ".config" / "PANORAMA" / "user.json"
-    if user_path.exists():
-        with user_path.open("r", encoding="utf-8") as fh:
-            return json.load(fh)
+    if USER_PATH.exists():
+        try:
+            with USER_PATH.open("r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except json.JSONDecodeError as exc:
+            LOGGER.warning("invalid user.json: %s", exc)
+            try:
+                backup = USER_PATH.with_name(USER_PATH.name + ".bak")
+                USER_PATH.replace(backup)
+            except OSError:
+                pass
+        except OSError as exc:
+            LOGGER.warning("cannot read user.json: %s", exc)
     return {}
 
 
