@@ -9,7 +9,13 @@ description = "PANORAMA spectrum analyzer"
 authors = [{name = "PANORAMA"}]
 readme = "README.md"
 requires-python = ">=3.8"
-dependencies = []
+dependencies = [
+    "numpy>=1.24",
+    "PyQt5>=5.15.9",
+    "pyqtgraph>=0.13.3",
+    "cffi>=1.15",
+    "jsonschema>=4.17",
+]
 
 [project.scripts]
 panorama = "panorama.app:main"

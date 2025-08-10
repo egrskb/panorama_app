@@ -12,7 +12,10 @@ pip install -e .
 ## Запуск
 
 ```bash
+# через установленный консольный скрипт
 panorama
+# или напрямую модуль
+python -m panorama
 ```
 
 Приложение загружает настройки из `configs/app.default.json` и
