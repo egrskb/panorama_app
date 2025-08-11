@@ -17,10 +17,6 @@ ENV/
 *.o
 *.a
 
-# build outputs
-build/
-dist/
-
 # --- Specific to project ---
 libhackrf_qsa.so
 

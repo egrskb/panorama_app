@@ -1,1 +1,3 @@
-gcc -O2 -fPIC -shared hq_sweep.c -o libhackrf_qsa.so -lhackrf -lfftw3f -lpthread
+gcc -O2 -fPIC -shared hq_sweep.c -o libhackrf_qsa.so \
+  -I/usr/include/libhackrf \
+  -lhackrf -lfftw3f -lm
