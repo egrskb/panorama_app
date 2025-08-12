@@ -1,0 +1,42 @@
+[project]
+name = "panorama"
+version = "0.1.0"
+description = "HackRF sweep analyzer: spectrum, waterfall, map, peaks"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "PyQt5",
+  "pyqtgraph",
+  "numpy",
+  "matplotlib",
+  "cffi",
+]
+
+# CLI/GUI ярлыки после установки:
+[project.scripts]
+panorama-calibrate = "panorama.cli.calibrate:main"
+
+[project.gui-scripts]
+panorama = "panorama.main:main"
+
+[project.optional-dependencies]
+dev = ["pytest", "black", "isort", "mypy"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel", "cffi"]
+build-backend = "setuptools.build_meta"
+
+# какие пакеты собирать
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["panorama*"]
+
+# включаем статические ресурсы/данные (если есть)
+[tool.setuptools.package-data]
+"panorama" = [
+  "docs/**",
+  "features/**/assets/*",
+  "drivers/hackrf_lib/native/*",
+  "data/**",
+  "configs/*.yaml",
+]
