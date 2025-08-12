@@ -1,1 +1,1 @@
-from .backend import HackRFLibSource
+from .backend import HackRFLibSource# re-export для удобного импорта
