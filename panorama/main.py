@@ -6,6 +6,18 @@ from panorama.features.spectrum import SpectrumView
 from panorama.features.peaks import PeaksWidget
 from panorama.features.devices import DeviceDialog
 
+# Карта: если вдруг импорта нет — ставим заглушку, чтобы окно запускалось
+try:
+    from panorama.features.map3d.view import MapView
+except Exception:
+    class MapView(QtWidgets.QWidget):  # type: ignore
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            v = QtWidgets.QVBoxLayout(self)
+            lbl = QtWidgets.QLabel("Карта (модуль не найден)")
+            lbl.setAlignment(QtCore.Qt.AlignCenter)
+            v.addStretch(1); v.addWidget(lbl); v.addStretch(1)
+
 from panorama.drivers.hackrf_sweep import HackRFSweepSource
 try:
     from panorama.drivers.hackrf_lib import HackRFLibSource  # CFFI
@@ -41,7 +53,8 @@ class LogDock(QtWidgets.QDockWidget):
     def __init__(self, parent=None):
         super().__init__("Лог", parent)
         self.setObjectName("LogDock")
-        self.setFeatures(QtWidgets.QDockWidget.NoDockWidgetFeatures)  # нельзя открепить/закрыть/переместить
+        # нельзя открепить, переместить или закрыть
+        self.setFeatures(QtWidgets.QDockWidget.NoDockWidgetFeatures)
         self.view = QtWidgets.QPlainTextEdit()
         self.view.setReadOnly(True)
         self.setWidget(self.view)
@@ -58,7 +71,7 @@ class DetectorPlaceholder(QtWidgets.QWidget):
         v.addWidget(QtWidgets.QLabel(
             "Детекция (заглушка)\n\n"
             "Здесь будет ядро детектора, таблица событий и оверлеи.\n"
-            "API предусмотрим позже: detector.push(freqs_hz, row_dbm)."
+            "API: detector.push(freqs_hz, row_dbm)."
         ))
         v.addStretch(1)
 
@@ -96,7 +109,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spectrum_tab.set_source(self._source)
         self._wire_source(self._source)
 
-        # Пики / Детекция (заглушка)
+        # Пики / Карта / Детекция
+        self.map_tab = MapView()
         self.peaks_tab = PeaksWidget()
         self.detector_tab = DetectorPlaceholder()
 
@@ -106,6 +120,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Вкладки
         self.tabs.addTab(self.spectrum_tab, "Спектр")
+        self.tabs.addTab(self.map_tab, "Карта")
         self.tabs.addTab(self.peaks_tab, "Пики")
         self.tabs.addTab(self.detector_tab, "Детекция")
 
@@ -121,7 +136,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Состояние окна + настройки спектра
         self._restore_window_state()
-        self.spectrum_tab.restore_settings(self.settings, merged_defaults())
+        if hasattr(self.spectrum_tab, "restore_settings"):
+            self.spectrum_tab.restore_settings(self.settings, merged_defaults())
 
     # ---------------- внутреннее ----------------
     def _wire_source(self, src):
@@ -208,8 +224,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "ПАНОРАМА 0.1 бета\n"
             "HackRF Sweep Analyzer (модульная версия)\n\n"
             "Источник: hackrf_sweep / libhackrf (CFFI)\n"
-            "Спектр + водопад, маркеры, экспорт CSV/PNG."
+            "Спектр + водопад, карта, пики, маркеры, экспорт CSV/PNG."
         )
+
     # ---------------- действия ----------------
     def _toggle_start_stop(self):
         try:
@@ -291,7 +308,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._lib_available or not self._lib_source:
             QtWidgets.QMessageBox.information(self, "Калибровка", "libhackrf (CFFI) недоступен.")
             return
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Файл калибровки CSV", "", "CSV files (*.csv);;All files (*)")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Файл калибровки CSV", "", "CSV files (*.csv);;All files (*)"
+        )
         if not path:
             return
         ok = self._lib_source.load_calibration(path)
@@ -323,9 +342,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._source.stop()
         except Exception:
             pass
-        # сохранить настройки виджета спектра
         try:
-            self.spectrum_tab.save_settings(self.settings)
+            if hasattr(self.spectrum_tab, "save_settings"):
+                self.spectrum_tab.save_settings(self.settings)
         except Exception:
             pass
         self._save_window_state()
