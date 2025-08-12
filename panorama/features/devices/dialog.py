@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Optional, Callable, List
-from PyQt5 import QtWidgets
+from PyQt5 import QtWidgets, QtCore
 
 class DeviceDialog(QtWidgets.QDialog):
     """
@@ -45,9 +45,12 @@ class DeviceDialog(QtWidgets.QDialog):
         bottom.addWidget(btns)
         lay.addLayout(bottom)
 
-        # выделим текущий при наличии
+        # выделим текущий при наличии (PyQt5: Match* без MatchFlag)
         if current:
-            items = self.list.findItems(current, QtCore.Qt.MatchFlag.MatchEndsWith | QtCore.Qt.MatchFlag.MatchCaseSensitive)  # type: ignore
+            items = self.list.findItems(
+                current,
+                QtCore.Qt.MatchEndsWith | QtCore.Qt.MatchCaseSensitive
+            )
             if items:
                 self.list.setCurrentItem(items[0])
 
@@ -73,5 +76,4 @@ class DeviceDialog(QtWidgets.QDialog):
         self.list.clear()
         self.list.addItems(serials)
 
-# экспортируем символ явно (на всякий случай)
 __all__ = ["DeviceDialog"]
