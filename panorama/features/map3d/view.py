@@ -37,7 +37,21 @@ class MapView(QtWidgets.QWidget):
         # Цели
         self.targets: List[Target] = []
         self._target_id_seq = 0
-        
+
+
+        targets_group = QtWidgets.QGroupBox("Обнаруженные цели")
+        targets_layout = QtWidgets.QVBoxLayout(targets_group)
+
+        self.targets_table = QtWidgets.QTableWidget(0, 4)
+        self.targets_table.setHorizontalHeaderLabels(["ID", "Позиция", "Частота", "Уровень"])
+        self.targets_table.setMaximumHeight(200)
+        targets_layout.addWidget(self.targets_table)
+
+        self.btn_clear = QtWidgets.QPushButton("Очистить цели")
+        self.btn_export = QtWidgets.QPushButton("Экспорт KML")
+        targets_layout.addWidget(self.btn_clear)
+        targets_layout.addWidget(self.btn_export)
+
         # Настройки отображения
         self.grid_size = 50.0  # метров
         self.show_grid = True
