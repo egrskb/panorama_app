@@ -13,4 +13,4 @@ if [ -d "venv" ]; then
 fi
 
 # Запускаем приложение
-python -m panorama.main "$@"
+python3 -m panorama.main "$@"
