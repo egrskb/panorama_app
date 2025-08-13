@@ -48,7 +48,7 @@ class DetectorWidget(QtWidgets.QWidget):
         v = QtWidgets.QVBoxLayout(self)
         
         # Пресеты диапазонов
-        grp_presets = QtWidgets.QGroupBox("ROI-пресеты")
+        grp_presets = QtWidgets.QGroupBox("Пресеты")
         grid = QtWidgets.QGridLayout(grp_presets)
         
         preset_rows = [
