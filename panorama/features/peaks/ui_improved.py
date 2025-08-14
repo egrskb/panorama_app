@@ -36,10 +36,10 @@ class AdaptivePeaksWidget(QtWidgets.QWidget):
         self.threshold_mode.addItems(["Адаптивный (baseline + N)", "Фиксированный порог"])
         self.threshold_mode.currentTextChanged.connect(self._on_threshold_mode_changed)
         
-        # Адаптивный порог
+        # Адаптивный порог (по умолчанию +20 дБ)
         self.adaptive_offset = QtWidgets.QDoubleSpinBox()
         self.adaptive_offset.setRange(3, 50)
-        self.adaptive_offset.setValue(10)
+        self.adaptive_offset.setValue(20)  # Изменено на 20 дБ
         self.adaptive_offset.setSuffix(" дБ над шумом")
         self.adaptive_offset.setToolTip("Порог = baseline + это значение")
         

@@ -173,6 +173,44 @@ class DetectorWidget(QtWidgets.QWidget):
         left_widget.setLayout(left_panel)
         left_widget.setMaximumWidth(400)
         
+        # Ручной ввод диапазона
+        grp_manual = QtWidgets.QGroupBox("Ручной ввод диапазона")
+        manual_layout = QtWidgets.QHBoxLayout(grp_manual)
+        
+        self.manual_start = QtWidgets.QDoubleSpinBox()
+        self.manual_start.setRange(0, 7000)
+        self.manual_start.setDecimals(3)
+        self.manual_start.setValue(433.0)
+        self.manual_start.setSuffix(" МГц")
+        
+        self.manual_stop = QtWidgets.QDoubleSpinBox()
+        self.manual_stop.setRange(0, 7000)
+        self.manual_stop.setDecimals(3)
+        self.manual_stop.setValue(435.0)
+        self.manual_stop.setSuffix(" МГц")
+        
+        self.manual_name = QtWidgets.QLineEdit()
+        self.manual_name.setPlaceholderText("Название диапазона")
+        
+        self.btn_add_manual = QtWidgets.QPushButton("+ Добавить")
+        self.btn_add_manual.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 6px;
+            }
+        """)
+        
+        manual_layout.addWidget(QtWidgets.QLabel("От:"))
+        manual_layout.addWidget(self.manual_start)
+        manual_layout.addWidget(QtWidgets.QLabel("До:"))
+        manual_layout.addWidget(self.manual_stop)
+        manual_layout.addWidget(self.manual_name)
+        manual_layout.addWidget(self.btn_add_manual)
+        
+        left_panel.addWidget(grp_manual)
+        
         # Пресеты диапазонов
         grp_presets = QtWidgets.QGroupBox("Быстрые пресеты ROI")
         preset_layout = QtWidgets.QGridLayout(grp_presets)
@@ -226,10 +264,10 @@ class DetectorWidget(QtWidgets.QWidget):
         self.threshold_mode.addItems(["Авто (baseline + N)", "Ручной порог"])
         self.threshold_mode.currentTextChanged.connect(self._on_threshold_mode_changed)
         
-        # Offset для авто-порога
+        # Offset для авто-порога (по умолчанию +20 дБ)
         self.threshold_offset = QtWidgets.QDoubleSpinBox()
         self.threshold_offset.setRange(3, 50)
-        self.threshold_offset.setValue(15)
+        self.threshold_offset.setValue(20)  # Изменено с 15 на 20
         self.threshold_offset.setSuffix(" дБ над шумом")
         self.threshold_offset.setToolTip("Порог = baseline + это значение")
         
@@ -416,6 +454,7 @@ class DetectorWidget(QtWidgets.QWidget):
         # Подключение сигналов
         self.btn_start.clicked.connect(self._start_detection)
         self.btn_stop.clicked.connect(self._stop_detection)
+        self.btn_add_manual.clicked.connect(self._add_manual_range)
         self.btn_add_current.clicked.connect(self._add_current_range)
         self.btn_delete_roi.clicked.connect(self._delete_selected_roi)
         self.btn_clear_roi.clicked.connect(self._clear_all_roi)
@@ -462,6 +501,29 @@ class DetectorWidget(QtWidgets.QWidget):
         self._state.regions.append(roi)
         self._update_roi_table()
         self.rangeSelected.emit(start_mhz, stop_mhz)
+
+    def _add_manual_range(self):
+        """Добавление диапазона из ручного ввода."""
+        start = self.manual_start.value()
+        stop = self.manual_stop.value()
+        
+        if start >= stop:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Начальная частота должна быть меньше конечной!")
+            return
+        
+        name = self.manual_name.text().strip()
+        if not name:
+            name = f"Диапазон {start:.1f}-{stop:.1f} МГц"
+        
+        self._add_roi(start, stop, name)
+        
+        # Очищаем поле названия
+        self.manual_name.clear()
+        
+        # Смещаем диапазон для следующего ввода
+        width = stop - start
+        self.manual_start.setValue(stop)
+        self.manual_stop.setValue(stop + width)
 
     def _add_current_range(self):
         """Добавление текущего диапазона из спектра."""

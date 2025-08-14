@@ -4,11 +4,11 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import QSettings
 
 from panorama.features.spectrum import SpectrumView
-from panorama.features.peaks.ui_improved import AdaptivePeaksWidget  # Новый модуль пиков
-from panorama.features.detector.widget import DetectorWidget  # Улучшенный детектор
-from panorama.features.devices.manager import DeviceManager, DeviceConfigDialog  # Новый менеджер
+from panorama.features.peaks.ui_improved import AdaptivePeaksWidget
+from panorama.features.detector.widget import DetectorWidget
+from panorama.features.devices.manager import DeviceManager, DeviceConfigDialog
 from panorama.features.map3d import MapView
-from panorama.features.trilateration.engine import TrilaterationEngine, SignalMeasurement  # Новый движок
+from panorama.features.trilateration.engine import TrilaterationEngine, SignalMeasurement
 
 from panorama.drivers.hackrf_sweep import HackRFSweepSource
 from panorama.shared.calibration import load_calibration_csv, get_calibration_lut
@@ -17,7 +17,7 @@ try:
     from panorama.drivers.hackrf_lib import HackRFLibSource
     _LIB_AVAILABLE = True
 except Exception:
-    HackRFLibSource = None  # type: ignore
+    HackRFLibSource = None
     _LIB_AVAILABLE = False
 
 from panorama.shared import write_row_csv, setup_logging, merged_defaults
@@ -60,7 +60,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(APP_TITLE)
         self.resize(1600, 950)
         
-        # Применяем темную тему
+        # Применяем улучшенную темную тему
         self._apply_dark_theme()
 
         # --- центральные вкладки ---
@@ -73,6 +73,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Источники
         self._sweep_source = HackRFSweepSource()
         self._lib_source = None
+        self._current_source_type = "sweep"
         
         if _LIB_AVAILABLE:
             try:
@@ -90,17 +91,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Остальные вкладки
         self.map_tab = MapView()
-        self.peaks_tab = AdaptivePeaksWidget()  # Новый виджет пиков
-        self.detector_tab = DetectorWidget()  # Улучшенный детектор
+        self.peaks_tab = AdaptivePeaksWidget()
+        self.detector_tab = DetectorWidget()
 
         # Провязка сигналов
         self._connect_signals()
 
-        # Добавляем вкладки
-        self.tabs.addTab(self.spectrum_tab, "📊 Спектр")
-        self.tabs.addTab(self.peaks_tab, "📍 Пики")
-        self.tabs.addTab(self.detector_tab, "🎯 Детектор")
-        self.tabs.addTab(self.map_tab, "🗺️ Карта")
+        # Добавляем вкладки (без эмодзи для совместимости)
+        self.tabs.addTab(self.spectrum_tab, "Спектр")
+        self.tabs.addTab(self.peaks_tab, "Пики")
+        self.tabs.addTab(self.detector_tab, "Детектор")
+        self.tabs.addTab(self.map_tab, "Карта")
+        
+        # Отключаем вкладки, требующие libhackrf, если используется hackrf_sweep
+        self._update_tabs_availability()
 
         # Меню и статусбар
         self._build_menu()
@@ -118,94 +122,363 @@ class MainWindow(QtWidgets.QMainWindow):
         self._try_load_default_calibration()
 
     def _apply_dark_theme(self):
-        """Применяет темную тему к приложению."""
+        """Применяет улучшенную темную тему с хорошей читаемостью."""
         dark_stylesheet = """
+        /* Основные элементы */
         QMainWindow {
             background-color: #2b2b2b;
+            color: #e0e0e0;
         }
-        QTabWidget::pane {
+        
+        QWidget {
             background-color: #2b2b2b;
-            border: 1px solid #444;
+            color: #e0e0e0;
         }
+        
+        /* Вкладки */
+        QTabWidget::pane {
+            background-color: #353535;
+            border: 1px solid #555;
+        }
+        
         QTabBar::tab {
-            background-color: #3c3c3c;
-            color: #ccc;
+            background-color: #404040;
+            color: #e0e0e0;
             padding: 8px 16px;
             margin-right: 2px;
+            border: 1px solid #555;
+            border-bottom: none;
         }
+        
         QTabBar::tab:selected {
-            background-color: #4a4a4a;
+            background-color: #4a90e2;
             color: white;
         }
+        
+        QTabBar::tab:hover {
+            background-color: #505050;
+        }
+        
+        /* Группы */
         QGroupBox {
-            color: #ccc;
-            border: 1px solid #555;
-            border-radius: 4px;
+            color: #e0e0e0;
+            border: 2px solid #555;
+            border-radius: 5px;
             margin-top: 10px;
             padding-top: 10px;
+            font-weight: bold;
         }
+        
         QGroupBox::title {
             subcontrol-origin: margin;
             left: 10px;
             padding: 0 5px 0 5px;
-        }
-        QPushButton {
-            background-color: #3c3c3c;
-            color: #ccc;
-            border: 1px solid #555;
-            padding: 6px;
-            border-radius: 4px;
-        }
-        QPushButton:hover {
-            background-color: #4a4a4a;
-        }
-        QPushButton:pressed {
-            background-color: #555;
-        }
-        QTableWidget {
             background-color: #2b2b2b;
-            color: #ccc;
-            gridline-color: #444;
-            selection-background-color: #4a4a4a;
         }
-        QHeaderView::section {
-            background-color: #3c3c3c;
-            color: #ccc;
-            padding: 4px;
+        
+        /* Кнопки */
+        QPushButton {
+            background-color: #404040;
+            color: #e0e0e0;
+            border: 1px solid #555;
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        
+        QPushButton:hover {
+            background-color: #4a90e2;
+            border: 1px solid #5aa0f2;
+        }
+        
+        QPushButton:pressed {
+            background-color: #3a80d2;
+        }
+        
+        QPushButton:disabled {
+            background-color: #2b2b2b;
+            color: #666;
             border: 1px solid #444;
         }
-        QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
-            background-color: #3c3c3c;
-            color: #ccc;
+        
+        /* Таблицы */
+        QTableWidget {
+            background-color: #353535;
+            color: #e0e0e0;
+            gridline-color: #555;
+            selection-background-color: #4a90e2;
+            border: 1px solid #555;
+        }
+        
+        QTableWidget::item {
+            padding: 4px;
+            border: none;
+        }
+        
+        QTableWidget::item:selected {
+            background-color: #4a90e2;
+            color: white;
+        }
+        
+        QHeaderView::section {
+            background-color: #404040;
+            color: #e0e0e0;
+            padding: 6px;
+            border: 1px solid #555;
+            font-weight: bold;
+        }
+        
+        /* Поля ввода */
+        QLineEdit, QTextEdit, QPlainTextEdit {
+            background-color: #404040;
+            color: #e0e0e0;
             border: 1px solid #555;
             padding: 4px;
-            border-radius: 2px;
+            border-radius: 3px;
+            selection-background-color: #4a90e2;
         }
-        QLabel {
-            color: #ccc;
+        
+        QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {
+            border: 1px solid #4a90e2;
         }
-        QCheckBox {
-            color: #ccc;
+        
+        /* Комбобоксы и спинбоксы */
+        QComboBox, QSpinBox, QDoubleSpinBox {
+            background-color: #404040;
+            color: #e0e0e0;
+            border: 1px solid #555;
+            padding: 4px;
+            border-radius: 3px;
         }
-        QMenuBar {
-            background-color: #2b2b2b;
-            color: #ccc;
+        
+        QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover {
+            border: 1px solid #4a90e2;
         }
-        QMenuBar::item:selected {
-            background-color: #4a4a4a;
+        
+        QComboBox::drop-down {
+            border: none;
+            padding-right: 4px;
         }
-        QMenu {
-            background-color: #3c3c3c;
-            color: #ccc;
+        
+        QComboBox::down-arrow {
+            image: none;
+            border-left: 4px solid transparent;
+            border-right: 4px solid transparent;
+            border-top: 6px solid #e0e0e0;
+            margin-right: 4px;
+        }
+        
+        QComboBox QAbstractItemView {
+            background-color: #404040;
+            color: #e0e0e0;
+            selection-background-color: #4a90e2;
             border: 1px solid #555;
         }
-        QMenu::item:selected {
-            background-color: #4a4a4a;
+        
+        /* Метки */
+        QLabel {
+            color: #e0e0e0;
+            background-color: transparent;
         }
+        
+        /* Чекбоксы */
+        QCheckBox {
+            color: #e0e0e0;
+            spacing: 5px;
+        }
+        
+        QCheckBox::indicator {
+            width: 16px;
+            height: 16px;
+            border: 1px solid #555;
+            background-color: #404040;
+            border-radius: 3px;
+        }
+        
+        QCheckBox::indicator:checked {
+            background-color: #4a90e2;
+            border: 1px solid #4a90e2;
+        }
+        
+        QCheckBox::indicator:checked:after {
+            content: "";
+            width: 4px;
+            height: 8px;
+            border: solid white;
+            border-width: 0 2px 2px 0;
+            transform: rotate(45deg);
+            margin: 2px 0 0 5px;
+            display: block;
+        }
+        
+        /* Радиокнопки */
+        QRadioButton {
+            color: #e0e0e0;
+            spacing: 5px;
+        }
+        
+        QRadioButton::indicator {
+            width: 16px;
+            height: 16px;
+            border: 1px solid #555;
+            background-color: #404040;
+            border-radius: 8px;
+        }
+        
+        QRadioButton::indicator:checked {
+            background-color: #4a90e2;
+            border: 1px solid #4a90e2;
+        }
+        
+        /* Меню */
+        QMenuBar {
+            background-color: #353535;
+            color: #e0e0e0;
+            border-bottom: 1px solid #555;
+        }
+        
+        QMenuBar::item {
+            padding: 4px 8px;
+            background-color: transparent;
+        }
+        
+        QMenuBar::item:selected {
+            background-color: #4a90e2;
+        }
+        
+        QMenu {
+            background-color: #404040;
+            color: #e0e0e0;
+            border: 1px solid #555;
+        }
+        
+        QMenu::item {
+            padding: 6px 20px;
+        }
+        
+        QMenu::item:selected {
+            background-color: #4a90e2;
+        }
+        
+        QMenu::separator {
+            height: 1px;
+            background-color: #555;
+            margin: 4px 10px;
+        }
+        
+        /* Статусбар */
         QStatusBar {
-            background-color: #2b2b2b;
-            color: #ccc;
-            border-top: 1px solid #444;
+            background-color: #353535;
+            color: #e0e0e0;
+            border-top: 1px solid #555;
+        }
+        
+        /* Скроллбары */
+        QScrollBar:vertical {
+            background-color: #353535;
+            width: 12px;
+            border: none;
+        }
+        
+        QScrollBar::handle:vertical {
+            background-color: #555;
+            border-radius: 6px;
+            min-height: 20px;
+        }
+        
+        QScrollBar::handle:vertical:hover {
+            background-color: #666;
+        }
+        
+        QScrollBar:horizontal {
+            background-color: #353535;
+            height: 12px;
+            border: none;
+        }
+        
+        QScrollBar::handle:horizontal {
+            background-color: #555;
+            border-radius: 6px;
+            min-width: 20px;
+        }
+        
+        QScrollBar::handle:horizontal:hover {
+            background-color: #666;
+        }
+        
+        /* Слайдеры */
+        QSlider::groove:horizontal {
+            background-color: #404040;
+            height: 6px;
+            border-radius: 3px;
+        }
+        
+        QSlider::handle:horizontal {
+            background-color: #4a90e2;
+            width: 16px;
+            height: 16px;
+            border-radius: 8px;
+            margin: -5px 0;
+        }
+        
+        QSlider::handle:horizontal:hover {
+            background-color: #5aa0f2;
+        }
+        
+        /* Прогрессбар */
+        QProgressBar {
+            background-color: #404040;
+            border: 1px solid #555;
+            border-radius: 3px;
+            text-align: center;
+            color: white;
+        }
+        
+        QProgressBar::chunk {
+            background-color: #4a90e2;
+            border-radius: 2px;
+        }
+        
+        /* Списки */
+        QListWidget {
+            background-color: #353535;
+            color: #e0e0e0;
+            border: 1px solid #555;
+            selection-background-color: #4a90e2;
+        }
+        
+        QListWidget::item:hover {
+            background-color: #404040;
+        }
+        
+        QListWidget::item:selected {
+            background-color: #4a90e2;
+            color: white;
+        }
+        
+        /* Деревья */
+        QTreeWidget {
+            background-color: #353535;
+            color: #e0e0e0;
+            border: 1px solid #555;
+            selection-background-color: #4a90e2;
+        }
+        
+        QTreeWidget::item:hover {
+            background-color: #404040;
+        }
+        
+        QTreeWidget::item:selected {
+            background-color: #4a90e2;
+            color: white;
+        }
+        
+        /* Тултипы */
+        QToolTip {
+            background-color: #404040;
+            color: #e0e0e0;
+            border: 1px solid #555;
+            padding: 4px;
         }
         """
         self.setStyleSheet(dark_stylesheet)
@@ -234,7 +507,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Индикатор источника
         self.lbl_source = QtWidgets.QLabel("Источник: hackrf_sweep")
-        self.lbl_source.setStyleSheet("padding: 0 10px;")
+        self.lbl_source.setStyleSheet("padding: 0 10px; font-weight: bold;")
         self.statusBar().addPermanentWidget(self.lbl_source)
         
         # Индикатор устройств
@@ -243,14 +516,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().addPermanentWidget(self.lbl_devices)
         
         # Индикатор калибровки
-        self.lbl_calibration = QtWidgets.QLabel("CAL: ✗")
+        self.lbl_calibration = QtWidgets.QLabel("CAL: НЕТ")
         self.lbl_calibration.setStyleSheet("padding: 0 10px; color: #ff6666;")
         self.statusBar().addPermanentWidget(self.lbl_calibration)
         
         # Индикатор трилатерации
-        self.lbl_trilateration = QtWidgets.QLabel("TRI: ⚪")
+        self.lbl_trilateration = QtWidgets.QLabel("TRI: ВЫКЛ")
         self.lbl_trilateration.setStyleSheet("padding: 0 10px;")
         self.statusBar().addPermanentWidget(self.lbl_trilateration)
+
+    def _update_tabs_availability(self):
+        """Обновляет доступность вкладок в зависимости от источника."""
+        if self._current_source_type == "sweep":
+            # При hackrf_sweep отключаем карту и предупреждаем в детекторе
+            self.tabs.setTabEnabled(3, False)  # Карта
+            self.tabs.setTabToolTip(3, "Требуется libhackrf для трилатерации")
+            
+            # Добавляем предупреждение в детектор
+            if hasattr(self.detector_tab, 'btn_send_to_map'):
+                self.detector_tab.btn_send_to_map.setEnabled(False)
+                self.detector_tab.btn_send_to_map.setToolTip("Требуется libhackrf для работы с картой")
+        else:
+            # При libhackrf все доступно
+            self.tabs.setTabEnabled(3, True)
+            self.tabs.setTabToolTip(3, "")
+            
+            if hasattr(self.detector_tab, 'btn_send_to_map'):
+                self.detector_tab.btn_send_to_map.setEnabled(True)
+                self.detector_tab.btn_send_to_map.setToolTip("")
 
     def _wire_source(self, src):
         """Подключает обработчики к источнику."""
@@ -296,10 +589,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # === Файл ===
         m_file = menubar.addMenu("&Файл")
         
-        act_export_csv = QtWidgets.QAction("📄 Экспорт свипа CSV…", self)
+        act_export_csv = QtWidgets.QAction("Экспорт свипа CSV...", self)
         act_export_csv.triggered.connect(self._export_current_csv)
         
-        act_export_png = QtWidgets.QAction("🖼️ Экспорт водопада PNG…", self)
+        act_export_png = QtWidgets.QAction("Экспорт водопада PNG...", self)
         act_export_png.triggered.connect(self._export_waterfall_png)
         
         m_file.addAction(act_export_csv)
@@ -330,46 +623,46 @@ class MainWindow(QtWidgets.QMainWindow):
         
         m_source.addSeparator()
         
-        act_devices = QtWidgets.QAction("⚙️ Настройка SDR устройств…", self)
+        act_devices = QtWidgets.QAction("Настройка SDR устройств...", self)
         act_devices.triggered.connect(self._configure_devices)
         m_source.addAction(act_devices)
 
         # === Калибровка ===
         m_cal = menubar.addMenu("&Калибровка")
         
-        act_cal_load = QtWidgets.QAction("📁 Загрузить CSV…", self)
+        act_cal_load = QtWidgets.QAction("Загрузить CSV...", self)
         act_cal_load.triggered.connect(self._load_calibration_csv)
         m_cal.addAction(act_cal_load)
         
-        self.act_cal_enable = QtWidgets.QAction("✓ Применять калибровку", self, checkable=True, checked=False)
+        self.act_cal_enable = QtWidgets.QAction("Применять калибровку", self, checkable=True, checked=False)
         self.act_cal_enable.toggled.connect(self._toggle_calibration)
         m_cal.addAction(self.act_cal_enable)
         
         m_cal.addSeparator()
         
-        act_cal_clear = QtWidgets.QAction("🗑️ Очистить калибровку", self)
+        act_cal_clear = QtWidgets.QAction("Очистить калибровку", self)
         act_cal_clear.triggered.connect(self._clear_calibration)
         m_cal.addAction(act_cal_clear)
 
         # === Инструменты ===
         m_tools = menubar.addMenu("&Инструменты")
         
-        act_trilateration = QtWidgets.QAction("📡 Трилатерация (3 SDR)", self)
+        act_trilateration = QtWidgets.QAction("Трилатерация (3 SDR)", self)
         act_trilateration.triggered.connect(self._open_trilateration_settings)
         m_tools.addAction(act_trilateration)
         
-        act_signal_db = QtWidgets.QAction("📊 База сигналов", self)
+        act_signal_db = QtWidgets.QAction("База сигналов", self)
         act_signal_db.triggered.connect(self._open_signal_database)
         m_tools.addAction(act_signal_db)
 
         # === Справка ===
         m_help = menubar.addMenu("&Справка")
         
-        act_hotkeys = QtWidgets.QAction("⌨️ Горячие клавиши", self)
+        act_hotkeys = QtWidgets.QAction("Горячие клавиши", self)
         act_hotkeys.triggered.connect(self._show_hotkeys)
         m_help.addAction(act_hotkeys)
         
-        act_about = QtWidgets.QAction("ℹ️ О программе", self)
+        act_about = QtWidgets.QAction("О программе", self)
         act_about.triggered.connect(self._show_about)
         m_help.addAction(act_about)
 
@@ -396,45 +689,44 @@ class MainWindow(QtWidgets.QMainWindow):
     def _show_hotkeys(self):
         QtWidgets.QMessageBox.information(
             self, "Горячие клавиши",
-            "**Управление:**\n"
-            "Space - Старт/Стоп\n"
-            "+ - Приблизить\n"
-            "- - Отдалить\n"
-            "R - Сброс вида\n\n"
-            "**Навигация:**\n"
-            "S - Вкладка Спектр\n"
-            "P - Вкладка Пики\n"
-            "D - Вкладка Детектор\n"
-            "M - Вкладка Карта\n\n"
-            "**Экспорт:**\n"
-            "Ctrl+E - Экспорт CSV\n"
-            "Ctrl+Q - Выход\n\n"
-            "**Мышь:**\n"
-            "Двойной клик на спектре/водопаде - добавить маркер\n"
+            "<b>Управление:</b><br>"
+            "Space - Старт/Стоп<br>"
+            "+ - Приблизить<br>"
+            "- - Отдалить<br>"
+            "R - Сброс вида<br><br>"
+            "<b>Навигация:</b><br>"
+            "S - Вкладка Спектр<br>"
+            "P - Вкладка Пики<br>"
+            "D - Вкладка Детектор<br>"
+            "M - Вкладка Карта<br><br>"
+            "<b>Экспорт:</b><br>"
+            "Ctrl+E - Экспорт CSV<br>"
+            "Ctrl+Q - Выход<br><br>"
+            "<b>Мышь:</b><br>"
+            "Двойной клик на спектре/водопаде - добавить маркер<br>"
             "Колесо мыши - зум по X"
         )
 
     def _show_about(self):
         QtWidgets.QMessageBox.information(
             self, "О программе",
-            f"**{APP_TITLE}**\n"
-            "Advanced HackRF Sweep Analyzer\n\n"
-            "**Возможности:**\n"
-            "• Адаптивный детектор с baseline + N порогом\n"
-            "• Трилатерация целей с 3 SDR\n"
-            "• Классификация сигналов по диапазонам\n"
-            "• Менеджер устройств с никнеймами\n"
-            "• Фильтр Калмана для траекторий\n"
-            "• Калибровка CSV (SDR Console format)\n"
-            "• Экспорт CSV/PNG/JSON\n\n"
-            "**Версия:** 0.2 Pro\n"
-            "**Лицензия:** MIT"
+            f"<b>{APP_TITLE}</b><br>"
+            "Advanced HackRF Sweep Analyzer<br><br>"
+            "<b>Возможности:</b><br>"
+            "• Адаптивный детектор с baseline + N порогом<br>"
+            "• Трилатерация целей с 3 SDR<br>"
+            "• Классификация сигналов по диапазонам<br>"
+            "• Менеджер устройств с никнеймами<br>"
+            "• Фильтр Калмана для траекторий<br>"
+            "• Калибровка CSV (SDR Console format)<br>"
+            "• Экспорт CSV/PNG/JSON<br><br>"
+            "<b>Версия:</b> 0.2 Pro<br>"
+            "<b>Лицензия:</b> MIT"
         )
 
     def _show_error(self, title: str, msg: str):
         QtWidgets.QMessageBox.critical(self, title, msg)
 
-    # ---------------- действия ----------------
     def _toggle_start_stop(self):
         """Переключает старт/стоп по пробелу."""
         if self._source and self._source.is_running():
@@ -449,26 +741,36 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if name == "lib" and self._lib_available and self._lib_source:
             self._source = self._lib_source
+            self._current_source_type = "lib"
             self.lbl_source.setText("Источник: libhackrf")
             self.statusBar().showMessage("Источник: libhackrf (CFFI)", 3000)
         else:
             self._source = self._sweep_source
+            self._current_source_type = "sweep"
             self.lbl_source.setText("Источник: hackrf_sweep")
             self.statusBar().showMessage("Источник: hackrf_sweep", 3000)
 
         self.spectrum_tab.set_source(self._source)
         self._wire_source(self._source)
+        self._update_tabs_availability()
 
     def _configure_devices(self):
         """Открывает диалог настройки SDR устройств."""
-        # Получаем список доступных устройств
+        # Получаем список реальных устройств
         serials = []
         if self._lib_available and self._lib_source:
-            serials = self._lib_source.list_serials()
+            try:
+                serials = self._lib_source.list_serials()
+            except Exception as e:
+                self.log.warning(f"Не удалось получить список устройств: {e}")
         
         if not serials:
-            # Заглушка для демонстрации
-            serials = ["HACKRF_001", "HACKRF_002", "HACKRF_003", "HACKRF_004"]
+            QtWidgets.QMessageBox.warning(
+                self, "SDR устройства",
+                "Не найдено подключенных HackRF устройств.\n\n"
+                "Подключите устройства и попробуйте снова."
+            )
+            return
         
         dlg = DeviceConfigDialog(self.device_manager, serials, self)
         dlg.devicesConfigured.connect(self._on_devices_configured)
@@ -491,8 +793,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 master.serial, slave1.serial, slave2.serial
             )
             
-            # Обновляем карту
-            self.map_tab._on_sdr_moved()
+            # Синхронизируем с картой
+            self.map_tab.sdr_positions = {
+                'master': (master.position_x, master.position_y),
+                'slave1': (slave1.position_x, slave1.position_y),
+                'slave2': (slave2.position_x, slave2.position_y)
+            }
+            self.map_tab._refresh_map()
 
     def _update_device_status(self):
         """Обновляет статус устройств в статусбаре."""
@@ -502,15 +809,22 @@ class MainWindow(QtWidgets.QMainWindow):
         # Проверяем готовность к трилатерации
         master, slave1, slave2 = self.device_manager.get_trilateration_devices()
         if master and slave1 and slave2:
-            self.lbl_trilateration.setText("TRI: ✓")
+            self.lbl_trilateration.setText("TRI: ГОТОВ")
             self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #66ff66;")
         else:
-            self.lbl_trilateration.setText("TRI: ✗")
+            self.lbl_trilateration.setText("TRI: НЕ ГОТОВ")
             self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #ff6666;")
 
-    # ---------------- трилатерация ----------------
     def _open_trilateration_settings(self):
         """Открывает настройки трилатерации."""
+        if self._current_source_type == "sweep":
+            QtWidgets.QMessageBox.warning(
+                self, "Трилатерация",
+                "Трилатерация требует libhackrf!\n\n"
+                "Переключитесь на источник libhackrf в меню Источник."
+            )
+            return
+            
         master, slave1, slave2 = self.device_manager.get_trilateration_devices()
         
         if not (master and slave1 and slave2):
@@ -524,14 +838,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # Показываем информацию о готовности
         QtWidgets.QMessageBox.information(
             self, "Трилатерация готова",
-            f"**Устройства настроены:**\n\n"
-            f"Master: {master.nickname} ({master.serial})\n"
-            f"Позиция: ({master.position_x:.1f}, {master.position_y:.1f}, {master.position_z:.1f})\n\n"
-            f"Slave 1: {slave1.nickname} ({slave1.serial})\n"
-            f"Позиция: ({slave1.position_x:.1f}, {slave1.position_y:.1f}, {slave1.position_z:.1f})\n\n"
-            f"Slave 2: {slave2.nickname} ({slave2.serial})\n"
-            f"Позиция: ({slave2.position_x:.1f}, {slave2.position_y:.1f}, {slave2.position_z:.1f})\n\n"
-            f"Переключитесь на вкладку **Карта** для запуска!"
+            f"<b>Устройства настроены:</b><br><br>"
+            f"Master: {master.nickname} ({master.serial})<br>"
+            f"Позиция: ({master.position_x:.1f}, {master.position_y:.1f}, {master.position_z:.1f})<br><br>"
+            f"Slave 1: {slave1.nickname} ({slave1.serial})<br>"
+            f"Позиция: ({slave1.position_x:.1f}, {slave1.position_y:.1f}, {slave1.position_z:.1f})<br><br>"
+            f"Slave 2: {slave2.nickname} ({slave2.serial})<br>"
+            f"Позиция: ({slave2.position_x:.1f}, {slave2.position_y:.1f}, {slave2.position_z:.1f})<br><br>"
+            f"Переключитесь на вкладку <b>Карта</b> для запуска!"
         )
         
         # Переключаемся на карту
@@ -540,14 +854,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _start_trilateration(self):
         """Запускает трилатерацию."""
         self.trilateration_engine.start()
-        self.lbl_trilateration.setText("TRI: 🔴")
-        self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #ff6666;")
+        self.lbl_trilateration.setText("TRI: АКТИВНА")
+        self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #ff6666; font-weight: bold;")
         self.statusBar().showMessage("Трилатерация запущена", 3000)
 
     def _stop_trilateration(self):
         """Останавливает трилатерацию."""
         self.trilateration_engine.stop()
-        self.lbl_trilateration.setText("TRI: ✓")
+        self.lbl_trilateration.setText("TRI: ГОТОВ")
         self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #66ff66;")
         self.statusBar().showMessage("Трилатерация остановлена", 3000)
 
@@ -557,11 +871,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         # Определяем какое это устройство
-        # В реальной системе это будет определяться по источнику
         device_serial = self.device_manager.master or "UNKNOWN"
         
         # Находим пики для трилатерации
-        threshold = np.median(power_dbm) + 10  # Простой порог
+        threshold = np.median(power_dbm) + 10
         peaks_mask = power_dbm > threshold
         
         if np.any(peaks_mask):
@@ -573,7 +886,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 device_serial=device_serial,
                 freq_mhz=freqs_hz[peak_idx] / 1e6,
                 power_dbm=power_dbm[peak_idx],
-                bandwidth_khz=200,  # Заглушка
+                bandwidth_khz=200,
                 noise_floor_dbm=np.median(power_dbm)
             )
             
@@ -581,38 +894,73 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _send_detection_to_map(self, detection):
         """Отправляет обнаружение на карту."""
-        # Здесь должна быть логика добавления цели на карту
-        # Используем трилатерацию для определения позиции
+        if self._current_source_type == "sweep":
+            QtWidgets.QMessageBox.warning(
+                self, "Карта",
+                "Работа с картой требует libhackrf!\n\n"
+                "Переключитесь на источник libhackrf."
+            )
+            return
+            
+        # Используем позицию из трилатерации или добавляем в центр
         positions = self.trilateration_engine.get_current_positions()
         
         if detection.freq_mhz in positions:
             pos = positions[detection.freq_mhz]
-            # Добавляем на карту с вычисленными координатами
-            self.statusBar().showMessage(
-                f"Цель на карте: {detection.freq_mhz:.1f} МГц @ ({pos.x:.1f}, {pos.y:.1f})",
-                5000
-            )
+            x, y = pos.x, pos.y
+        else:
+            # Добавляем в центр карты
+            x, y = 0, 0
+        
+        # Создаем цель для карты
+        from panorama.features.map3d.view import Target
+        target = Target(
+            id=len(self.map_tab.targets) + 1,
+            x=x,
+            y=y,
+            freq_mhz=detection.freq_mhz,
+            power_dbm=detection.power_dbm,
+            confidence=detection.confidence,
+            timestamp=detection.timestamp
+        )
+        
+        self.map_tab.targets.append(target)
+        self.map_tab._refresh_map()
+        
+        # Обновляем таблицу целей на карте
+        row = self.map_tab.targets_table.rowCount()
+        self.map_tab.targets_table.insertRow(row)
+        self.map_tab.targets_table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(target.id)))
+        self.map_tab.targets_table.setItem(row, 1, QtWidgets.QTableWidgetItem(f"({target.x:.1f}, {target.y:.1f})"))
+        self.map_tab.targets_table.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{target.freq_mhz:.3f} МГц"))
+        self.map_tab.targets_table.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{target.power_dbm:.1f} дБм"))
+        
+        self.map_tab.lbl_targets.setText(str(len(self.map_tab.targets)))
+        
+        self.statusBar().showMessage(
+            f"Цель добавлена на карту: {detection.freq_mhz:.1f} МГц @ ({x:.1f}, {y:.1f})",
+            5000
+        )
 
     def _open_signal_database(self):
         """Открывает базу данных сигналов."""
         QtWidgets.QMessageBox.information(
             self, "База сигналов",
-            "**Классификация сигналов:**\n\n"
-            "• 87.5-108 МГц - FM Radio\n"
-            "• 118-137 МГц - Aviation\n"
-            "• 144-148 МГц - Amateur 2m\n"
-            "• 156-163 МГц - Marine VHF\n"
-            "• 430-440 МГц - Amateur 70cm\n"
-            "• 446 МГц - PMR446\n"
-            "• 433 МГц - ISM 433\n"
-            "• 868 МГц - ISM 868\n"
-            "• 900-960 МГц - GSM\n"
-            "• 2.4 ГГц - WiFi/Bluetooth\n"
-            "• 5.8 ГГц - FPV Video\n"
-            "• 1.5-1.6 ГГц - GPS/GNSS\n"
+            "<b>Классификация сигналов:</b><br><br>"
+            "• 87.5-108 МГц - FM Radio<br>"
+            "• 118-137 МГц - Aviation<br>"
+            "• 144-148 МГц - Amateur 2m<br>"
+            "• 156-163 МГц - Marine VHF<br>"
+            "• 430-440 МГц - Amateur 70cm<br>"
+            "• 446 МГц - PMR446<br>"
+            "• 433 МГц - ISM 433<br>"
+            "• 868 МГц - ISM 868<br>"
+            "• 900-960 МГц - GSM<br>"
+            "• 2.4 ГГц - WiFi/Bluetooth<br>"
+            "• 5.8 ГГц - FPV Video<br>"
+            "• 1.5-1.6 ГГц - GPS/GNSS"
         )
 
-    # ---------------- калибровка ----------------
     def _try_load_default_calibration(self):
         """Пытается загрузить hackrf_cal.csv из текущей директории."""
         default_path = "hackrf_cal.csv"
@@ -644,7 +992,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ok = self._lib_source.load_calibration(path)
                 if ok:
                     self.act_cal_enable.setChecked(True)
-                    self.lbl_calibration.setText("CAL: ✓")
+                    self.lbl_calibration.setText("CAL: ДА")
                     self.lbl_calibration.setStyleSheet("padding: 0 10px; color: #66ff66;")
                     self.statusBar().showMessage(f"Калибровка загружена: {os.path.basename(path)}", 5000)
                 else:
@@ -652,7 +1000,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 # Для hackrf_sweep просто сохраняем профили
                 self.act_cal_enable.setChecked(True)
-                self.lbl_calibration.setText("CAL: ✓")
+                self.lbl_calibration.setText("CAL: ДА")
                 self.lbl_calibration.setStyleSheet("padding: 0 10px; color: #66ff66;")
                 self.statusBar().showMessage(f"Калибровка загружена: {os.path.basename(path)}", 5000)
             
@@ -667,10 +1015,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._lib_source.set_calibration_enabled(on)
         
         if on and self._calibration_profiles:
-            self.lbl_calibration.setText("CAL: ✓")
+            self.lbl_calibration.setText("CAL: ДА")
             self.lbl_calibration.setStyleSheet("padding: 0 10px; color: #66ff66;")
         else:
-            self.lbl_calibration.setText("CAL: ✗")
+            self.lbl_calibration.setText("CAL: НЕТ")
             self.lbl_calibration.setStyleSheet("padding: 0 10px; color: #ff6666;")
         
         self.statusBar().showMessage(f"Калибровка: {'включена' if on else 'выключена'}", 3000)
@@ -679,11 +1027,10 @@ class MainWindow(QtWidgets.QMainWindow):
         """Очищает загруженную калибровку."""
         self._calibration_profiles = {}
         self.act_cal_enable.setChecked(False)
-        self.lbl_calibration.setText("CAL: ✗")
+        self.lbl_calibration.setText("CAL: НЕТ")
         self.lbl_calibration.setStyleSheet("padding: 0 10px; color: #ff6666;")
         self.statusBar().showMessage("Калибровка очищена", 3000)
 
-    # ---------------- экспорт ----------------
     def _export_current_csv(self):
         """Экспорт текущего свипа в CSV."""
         freqs, row = self.spectrum_tab.get_current_row()
@@ -721,7 +1068,6 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self._show_error("Экспорт", f"Ошибка: {e}")
 
-    # -------- окно/настройки --------
     def _restore_window_state(self):
         self.restoreGeometry(self.settings.value("main/geometry", type=QtCore.QByteArray) or QtCore.QByteArray())
         self.restoreState(self.settings.value("main/windowState", type=QtCore.QByteArray) or QtCore.QByteArray())
@@ -771,9 +1117,6 @@ def main():
 
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
-    
-    # Устанавливаем иконку приложения
-    app.setWindowIcon(QtGui.QIcon.fromTheme("radio"))
     
     win = MainWindow(logger, settings)
     win.show()
