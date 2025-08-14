@@ -1,11 +1,14 @@
+# panorama/main.py
 import sys, os, stat, getpass, pathlib, logging, time
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import QSettings
 
 from panorama.features.spectrum import SpectrumView
-from panorama.features.peaks import AdaptivePeaksWidget
-from panorama.features.devices import DeviceDialog
+from panorama.features.peaks.ui_improved import AdaptivePeaksWidget  # Новый модуль пиков
+from panorama.features.detector.widget import DetectorWidget  # Улучшенный детектор
+from panorama.features.devices.manager import DeviceManager, DeviceConfigDialog  # Новый менеджер
 from panorama.features.map3d import MapView
+from panorama.features.trilateration.engine import TrilaterationEngine, SignalMeasurement  # Новый движок
 
 from panorama.drivers.hackrf_sweep import HackRFSweepSource
 from panorama.shared.calibration import load_calibration_csv, get_calibration_lut
@@ -20,7 +23,7 @@ except Exception:
 from panorama.shared import write_row_csv, setup_logging, merged_defaults
 
 
-APP_TITLE = "ПАНОРАМА 0.1 бета"
+APP_TITLE = "ПАНОРАМА 0.2 Pro"
 
 
 def _fix_runtime_dir():
@@ -39,224 +42,6 @@ def _fix_runtime_dir():
         os.environ["XDG_RUNTIME_DIR"] = new
 
 
-class DetectorWidget(QtWidgets.QWidget):
-    """Вкладка детектора активности с ROI."""
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        
-        v = QtWidgets.QVBoxLayout(self)
-        
-        # Пресеты диапазонов
-        grp_presets = QtWidgets.QGroupBox("Пресеты")
-        grid = QtWidgets.QGridLayout(grp_presets)
-        
-        preset_rows = [
-            ("FM (87–108 МГц)", [(87.5, 108.0)]),
-            ("VHF (136–174 МГц)", [(136.0, 174.0)]),
-            ("UHF (400–470 МГц)", [(400.0, 470.0)]),
-            ("Wi-Fi 2.4 ГГц", [(2400.0, 2483.5)]),
-            ("Wi-Fi 5 ГГц", [(5170.0, 5895.0)]),
-            ("5.8 ГГц FPV", [(5725.0, 5875.0)]),
-            ("LTE 700–900", [(703.0, 960.0)]),
-            ("ISM 868", [(863.0, 873.0)]),
-        ]
-        
-        r = 0; c = 0
-        for title, ranges in preset_rows:
-            btn = QtWidgets.QPushButton(title)
-            btn.clicked.connect(lambda _, rr=ranges: self._add_ranges(rr))
-            grid.addWidget(btn, r, c)
-            c += 1
-            if c >= 2:
-                c = 0; r += 1
-        
-        v.addWidget(grp_presets)
-        
-        # Таблица диапазонов
-        grp_ranges = QtWidgets.QGroupBox("Диапазоны сканирования")
-        vr = QtWidgets.QVBoxLayout(grp_ranges)
-        
-        self.tbl_ranges = QtWidgets.QTableWidget(0, 2)
-        self.tbl_ranges.setHorizontalHeaderLabels(["Начало, МГц", "Конец, МГц"])
-        self.tbl_ranges.horizontalHeader().setStretchLastSection(True)
-        vr.addWidget(self.tbl_ranges)
-        
-        btn_row = QtWidgets.QHBoxLayout()
-        self.btn_add = QtWidgets.QPushButton("Добавить +")
-        self.btn_del = QtWidgets.QPushButton("Удалить −")
-        self.btn_merge = QtWidgets.QPushButton("Объединить")
-        btn_row.addWidget(self.btn_add)
-        btn_row.addWidget(self.btn_del)
-        btn_row.addWidget(self.btn_merge)
-        vr.addLayout(btn_row)
-        
-        v.addWidget(grp_ranges)
-        
-        # Параметры детектора
-        grp_params = QtWidgets.QGroupBox("Параметры детектора")
-        fp = QtWidgets.QFormLayout(grp_params)
-        
-        self.th_dbm = QtWidgets.QDoubleSpinBox()
-        self.th_dbm.setRange(-160, 30)
-        self.th_dbm.setValue(-80)
-        self.th_dbm.setSuffix(" дБм")
-        
-        self.min_width = QtWidgets.QSpinBox()
-        self.min_width.setRange(1, 1000)
-        self.min_width.setValue(5)
-        self.min_width.setSuffix(" бинов")
-        
-        fp.addRow("Порог:", self.th_dbm)
-        fp.addRow("Мин. ширина:", self.min_width)
-        
-        v.addWidget(grp_params)
-        
-        # Кнопки управления
-        btns = QtWidgets.QHBoxLayout()
-        self.btn_start = QtWidgets.QPushButton("Начать детект")
-        self.btn_stop = QtWidgets.QPushButton("Остановить")
-        self.btn_stop.setEnabled(False)
-        btns.addWidget(self.btn_start)
-        btns.addWidget(self.btn_stop)
-        btns.addStretch(1)
-        v.addLayout(btns)
-        
-        v.addStretch(1)
-        
-        # Обработчики
-        self.btn_add.clicked.connect(self._add_current)
-        self.btn_del.clicked.connect(self._delete_selected)
-        self.btn_merge.clicked.connect(self._merge_ranges)
-        self.btn_start.clicked.connect(self._start_detection)
-        self.btn_stop.clicked.connect(self._stop_detection)
-        
-        self._detecting = False
-    
-    def _add_ranges(self, ranges):
-        for start, stop in ranges:
-            r = self.tbl_ranges.rowCount()
-            self.tbl_ranges.insertRow(r)
-            self.tbl_ranges.setItem(r, 0, QtWidgets.QTableWidgetItem(f"{start:.3f}"))
-            self.tbl_ranges.setItem(r, 1, QtWidgets.QTableWidgetItem(f"{stop:.3f}"))
-    
-    def _add_current(self):
-        # Заглушка - берем диапазон из спектра
-        self._add_ranges([(2400.0, 2483.5)])
-    
-    def _delete_selected(self):
-        rows = sorted({i.row() for i in self.tbl_ranges.selectedIndexes()}, reverse=True)
-        for r in rows:
-            self.tbl_ranges.removeRow(r)
-    
-    def _merge_ranges(self):
-        # Простое объединение перекрывающихся диапазонов
-        ranges = []
-        for r in range(self.tbl_ranges.rowCount()):
-            try:
-                start = float(self.tbl_ranges.item(r, 0).text())
-                stop = float(self.tbl_ranges.item(r, 1).text())
-                ranges.append((start, stop))
-            except Exception:
-                continue
-        
-        if not ranges:
-            return
-        
-        ranges.sort()
-        merged = []
-        for start, stop in ranges:
-            if not merged or start > merged[-1][1] + 0.1:
-                merged.append([start, stop])
-            else:
-                merged[-1][1] = max(merged[-1][1], stop)
-        
-        self.tbl_ranges.setRowCount(0)
-        for start, stop in merged:
-            r = self.tbl_ranges.rowCount()
-            self.tbl_ranges.insertRow(r)
-            self.tbl_ranges.setItem(r, 0, QtWidgets.QTableWidgetItem(f"{start:.3f}"))
-            self.tbl_ranges.setItem(r, 1, QtWidgets.QTableWidgetItem(f"{stop:.3f}"))
-    
-    def _start_detection(self):
-        self._detecting = True
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        # Здесь будет логика детектора
-        QtWidgets.QMessageBox.information(self, "Детектор", "Детекция запущена (заглушка)")
-    
-    def _stop_detection(self):
-        self._detecting = False
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-    
-    def push_data(self, freqs_hz, row_dbm):
-        """API для подачи данных в детектор."""
-        if not self._detecting:
-            return
-        # Здесь будет анализ данных
-        pass
-
-
-class TrilaterationWindow(QtWidgets.QMainWindow):
-    """Окно трилатерации с 3 SDR."""
-    
-    def __init__(self, master_serial: str, slave1_serial: str, slave2_serial: str, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Трилатерация")
-        
-        self.master_serial = master_serial
-        self.slave1_serial = slave1_serial
-        self.slave2_serial = slave2_serial
-        
-        # Центральный виджет - карта
-        self.map = MapView()
-        self.setCentralWidget(self.map)
-        
-        # Док с логом
-        self.log_dock = QtWidgets.QDockWidget("Лог трилатерации", self)
-        self.log = QtWidgets.QTextEdit()
-        self.log.setReadOnly(True)
-        self.log_dock.setWidget(self.log)
-        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self.log_dock)
-        
-        # Тулбар
-        toolbar = self.addToolBar("Управление")
-        
-        act_start = toolbar.addAction("Старт")
-        act_stop = toolbar.addAction("Стоп")
-        act_clear = toolbar.addAction("Очистить")
-        
-        act_start.triggered.connect(self._start)
-        act_stop.triggered.connect(self._stop)
-        act_clear.triggered.connect(self._clear)
-        
-        self._running = False
-        
-        self.resize(900, 700)
-        self._log(f"Master: {master_serial}")
-        self._log(f"Slave1: {slave1_serial}")
-        self._log(f"Slave2: {slave2_serial}")
-    
-    def _log(self, msg: str):
-        ts = time.strftime("%H:%M:%S")
-        self.log.append(f"[{ts}] {msg}")
-    
-    def _start(self):
-        if self._running:
-            return
-        self._running = True
-        self._log("Трилатерация запущена")
-        # Здесь будет запуск 3 источников
-    
-    def _stop(self):
-        self._running = False
-        self._log("Трилатерация остановлена")
-    
-    def _clear(self):
-        self.log.clear()
-
-
 class MainWindow(QtWidgets.QMainWindow):
     """Главное окно приложения ПАНОРАМА."""
     
@@ -264,10 +49,19 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.log = logger
         self.settings = settings
-        self._calibration_profiles = {}  # Загруженные профили калибровки
+        self._calibration_profiles = {}
+        
+        # Менеджер устройств
+        self.device_manager = DeviceManager()
+        
+        # Движок трилатерации
+        self.trilateration_engine = TrilaterationEngine()
 
         self.setWindowTitle(APP_TITLE)
-        self.resize(1400, 900)
+        self.resize(1600, 950)
+        
+        # Применяем темную тему
+        self._apply_dark_theme()
 
         # --- центральные вкладки ---
         self.tabs = QtWidgets.QTabWidget(self)
@@ -296,24 +90,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Остальные вкладки
         self.map_tab = MapView()
-        self.peaks_tab = AdaptivePeaksWidget()
-        self.detector_tab = DetectorWidget()
+        self.peaks_tab = AdaptivePeaksWidget()  # Новый виджет пиков
+        self.detector_tab = DetectorWidget()  # Улучшенный детектор
 
-        # Провязка: спектр → пики и детектор
-        self.spectrum_tab.newRowReady.connect(self.peaks_tab.update_from_row)
-        self.spectrum_tab.newRowReady.connect(self.detector_tab.push_data)
-        self.peaks_tab.goToFreq.connect(self.spectrum_tab.set_cursor_freq)
+        # Провязка сигналов
+        self._connect_signals()
 
         # Добавляем вкладки
-        self.tabs.addTab(self.spectrum_tab, "Спектр")
-        self.tabs.addTab(self.peaks_tab, "Пики")
-        self.tabs.addTab(self.detector_tab, "Детектор")
-        self.tabs.addTab(self.map_tab, "Карта")
+        self.tabs.addTab(self.spectrum_tab, "📊 Спектр")
+        self.tabs.addTab(self.peaks_tab, "📍 Пики")
+        self.tabs.addTab(self.detector_tab, "🎯 Детектор")
+        self.tabs.addTab(self.map_tab, "🗺️ Карта")
 
         # Меню и статусбар
         self._build_menu()
         self._build_shortcuts()
-        self.statusBar().showMessage("Готово")
+        
+        # Статусбар с индикаторами
+        self._build_statusbar()
 
         # Восстановление состояния
         self._restore_window_state()
@@ -323,10 +117,143 @@ class MainWindow(QtWidgets.QMainWindow):
         # Автозагрузка калибровки если есть
         self._try_load_default_calibration()
 
-    # ---------------- внутреннее ----------------
+    def _apply_dark_theme(self):
+        """Применяет темную тему к приложению."""
+        dark_stylesheet = """
+        QMainWindow {
+            background-color: #2b2b2b;
+        }
+        QTabWidget::pane {
+            background-color: #2b2b2b;
+            border: 1px solid #444;
+        }
+        QTabBar::tab {
+            background-color: #3c3c3c;
+            color: #ccc;
+            padding: 8px 16px;
+            margin-right: 2px;
+        }
+        QTabBar::tab:selected {
+            background-color: #4a4a4a;
+            color: white;
+        }
+        QGroupBox {
+            color: #ccc;
+            border: 1px solid #555;
+            border-radius: 4px;
+            margin-top: 10px;
+            padding-top: 10px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 10px;
+            padding: 0 5px 0 5px;
+        }
+        QPushButton {
+            background-color: #3c3c3c;
+            color: #ccc;
+            border: 1px solid #555;
+            padding: 6px;
+            border-radius: 4px;
+        }
+        QPushButton:hover {
+            background-color: #4a4a4a;
+        }
+        QPushButton:pressed {
+            background-color: #555;
+        }
+        QTableWidget {
+            background-color: #2b2b2b;
+            color: #ccc;
+            gridline-color: #444;
+            selection-background-color: #4a4a4a;
+        }
+        QHeaderView::section {
+            background-color: #3c3c3c;
+            color: #ccc;
+            padding: 4px;
+            border: 1px solid #444;
+        }
+        QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
+            background-color: #3c3c3c;
+            color: #ccc;
+            border: 1px solid #555;
+            padding: 4px;
+            border-radius: 2px;
+        }
+        QLabel {
+            color: #ccc;
+        }
+        QCheckBox {
+            color: #ccc;
+        }
+        QMenuBar {
+            background-color: #2b2b2b;
+            color: #ccc;
+        }
+        QMenuBar::item:selected {
+            background-color: #4a4a4a;
+        }
+        QMenu {
+            background-color: #3c3c3c;
+            color: #ccc;
+            border: 1px solid #555;
+        }
+        QMenu::item:selected {
+            background-color: #4a4a4a;
+        }
+        QStatusBar {
+            background-color: #2b2b2b;
+            color: #ccc;
+            border-top: 1px solid #444;
+        }
+        """
+        self.setStyleSheet(dark_stylesheet)
+
+    def _connect_signals(self):
+        """Подключает все сигналы между компонентами."""
+        # Спектр → Пики и Детектор
+        self.spectrum_tab.newRowReady.connect(self.peaks_tab.update_from_row)
+        self.spectrum_tab.newRowReady.connect(self.detector_tab.push_data)
+        self.spectrum_tab.newRowReady.connect(self._process_for_trilateration)
+        
+        # Пики → Спектр
+        self.peaks_tab.goToFreq.connect(self.spectrum_tab.set_cursor_freq)
+        
+        # Детектор → Карта
+        self.detector_tab.sendToMap.connect(self._send_detection_to_map)
+        self.detector_tab.rangeSelected.connect(self.spectrum_tab.add_roi_region)
+        
+        # Карта → Трилатерация
+        self.map_tab.trilaterationStarted.connect(self._start_trilateration)
+        self.map_tab.trilaterationStopped.connect(self._stop_trilateration)
+
+    def _build_statusbar(self):
+        """Создает статусбар с индикаторами."""
+        self.statusBar().showMessage("Готово")
+        
+        # Индикатор источника
+        self.lbl_source = QtWidgets.QLabel("Источник: hackrf_sweep")
+        self.lbl_source.setStyleSheet("padding: 0 10px;")
+        self.statusBar().addPermanentWidget(self.lbl_source)
+        
+        # Индикатор устройств
+        self.lbl_devices = QtWidgets.QLabel("SDR: 0")
+        self.lbl_devices.setStyleSheet("padding: 0 10px;")
+        self.statusBar().addPermanentWidget(self.lbl_devices)
+        
+        # Индикатор калибровки
+        self.lbl_calibration = QtWidgets.QLabel("CAL: ✗")
+        self.lbl_calibration.setStyleSheet("padding: 0 10px; color: #ff6666;")
+        self.statusBar().addPermanentWidget(self.lbl_calibration)
+        
+        # Индикатор трилатерации
+        self.lbl_trilateration = QtWidgets.QLabel("TRI: ⚪")
+        self.lbl_trilateration.setStyleSheet("padding: 0 10px;")
+        self.statusBar().addPermanentWidget(self.lbl_trilateration)
+
     def _wire_source(self, src):
         """Подключает обработчики к источнику."""
-        # Отписываемся от старых
         for s in [self._sweep_source, self._lib_source]:
             if not s:
                 continue
@@ -348,7 +275,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_source_started(self):
         """Вызывается при старте источника."""
-        # Применяем калибровку для hackrf_sweep
         if isinstance(self._source, HackRFSweepSource) and self._calibration_profiles:
             lna = self.spectrum_tab.lna_db.value()
             vga = self.spectrum_tab.vga_db.value()
@@ -370,10 +296,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # === Файл ===
         m_file = menubar.addMenu("&Файл")
         
-        act_export_csv = QtWidgets.QAction("Экспорт свипа CSV…", self)
+        act_export_csv = QtWidgets.QAction("📄 Экспорт свипа CSV…", self)
         act_export_csv.triggered.connect(self._export_current_csv)
         
-        act_export_png = QtWidgets.QAction("Экспорт водопада PNG…", self)
+        act_export_png = QtWidgets.QAction("🖼️ Экспорт водопада PNG…", self)
         act_export_png.triggered.connect(self._export_waterfall_png)
         
         m_file.addAction(act_export_csv)
@@ -404,35 +330,46 @@ class MainWindow(QtWidgets.QMainWindow):
         
         m_source.addSeparator()
         
-        act_devices = QtWidgets.QAction("Выбрать устройство…", self)
-        act_devices.triggered.connect(self._choose_device)
+        act_devices = QtWidgets.QAction("⚙️ Настройка SDR устройств…", self)
+        act_devices.triggered.connect(self._configure_devices)
         m_source.addAction(act_devices)
 
         # === Калибровка ===
         m_cal = menubar.addMenu("&Калибровка")
         
-        act_cal_load = QtWidgets.QAction("Загрузить CSV…", self)
+        act_cal_load = QtWidgets.QAction("📁 Загрузить CSV…", self)
         act_cal_load.triggered.connect(self._load_calibration_csv)
         m_cal.addAction(act_cal_load)
         
-        self.act_cal_enable = QtWidgets.QAction("Применять калибровку", self, checkable=True, checked=False)
+        self.act_cal_enable = QtWidgets.QAction("✓ Применять калибровку", self, checkable=True, checked=False)
         self.act_cal_enable.toggled.connect(self._toggle_calibration)
         m_cal.addAction(self.act_cal_enable)
         
         m_cal.addSeparator()
         
-        act_cal_clear = QtWidgets.QAction("Очистить калибровку", self)
+        act_cal_clear = QtWidgets.QAction("🗑️ Очистить калибровку", self)
         act_cal_clear.triggered.connect(self._clear_calibration)
         m_cal.addAction(act_cal_clear)
+
+        # === Инструменты ===
+        m_tools = menubar.addMenu("&Инструменты")
+        
+        act_trilateration = QtWidgets.QAction("📡 Трилатерация (3 SDR)", self)
+        act_trilateration.triggered.connect(self._open_trilateration_settings)
+        m_tools.addAction(act_trilateration)
+        
+        act_signal_db = QtWidgets.QAction("📊 База сигналов", self)
+        act_signal_db.triggered.connect(self._open_signal_database)
+        m_tools.addAction(act_signal_db)
 
         # === Справка ===
         m_help = menubar.addMenu("&Справка")
         
-        act_hotkeys = QtWidgets.QAction("Горячие клавиши", self)
+        act_hotkeys = QtWidgets.QAction("⌨️ Горячие клавиши", self)
         act_hotkeys.triggered.connect(self._show_hotkeys)
         m_help.addAction(act_hotkeys)
         
-        act_about = QtWidgets.QAction("О программе", self)
+        act_about = QtWidgets.QAction("ℹ️ О программе", self)
         act_about.triggered.connect(self._show_about)
         m_help.addAction(act_about)
 
@@ -443,6 +380,10 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QShortcut(QtGui.QKeySequence("R"), self, activated=self.spectrum_tab._on_reset_view)
         QtWidgets.QShortcut(QtGui.QKeySequence("+"), self, activated=lambda: self._zoom_x(0.8))
         QtWidgets.QShortcut(QtGui.QKeySequence("-"), self, activated=lambda: self._zoom_x(1.25))
+        QtWidgets.QShortcut(QtGui.QKeySequence("D"), self, activated=lambda: self.tabs.setCurrentWidget(self.detector_tab))
+        QtWidgets.QShortcut(QtGui.QKeySequence("S"), self, activated=lambda: self.tabs.setCurrentWidget(self.spectrum_tab))
+        QtWidgets.QShortcut(QtGui.QKeySequence("P"), self, activated=lambda: self.tabs.setCurrentWidget(self.peaks_tab))
+        QtWidgets.QShortcut(QtGui.QKeySequence("M"), self, activated=lambda: self.tabs.setCurrentWidget(self.map_tab))
 
     def _zoom_x(self, factor: float):
         """Зум по X для спектра."""
@@ -455,27 +396,39 @@ class MainWindow(QtWidgets.QMainWindow):
     def _show_hotkeys(self):
         QtWidgets.QMessageBox.information(
             self, "Горячие клавиши",
+            "**Управление:**\n"
             "Space - Старт/Стоп\n"
             "+ - Приблизить\n"
             "- - Отдалить\n"
-            "R - Сброс вида\n"
+            "R - Сброс вида\n\n"
+            "**Навигация:**\n"
+            "S - Вкладка Спектр\n"
+            "P - Вкладка Пики\n"
+            "D - Вкладка Детектор\n"
+            "M - Вкладка Карта\n\n"
+            "**Экспорт:**\n"
             "Ctrl+E - Экспорт CSV\n"
             "Ctrl+Q - Выход\n\n"
-            "Двойной клик на спектре/водопаде - добавить маркер"
+            "**Мышь:**\n"
+            "Двойной клик на спектре/водопаде - добавить маркер\n"
+            "Колесо мыши - зум по X"
         )
 
     def _show_about(self):
         QtWidgets.QMessageBox.information(
             self, "О программе",
-            f"{APP_TITLE}\n"
-            "HackRF Sweep Analyzer\n\n"
-            "Модульная версия с поддержкой:\n"
-            "• hackrf_sweep и libhackrf (CFFI)\n"
+            f"**{APP_TITLE}**\n"
+            "Advanced HackRF Sweep Analyzer\n\n"
+            "**Возможности:**\n"
+            "• Адаптивный детектор с baseline + N порогом\n"
+            "• Трилатерация целей с 3 SDR\n"
+            "• Классификация сигналов по диапазонам\n"
+            "• Менеджер устройств с никнеймами\n"
+            "• Фильтр Калмана для траекторий\n"
             "• Калибровка CSV (SDR Console format)\n"
-            "• Спектр, водопад, пики, маркеры\n"
-            "• Детектор активности с ROI\n"
-            "• Трилатерация (3 SDR)\n"
-            "• Экспорт CSV/PNG"
+            "• Экспорт CSV/PNG/JSON\n\n"
+            "**Версия:** 0.2 Pro\n"
+            "**Лицензия:** MIT"
         )
 
     def _show_error(self, title: str, msg: str):
@@ -491,49 +444,173 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _switch_source(self, name: str):
         """Переключает источник данных."""
-        # Останавливаем текущий
         if self._source and self._source.is_running():
             self._source.stop()
 
         if name == "lib" and self._lib_available and self._lib_source:
             self._source = self._lib_source
+            self.lbl_source.setText("Источник: libhackrf")
             self.statusBar().showMessage("Источник: libhackrf (CFFI)", 3000)
         else:
             self._source = self._sweep_source
+            self.lbl_source.setText("Источник: hackrf_sweep")
             self.statusBar().showMessage("Источник: hackrf_sweep", 3000)
 
         self.spectrum_tab.set_source(self._source)
         self._wire_source(self._source)
 
-    def _choose_device(self):
-        """Выбор устройства HackRF."""
+    def _configure_devices(self):
+        """Открывает диалог настройки SDR устройств."""
+        # Получаем список доступных устройств
         serials = []
-        
         if self._lib_available and self._lib_source:
             serials = self._lib_source.list_serials()
         
         if not serials:
-            serials = ["(auto)"]
+            # Заглушка для демонстрации
+            serials = ["HACKRF_001", "HACKRF_002", "HACKRF_003", "HACKRF_004"]
         
-        current = self.settings.value("device/serial", "", type=str) or ""
-        
-        dlg = DeviceDialog(serials, current, self)
-        if self._lib_source:
-            dlg.set_provider(self._lib_source.list_serials)
+        dlg = DeviceConfigDialog(self.device_manager, serials, self)
+        dlg.devicesConfigured.connect(self._on_devices_configured)
         
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
-            sel = dlg.selected_serial_suffix().strip()
+            self._update_device_status()
+
+    def _on_devices_configured(self):
+        """Вызывается после настройки устройств."""
+        self._update_device_status()
+        
+        # Обновляем движок трилатерации
+        master, slave1, slave2 = self.device_manager.get_trilateration_devices()
+        
+        if master and slave1 and slave2:
+            self.trilateration_engine.set_device_positions(
+                (master.position_x, master.position_y, master.position_z),
+                (slave1.position_x, slave1.position_y, slave1.position_z),
+                (slave2.position_x, slave2.position_y, slave2.position_z),
+                master.serial, slave1.serial, slave2.serial
+            )
             
-            # Сохраняем выбор
-            self.settings.setValue("device/serial", sel)
+            # Обновляем карту
+            self.map_tab._on_sdr_moved()
+
+    def _update_device_status(self):
+        """Обновляет статус устройств в статусбаре."""
+        online_count = sum(1 for d in self.device_manager.devices.values() if d.is_online)
+        self.lbl_devices.setText(f"SDR: {online_count}")
+        
+        # Проверяем готовность к трилатерации
+        master, slave1, slave2 = self.device_manager.get_trilateration_devices()
+        if master and slave1 and slave2:
+            self.lbl_trilateration.setText("TRI: ✓")
+            self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #66ff66;")
+        else:
+            self.lbl_trilateration.setText("TRI: ✗")
+            self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #ff6666;")
+
+    # ---------------- трилатерация ----------------
+    def _open_trilateration_settings(self):
+        """Открывает настройки трилатерации."""
+        master, slave1, slave2 = self.device_manager.get_trilateration_devices()
+        
+        if not (master and slave1 and slave2):
+            QtWidgets.QMessageBox.warning(
+                self, "Трилатерация",
+                "Необходимо настроить 3 SDR устройства!\n"
+                "Источник → Настройка SDR устройств"
+            )
+            return
+        
+        # Показываем информацию о готовности
+        QtWidgets.QMessageBox.information(
+            self, "Трилатерация готова",
+            f"**Устройства настроены:**\n\n"
+            f"Master: {master.nickname} ({master.serial})\n"
+            f"Позиция: ({master.position_x:.1f}, {master.position_y:.1f}, {master.position_z:.1f})\n\n"
+            f"Slave 1: {slave1.nickname} ({slave1.serial})\n"
+            f"Позиция: ({slave1.position_x:.1f}, {slave1.position_y:.1f}, {slave1.position_z:.1f})\n\n"
+            f"Slave 2: {slave2.nickname} ({slave2.serial})\n"
+            f"Позиция: ({slave2.position_x:.1f}, {slave2.position_y:.1f}, {slave2.position_z:.1f})\n\n"
+            f"Переключитесь на вкладку **Карта** для запуска!"
+        )
+        
+        # Переключаемся на карту
+        self.tabs.setCurrentWidget(self.map_tab)
+
+    def _start_trilateration(self):
+        """Запускает трилатерацию."""
+        self.trilateration_engine.start()
+        self.lbl_trilateration.setText("TRI: 🔴")
+        self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #ff6666;")
+        self.statusBar().showMessage("Трилатерация запущена", 3000)
+
+    def _stop_trilateration(self):
+        """Останавливает трилатерацию."""
+        self.trilateration_engine.stop()
+        self.lbl_trilateration.setText("TRI: ✓")
+        self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #66ff66;")
+        self.statusBar().showMessage("Трилатерация остановлена", 3000)
+
+    def _process_for_trilateration(self, freqs_hz, power_dbm):
+        """Обрабатывает данные для трилатерации."""
+        if not self.trilateration_engine.is_running:
+            return
+        
+        # Определяем какое это устройство
+        # В реальной системе это будет определяться по источнику
+        device_serial = self.device_manager.master or "UNKNOWN"
+        
+        # Находим пики для трилатерации
+        threshold = np.median(power_dbm) + 10  # Простой порог
+        peaks_mask = power_dbm > threshold
+        
+        if np.any(peaks_mask):
+            peak_idx = np.argmax(power_dbm)
             
-            # Применяем к источникам
-            if self._lib_source:
-                self._lib_source.set_serial_suffix(sel or None)
+            from panorama.features.trilateration.engine import SignalMeasurement
+            measurement = SignalMeasurement(
+                timestamp=time.time(),
+                device_serial=device_serial,
+                freq_mhz=freqs_hz[peak_idx] / 1e6,
+                power_dbm=power_dbm[peak_idx],
+                bandwidth_khz=200,  # Заглушка
+                noise_floor_dbm=np.median(power_dbm)
+            )
             
-            # Для hackrf_sweep нужно будет передать через SweepConfig.serial
-            
-            self.statusBar().showMessage(f"Выбран: {sel or '(auto)'}", 3000)
+            self.trilateration_engine.add_measurement(measurement)
+
+    def _send_detection_to_map(self, detection):
+        """Отправляет обнаружение на карту."""
+        # Здесь должна быть логика добавления цели на карту
+        # Используем трилатерацию для определения позиции
+        positions = self.trilateration_engine.get_current_positions()
+        
+        if detection.freq_mhz in positions:
+            pos = positions[detection.freq_mhz]
+            # Добавляем на карту с вычисленными координатами
+            self.statusBar().showMessage(
+                f"Цель на карте: {detection.freq_mhz:.1f} МГц @ ({pos.x:.1f}, {pos.y:.1f})",
+                5000
+            )
+
+    def _open_signal_database(self):
+        """Открывает базу данных сигналов."""
+        QtWidgets.QMessageBox.information(
+            self, "База сигналов",
+            "**Классификация сигналов:**\n\n"
+            "• 87.5-108 МГц - FM Radio\n"
+            "• 118-137 МГц - Aviation\n"
+            "• 144-148 МГц - Amateur 2m\n"
+            "• 156-163 МГц - Marine VHF\n"
+            "• 430-440 МГц - Amateur 70cm\n"
+            "• 446 МГц - PMR446\n"
+            "• 433 МГц - ISM 433\n"
+            "• 868 МГц - ISM 868\n"
+            "• 900-960 МГц - GSM\n"
+            "• 2.4 ГГц - WiFi/Bluetooth\n"
+            "• 5.8 ГГц - FPV Video\n"
+            "• 1.5-1.6 ГГц - GPS/GNSS\n"
+        )
 
     # ---------------- калибровка ----------------
     def _try_load_default_calibration(self):
@@ -567,12 +644,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 ok = self._lib_source.load_calibration(path)
                 if ok:
                     self.act_cal_enable.setChecked(True)
+                    self.lbl_calibration.setText("CAL: ✓")
+                    self.lbl_calibration.setStyleSheet("padding: 0 10px; color: #66ff66;")
                     self.statusBar().showMessage(f"Калибровка загружена: {os.path.basename(path)}", 5000)
                 else:
                     self._show_error("Калибровка", "Ошибка загрузки в libhackrf")
             else:
                 # Для hackrf_sweep просто сохраняем профили
                 self.act_cal_enable.setChecked(True)
+                self.lbl_calibration.setText("CAL: ✓")
+                self.lbl_calibration.setStyleSheet("padding: 0 10px; color: #66ff66;")
                 self.statusBar().showMessage(f"Калибровка загружена: {os.path.basename(path)}", 5000)
             
             self.log.info(f"Загружено профилей калибровки: {len(self._calibration_profiles)}")
@@ -585,72 +666,22 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._lib_available and self._lib_source:
             self._lib_source.set_calibration_enabled(on)
         
+        if on and self._calibration_profiles:
+            self.lbl_calibration.setText("CAL: ✓")
+            self.lbl_calibration.setStyleSheet("padding: 0 10px; color: #66ff66;")
+        else:
+            self.lbl_calibration.setText("CAL: ✗")
+            self.lbl_calibration.setStyleSheet("padding: 0 10px; color: #ff6666;")
+        
         self.statusBar().showMessage(f"Калибровка: {'включена' if on else 'выключена'}", 3000)
 
     def _clear_calibration(self):
         """Очищает загруженную калибровку."""
         self._calibration_profiles = {}
         self.act_cal_enable.setChecked(False)
+        self.lbl_calibration.setText("CAL: ✗")
+        self.lbl_calibration.setStyleSheet("padding: 0 10px; color: #ff6666;")
         self.statusBar().showMessage("Калибровка очищена", 3000)
-
-    # ---------------- трилатерация ----------------
-    def _open_trilateration(self):
-        """Открывает окно трилатерации."""
-        if not self._lib_available:
-            self._show_error("Трилатерация", "Требуется libhackrf (CFFI)")
-            return
-        
-        # Диалог выбора 3 устройств
-        serials = self._lib_source.list_serials() if self._lib_source else []
-        if len(serials) < 3:
-            self._show_error("Трилатерация", f"Требуется минимум 3 устройства (найдено: {len(serials)})")
-            return
-        
-        # Простой диалог выбора
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Выбор устройств для трилатерации")
-        dlg.resize(400, 200)
-        
-        layout = QtWidgets.QFormLayout(dlg)
-        
-        master_combo = QtWidgets.QComboBox()
-        slave1_combo = QtWidgets.QComboBox()
-        slave2_combo = QtWidgets.QComboBox()
-        
-        for combo in [master_combo, slave1_combo, slave2_combo]:
-            combo.addItems(serials)
-        
-        if len(serials) >= 3:
-            master_combo.setCurrentIndex(0)
-            slave1_combo.setCurrentIndex(1)
-            slave2_combo.setCurrentIndex(2)
-        
-        layout.addRow("Master:", master_combo)
-        layout.addRow("Slave 1:", slave1_combo)
-        layout.addRow("Slave 2:", slave2_combo)
-        
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
-        )
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        layout.addWidget(buttons)
-        
-        if dlg.exec_() != QtWidgets.QDialog.Accepted:
-            return
-        
-        master = master_combo.currentText()
-        slave1 = slave1_combo.currentText()
-        slave2 = slave2_combo.currentText()
-        
-        # Проверка уникальности
-        if len({master, slave1, slave2}) < 3:
-            self._show_error("Трилатерация", "Выберите 3 разных устройства")
-            return
-        
-        # Открываем окно
-        self.trilat_window = TrilaterationWindow(master, slave1, slave2, self)
-        self.trilat_window.show()
 
     # ---------------- экспорт ----------------
     def _export_current_csv(self):
@@ -707,12 +738,22 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         
+        # Останавливаем трилатерацию
+        try:
+            if self.trilateration_engine.is_running:
+                self.trilateration_engine.stop()
+        except Exception:
+            pass
+        
         # Сохраняем настройки
         try:
             if hasattr(self.spectrum_tab, "save_settings"):
                 self.spectrum_tab.save_settings(self.settings)
         except Exception:
             pass
+        
+        # Сохраняем конфигурацию устройств
+        self.device_manager.save_config()
         
         self._save_window_state()
         super().closeEvent(e)
@@ -726,10 +767,13 @@ def main():
     settings = QSettings(QSettings.IniFormat, QSettings.UserScope, "panorama", "panorama")
 
     logger = setup_logging("panorama")
-    logger.info(f"ПАНОРАМА запущена")
+    logger.info(f"ПАНОРАМА Pro запущена")
 
     app = QtWidgets.QApplication(sys.argv)
-    app.setStyle("Fusion")  # Современный стиль
+    app.setStyle("Fusion")
+    
+    # Устанавливаем иконку приложения
+    app.setWindowIcon(QtGui.QIcon.fromTheme("radio"))
     
     win = MainWindow(logger, settings)
     win.show()

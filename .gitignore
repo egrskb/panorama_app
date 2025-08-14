@@ -33,3 +33,5 @@ Thumbs.db
 *.swp
 
 panorama.egg-info
+
+sdr_devices.json

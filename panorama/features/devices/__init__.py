@@ -1,2 +1,3 @@
-from .dialog import DeviceDialog
-__all__ = ["DeviceDialog"]
+from .manager import DeviceManager, DeviceConfigDialog, SDRDevice
+
+__all__ = ["DeviceManager", "DeviceConfigDialog", "SDRDevice"]
