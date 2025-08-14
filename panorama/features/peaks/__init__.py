@@ -1,1 +1,1 @@
-from .ui import PeaksWidget
+from .ui import AdaptivePeaksWidget

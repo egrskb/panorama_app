@@ -3,7 +3,7 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import QSettings
 
 from panorama.features.spectrum import SpectrumView
-from panorama.features.peaks import PeaksWidget
+from panorama.features.peaks import AdaptivePeaksWidget
 from panorama.features.devices import DeviceDialog
 from panorama.features.map3d import MapView
 
@@ -296,7 +296,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Остальные вкладки
         self.map_tab = MapView()
-        self.peaks_tab = PeaksWidget()
+        self.peaks_tab = AdaptivePeaksWidget()
         self.detector_tab = DetectorWidget()
 
         # Провязка: спектр → пики и детектор
