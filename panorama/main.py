@@ -425,14 +425,6 @@ class MainWindow(QtWidgets.QMainWindow):
         act_cal_clear.triggered.connect(self._clear_calibration)
         m_cal.addAction(act_cal_clear)
 
-        # === Инструменты ===
-        m_tools = menubar.addMenu("&Инструменты")
-        
-        act_trilat = QtWidgets.QAction("Трилатерация (3 SDR)…", self)
-        act_trilat.triggered.connect(self._open_trilateration)
-        act_trilat.setEnabled(self._lib_available)
-        m_tools.addAction(act_trilat)
-
         # === Справка ===
         m_help = menubar.addMenu("&Справка")
         

@@ -1,10 +1,11 @@
 from __future__ import annotations
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass
 import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl  # Для 3D если доступно
+import time
 
 
 @dataclass 
@@ -17,12 +18,31 @@ class Target:
     power_dbm: float
     confidence: float  # 0-1
     timestamp: float
+    rssi_master: float = -100.0
+    rssi_slave1: float = -100.0
+    rssi_slave2: float = -100.0
+
+
+@dataclass
+class DetectedSignal:
+    """Детектированный сигнал для трилатерации."""
+    freq_mhz: float
+    bandwidth_khz: float
+    center_freq_mhz: float
+    power_dbm: float
+    timestamp: float
+    duration_ms: float
+    modulation_type: str = "unknown"  # FM, AM, Digital, etc
+    confidence: float = 0.0
 
 
 class MapView(QtWidgets.QWidget):
     """Интерактивная карта с трилатерацией."""
     
     targetDetected = QtCore.pyqtSignal(object)  # Target
+    targetSelected = QtCore.pyqtSignal(object)  # Target - для демодуляции
+    trilaterationStarted = QtCore.pyqtSignal()
+    trilaterationStopped = QtCore.pyqtSignal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -34,29 +54,24 @@ class MapView(QtWidgets.QWidget):
             'slave2': (0.0, 10.0)
         }
         
+        # SDR устройства
+        self.master_device = None
+        self.slave1_device = None
+        self.slave2_device = None
+        
         # Цели
         self.targets: List[Target] = []
         self._target_id_seq = 0
-
-
-        targets_group = QtWidgets.QGroupBox("Обнаруженные цели")
-        targets_layout = QtWidgets.QVBoxLayout(targets_group)
-
-        self.targets_table = QtWidgets.QTableWidget(0, 4)
-        self.targets_table.setHorizontalHeaderLabels(["ID", "Позиция", "Частота", "Уровень"])
-        self.targets_table.setMaximumHeight(200)
-        targets_layout.addWidget(self.targets_table)
-
-        self.btn_clear = QtWidgets.QPushButton("Очистить цели")
-        self.btn_export = QtWidgets.QPushButton("Экспорт KML")
-        targets_layout.addWidget(self.btn_clear)
-        targets_layout.addWidget(self.btn_export)
-
+        self._selected_target: Optional[Target] = None
+        
         # Настройки отображения
         self.grid_size = 50.0  # метров
         self.show_grid = True
         self.show_labels = True
         self.show_circles = True
+        
+        # Флаг трилатерации
+        self._trilateration_active = False
         
         # Создаем UI
         self._build_ui()
@@ -71,7 +86,31 @@ class MapView(QtWidgets.QWidget):
         # === Левая панель управления ===
         left_panel = QtWidgets.QVBoxLayout()
         
-        # Настройки SDR
+        # Выбор устройств
+        devices_group = QtWidgets.QGroupBox("Устройства SDR")
+        devices_layout = QtWidgets.QFormLayout(devices_group)
+        
+        self.master_combo = QtWidgets.QComboBox()
+        self.master_combo.addItem("(не выбрано)")
+        self.master_combo.setToolTip("Основное устройство для анализа спектра")
+        
+        self.slave1_combo = QtWidgets.QComboBox()
+        self.slave1_combo.addItem("(не выбрано)")
+        
+        self.slave2_combo = QtWidgets.QComboBox()
+        self.slave2_combo.addItem("(не выбрано)")
+        
+        self.btn_refresh_devices = QtWidgets.QPushButton("Обновить")
+        self.btn_refresh_devices.clicked.connect(self._refresh_devices)
+        
+        devices_layout.addRow("Master SDR:", self.master_combo)
+        devices_layout.addRow("Slave 1:", self.slave1_combo)
+        devices_layout.addRow("Slave 2:", self.slave2_combo)
+        devices_layout.addRow(self.btn_refresh_devices)
+        
+        left_panel.addWidget(devices_group)
+        
+        # Позиции SDR
         sdr_group = QtWidgets.QGroupBox("Позиции SDR")
         sdr_layout = QtWidgets.QFormLayout(sdr_group)
         
@@ -149,16 +188,18 @@ class MapView(QtWidgets.QWidget):
         self.targets_table = QtWidgets.QTableWidget(0, 4)
         self.targets_table.setHorizontalHeaderLabels(["ID", "Позиция", "Частота", "Уровень"])
         self.targets_table.setMaximumHeight(200)
+        self.targets_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.targets_table.itemSelectionChanged.connect(self._on_target_selected)
         targets_layout.addWidget(self.targets_table)
         
-        btn_clear = QtWidgets.QPushButton("Очистить цели")
-        btn_export = QtWidgets.QPushButton("Экспорт KML")
-        targets_layout.addWidget(btn_clear)
-        targets_layout.addWidget(btn_export)
+        self.btn_clear = QtWidgets.QPushButton("Очистить цели")
+        self.btn_export = QtWidgets.QPushButton("Экспорт KML")
+        targets_layout.addWidget(self.btn_clear)
+        targets_layout.addWidget(self.btn_export)
         
         left_panel.addWidget(targets_group)
         
-        # Управление
+        # Управление трилатерацией
         control_group = QtWidgets.QGroupBox("Управление")
         control_layout = QtWidgets.QVBoxLayout(control_group)
         
@@ -166,11 +207,12 @@ class MapView(QtWidgets.QWidget):
         self.btn_stop = QtWidgets.QPushButton("Остановить")
         self.btn_stop.setEnabled(False)
         
-        self.btn_simulate = QtWidgets.QPushButton("Симуляция цели")
+        self.lbl_trilat_status = QtWidgets.QLabel("Требуется 3 SDR устройства")
+        self.lbl_trilat_status.setStyleSheet("color: orange; padding: 5px;")
         
+        control_layout.addWidget(self.lbl_trilat_status)
         control_layout.addWidget(self.btn_start)
         control_layout.addWidget(self.btn_stop)
-        control_layout.addWidget(self.btn_simulate)
         
         left_panel.addWidget(control_group)
         left_panel.addStretch()
@@ -200,6 +242,9 @@ class MapView(QtWidgets.QWidget):
         self.map_plot.addItem(self.sdr_scatter)
         self.map_plot.addItem(self.target_scatter)
         
+        # Текстовые подписи для SDR
+        self.sdr_labels = []
+        
         # Круги дальности
         self.range_circles = []
         
@@ -213,7 +258,7 @@ class MapView(QtWidgets.QWidget):
         
         map_container.addWidget(self.map_plot)
         
-        # === Правая панель (лог и статистика) ===
+        # === Правая панель (лог и демодуляция) ===
         right_panel = QtWidgets.QVBoxLayout()
         
         # Статистика
@@ -236,10 +281,28 @@ class MapView(QtWidgets.QWidget):
         
         self.event_log = QtWidgets.QTextEdit()
         self.event_log.setReadOnly(True)
-        self.event_log.setMaximumHeight(300)
+        self.event_log.setMaximumHeight(200)
         log_layout.addWidget(self.event_log)
         
         right_panel.addWidget(log_group)
+        
+        # Панель демодуляции видео
+        demod_group = QtWidgets.QGroupBox("Демодуляция FPV")
+        demod_layout = QtWidgets.QVBoxLayout(demod_group)
+        
+        self.video_label = QtWidgets.QLabel()
+        self.video_label.setMinimumHeight(200)
+        self.video_label.setStyleSheet("background-color: black; color: white; border: 1px solid #444;")
+        self.video_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.video_label.setText("Выберите цель для демодуляции")
+        
+        self.demod_info = QtWidgets.QLabel("Статус: Ожидание")
+        self.demod_info.setStyleSheet("padding: 5px;")
+        
+        demod_layout.addWidget(self.video_label)
+        demod_layout.addWidget(self.demod_info)
+        
+        right_panel.addWidget(demod_group)
         right_panel.addStretch()
         
         # === Сборка layout ===
@@ -249,7 +312,7 @@ class MapView(QtWidgets.QWidget):
         
         right_widget = QtWidgets.QWidget()
         right_widget.setLayout(right_panel)
-        right_widget.setMaximumWidth(250)
+        right_widget.setMaximumWidth(350)
         
         main_layout.addWidget(left_widget)
         main_layout.addLayout(map_container, stretch=1)
@@ -269,12 +332,80 @@ class MapView(QtWidgets.QWidget):
         
         self.btn_clear.clicked.connect(self._clear_targets)
         self.btn_export.clicked.connect(self._export_kml)
-        self.btn_simulate.clicked.connect(self._simulate_target)
         self.btn_start.clicked.connect(self._start_trilateration)
         self.btn_stop.clicked.connect(self._stop_trilateration)
         
+        self.master_combo.currentTextChanged.connect(self._check_devices_ready)
+        self.slave1_combo.currentTextChanged.connect(self._check_devices_ready)
+        self.slave2_combo.currentTextChanged.connect(self._check_devices_ready)
+        
         self.map_plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
-        self.map_plot.scene().sigMouseClicked.connect(self._on_map_clicked)
+        # Убираем добавление целей по клику
+        # self.map_plot.scene().sigMouseClicked.connect(self._on_map_clicked)
+        
+        # Обработчик клика на цель
+        self.target_scatter.sigClicked.connect(self._on_target_clicked)
+
+    def _refresh_devices(self):
+        """Обновляет список доступных устройств."""
+        # Здесь будет логика получения списка устройств
+        # Пока заглушка
+        devices = ["HackRF_001", "HackRF_002", "HackRF_003", "HackRF_004"]
+        
+        current_master = self.master_combo.currentText()
+        current_slave1 = self.slave1_combo.currentText()
+        current_slave2 = self.slave2_combo.currentText()
+        
+        self.master_combo.clear()
+        self.slave1_combo.clear()
+        self.slave2_combo.clear()
+        
+        self.master_combo.addItem("(не выбрано)")
+        self.slave1_combo.addItem("(не выбрано)")
+        self.slave2_combo.addItem("(не выбрано)")
+        
+        for dev in devices:
+            self.master_combo.addItem(dev)
+            self.slave1_combo.addItem(dev)
+            self.slave2_combo.addItem(dev)
+        
+        # Восстанавливаем выбор
+        idx = self.master_combo.findText(current_master)
+        if idx >= 0:
+            self.master_combo.setCurrentIndex(idx)
+        idx = self.slave1_combo.findText(current_slave1)
+        if idx >= 0:
+            self.slave1_combo.setCurrentIndex(idx)
+        idx = self.slave2_combo.findText(current_slave2)
+        if idx >= 0:
+            self.slave2_combo.setCurrentIndex(idx)
+        
+        self._log("Список устройств обновлен")
+
+    def _check_devices_ready(self):
+        """Проверяет готовность устройств для трилатерации."""
+        master = self.master_combo.currentText()
+        slave1 = self.slave1_combo.currentText()
+        slave2 = self.slave2_combo.currentText()
+        
+        # Проверяем что выбраны все 3 и они разные
+        if (master != "(не выбрано)" and 
+            slave1 != "(не выбрано)" and 
+            slave2 != "(не выбрано)" and
+            len({master, slave1, slave2}) == 3):
+            
+            self.btn_start.setEnabled(not self._trilateration_active)
+            self.lbl_trilat_status.setText("Устройства готовы")
+            self.lbl_trilat_status.setStyleSheet("color: green; padding: 5px;")
+            return True
+        else:
+            self.btn_start.setEnabled(False)
+            if master == "(не выбрано)" or slave1 == "(не выбрано)" or slave2 == "(не выбрано)":
+                self.lbl_trilat_status.setText("Выберите все 3 устройства")
+            else:
+                self.lbl_trilat_status.setText("Устройства должны быть разными")
+            self.lbl_trilat_status.setStyleSheet("color: orange; padding: 5px;")
+            return False
 
     def _on_sdr_moved(self):
         """Обновление позиций SDR."""
@@ -303,6 +434,20 @@ class MapView(QtWidgets.QWidget):
         
         self.sdr_scatter.setData(sdr_points, brush=sdr_brushes)
         
+        # Обновляем подписи SDR
+        for label in self.sdr_labels:
+            self.map_plot.removeItem(label)
+        self.sdr_labels.clear()
+        
+        if self.chk_labels.isChecked():
+            for name, pos in [('Master', self.sdr_positions['master']), 
+                              ('Slave1', self.sdr_positions['slave1']),
+                              ('Slave2', self.sdr_positions['slave2'])]:
+                label = pg.TextItem(name, anchor=(0.5, -0.5))
+                label.setPos(pos[0], pos[1])
+                self.map_plot.addItem(label)
+                self.sdr_labels.append(label)
+        
         # Цели
         if self.targets:
             target_points = []
@@ -312,7 +457,11 @@ class MapView(QtWidgets.QWidget):
                 target_points.append({'pos': (target.x, target.y), 'data': target})
                 # Цвет по уровню уверенности
                 alpha = int(100 + 155 * target.confidence)
-                target_brushes.append(pg.mkBrush(255, 200, 0, alpha))
+                if target == self._selected_target:
+                    # Выделенная цель - желтая с рамкой
+                    target_brushes.append(pg.mkBrush(255, 255, 0, alpha))
+                else:
+                    target_brushes.append(pg.mkBrush(255, 200, 0, alpha))
             
             self.target_scatter.setData(target_points, brush=target_brushes)
         
@@ -387,24 +536,77 @@ class MapView(QtWidgets.QWidget):
             scene_pos = vb.mapSceneToView(pos)
             self.cursor_label.setText(f"X: {scene_pos.x():.1f} м, Y: {scene_pos.y():.1f} м")
 
-    def _on_map_clicked(self, ev):
-        """Клик по карте."""
-        if ev.button() == QtCore.Qt.LeftButton:
-            vb = self.map_plot.getViewBox()
-            pos = vb.mapSceneToView(ev.scenePos())
-            self._add_target(pos.x(), pos.y(), freq_mhz=2450.0, power_dbm=-60.0)
+    def _on_target_clicked(self, plot, points):
+        """Обработка клика на цель."""
+        if points:
+            target = points[0].data()
+            if isinstance(target, Target):
+                self._select_target(target)
 
-    def _add_target(self, x: float, y: float, freq_mhz: float = 0.0, power_dbm: float = -100.0):
-        """Добавление цели."""
+    def _on_target_selected(self):
+        """Обработка выбора цели в таблице."""
+        rows = self.targets_table.selectionModel().selectedRows()
+        if rows:
+            row = rows[0].row()
+            if 0 <= row < len(self.targets):
+                self._select_target(self.targets[row])
+
+    def _select_target(self, target: Target):
+        """Выбирает цель для демодуляции."""
+        self._selected_target = target
+        self._refresh_map()
+        
+        # Обновляем панель демодуляции
+        self.video_label.setText(f"Демодуляция цели #{target.id}\nЧастота: {target.freq_mhz:.1f} МГц")
+        self.demod_info.setText(f"Статус: Попытка демодуляции...")
+        
+        # Эмитим сигнал для внешней обработки
+        self.targetSelected.emit(target)
+        
+        # Заглушка для демодуляции
+        QtCore.QTimer.singleShot(2000, self._simulate_demodulation_fail)
+        
+        self._log(f"Выбрана цель #{target.id} для демодуляции")
+
+    def _simulate_demodulation_fail(self):
+        """Симуляция неудачной демодуляции."""
+        if self._selected_target:
+            self.video_label.setText(f"Не удалось демодулировать сигнал\n"
+                                    f"Цель #{self._selected_target.id}\n"
+                                    f"Частота: {self._selected_target.freq_mhz:.1f} МГц\n"
+                                    f"Уровень: {self._selected_target.power_dbm:.1f} дБм")
+            self.demod_info.setText("Статус: Демодуляция не удалась (слабый сигнал или неподдерживаемый формат)")
+
+    def add_target_from_detection(self, detected_signal: DetectedSignal, 
+                                  rssi_master: float, rssi_slave1: float, rssi_slave2: float) -> Optional[Target]:
+        """
+        Добавляет цель на основе детектированного сигнала и RSSI от 3 SDR.
+        Выполняет трилатерацию для определения позиции.
+        """
+        if not self._trilateration_active:
+            return None
+        
+        # Выполняем трилатерацию
+        position = self.trilaterate(rssi_master, rssi_slave1, rssi_slave2)
+        if position is None:
+            self._log(f"Трилатерация не удалась для сигнала {detected_signal.freq_mhz:.1f} МГц")
+            return None
+        
+        x, y = position
+        
+        # Создаем цель
         self._target_id_seq += 1
         target = Target(
             id=self._target_id_seq,
             x=x,
             y=y,
-            freq_mhz=freq_mhz,
-            power_dbm=power_dbm,
-            confidence=0.8,
-            timestamp=QtCore.QDateTime.currentMSecsSinceEpoch() / 1000.0
+            freq_mhz=detected_signal.freq_mhz,
+            power_dbm=detected_signal.power_dbm,
+            confidence=detected_signal.confidence,
+            timestamp=detected_signal.timestamp,
+            rssi_master=rssi_master,
+            rssi_slave1=rssi_slave1,
+            rssi_slave2=rssi_slave2
         )
         
         self.targets.append(target)
@@ -418,27 +620,23 @@ class MapView(QtWidgets.QWidget):
         self.targets_table.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{target.power_dbm:.1f} дБм"))
         
         self.lbl_targets.setText(str(len(self.targets)))
-        self._log(f"Цель #{target.id} добавлена: ({x:.1f}, {y:.1f})")
+        self._log(f"Цель #{target.id} обнаружена: ({x:.1f}, {y:.1f}) @ {detected_signal.freq_mhz:.1f} МГц")
         
         self._refresh_map()
         self.targetDetected.emit(target)
+        
+        return target
 
     def _clear_targets(self):
         """Очистка всех целей."""
         self.targets.clear()
         self.targets_table.setRowCount(0)
         self.lbl_targets.setText("0")
+        self._selected_target = None
+        self.video_label.setText("Выберите цель для демодуляции")
+        self.demod_info.setText("Статус: Ожидание")
         self._refresh_map()
         self._log("Все цели удалены")
-
-    def _simulate_target(self):
-        """Симуляция обнаружения цели."""
-        import random
-        x = random.uniform(-30, 30)
-        y = random.uniform(-30, 30)
-        freq = random.choice([433.0, 868.0, 915.0, 2437.0, 2450.0, 2462.0])
-        power = random.uniform(-80, -40)
-        self._add_target(x, y, freq, power)
 
     def _export_kml(self):
         """Экспорт целей в KML для Google Earth."""
@@ -465,15 +663,18 @@ class MapView(QtWidgets.QWidget):
     <IconStyle>
         <color>ff00ffff</color>
         <scale>1.0</scale>
+        <Icon>
+            <href>http://maps.google.com/mapfiles/kml/shapes/target.png</href>
+        </Icon>
     </IconStyle>
 </Style>
 """
             # Добавляем точки
             for target in self.targets:
                 # Преобразуем локальные координаты в GPS (примерный расчет)
-                # Предполагаем центр в 55.7558, 37.6173 (Москва)
-                lat_base = 55.7558
-                lon_base = 37.6173
+                # Предполагаем центр в Helsinki, Uusimaa, FI
+                lat_base = 60.1699  # Helsinki
+                lon_base = 24.9384
                 
                 # Примерное преобразование метров в градусы
                 lat = lat_base + (target.y / 111000.0)
@@ -482,7 +683,15 @@ class MapView(QtWidgets.QWidget):
                 kml_content += f"""
 <Placemark>
     <name>Target {target.id}</name>
-    <description>Freq: {target.freq_mhz:.1f} MHz, Power: {target.power_dbm:.1f} dBm</description>
+    <description>
+        Freq: {target.freq_mhz:.1f} MHz
+        Power: {target.power_dbm:.1f} dBm
+        Confidence: {target.confidence:.2f}
+        RSSI Master: {target.rssi_master:.1f} dBm
+        RSSI Slave1: {target.rssi_slave1:.1f} dBm
+        RSSI Slave2: {target.rssi_slave2:.1f} dBm
+        Timestamp: {QDateTime.fromSecsSinceEpoch(int(target.timestamp)).toString()}
+    </description>
     <styleUrl>#targetStyle</styleUrl>
     <Point>
         <coordinates>{lon},{lat},0</coordinates>
@@ -497,28 +706,89 @@ class MapView(QtWidgets.QWidget):
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(kml_content)
             
-            QtWidgets.QMessageBox.information(self, "Экспорт", f"Сохранено {len(self.targets)} целей в KML")
+            QtWidgets.QMessageBox.information(self, "Экспорт", f"Сохранено {len(self.targets)} целей в KML:\n{path}")
+            self._log(f"Экспортировано {len(self.targets)} целей в {path}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Ошибка", f"Ошибка экспорта: {e}")
+            self._log(f"Ошибка экспорта KML: {e}")
 
     def _start_trilateration(self):
         """Запуск трилатерации."""
+        if not self._check_devices_ready():
+            return
+        
+        self._trilateration_active = True
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self._log("Трилатерация запущена")
-        # Здесь будет логика трилатерации
+        self.lbl_trilat_status.setText("Трилатерация активна")
+        self.lbl_trilat_status.setStyleSheet("color: green; background-color: #e0ffe0; padding: 5px;")
+        
+        self.master_device = self.master_combo.currentText()
+        self.slave1_device = self.slave1_combo.currentText()
+        self.slave2_device = self.slave2_combo.currentText()
+        
+        self._log(f"Трилатерация запущена")
+        self._log(f"Master: {self.master_device}")
+        self._log(f"Slave1: {self.slave1_device}")
+        self._log(f"Slave2: {self.slave2_device}")
+        
+        self.trilaterationStarted.emit()
+        
+        # Симуляция автоматического обнаружения целей
+        self._simulate_auto_detection()
 
     def _stop_trilateration(self):
         """Остановка трилатерации."""
+        self._trilateration_active = False
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self.lbl_trilat_status.setText("Трилатерация остановлена")
+        self.lbl_trilat_status.setStyleSheet("color: orange; padding: 5px;")
         self._log("Трилатерация остановлена")
+        self.trilaterationStopped.emit()
+
+    def _simulate_auto_detection(self):
+        """Симуляция автоматического обнаружения целей (заглушка)."""
+        if not self._trilateration_active:
+            return
+        
+        import random
+        
+        # Симулируем обнаружение сигнала
+        if random.random() < 0.3:  # 30% вероятность обнаружения
+            signal = DetectedSignal(
+                freq_mhz=random.choice([433.0, 868.0, 915.0, 2437.0, 2450.0, 2462.0, 5800.0]),
+                bandwidth_khz=random.uniform(100, 1000),
+                center_freq_mhz=0,
+                power_dbm=random.uniform(-80, -40),
+                timestamp=time.time(),
+                duration_ms=random.uniform(100, 5000),
+                modulation_type=random.choice(["FM", "AM", "Digital", "FHSS", "Unknown"]),
+                confidence=random.uniform(0.5, 1.0)
+            )
+            signal.center_freq_mhz = signal.freq_mhz
+            
+            # Симулируем RSSI от каждого SDR
+            base_rssi = signal.power_dbm
+            rssi_master = base_rssi + random.uniform(-10, 5)
+            rssi_slave1 = base_rssi + random.uniform(-15, 5)
+            rssi_slave2 = base_rssi + random.uniform(-15, 5)
+            
+            # Добавляем цель
+            self.add_target_from_detection(signal, rssi_master, rssi_slave1, rssi_slave2)
+        
+        # Планируем следующую проверку
+        if self._trilateration_active:
+            QtCore.QTimer.singleShot(3000, self._simulate_auto_detection)
 
     def _log(self, message: str):
         """Добавление записи в лог."""
         from PyQt5.QtCore import QDateTime
         timestamp = QDateTime.currentDateTime().toString("HH:mm:ss")
         self.event_log.append(f"[{timestamp}] {message}")
+        # Автопрокрутка вниз
+        scrollbar = self.event_log.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
         
     def trilaterate(self, rssi_master: float, rssi_slave1: float, rssi_slave2: float) -> Optional[Tuple[float, float]]:
         """
@@ -559,7 +829,16 @@ class MapView(QtWidgets.QWidget):
             # Решаем Ax = b
             result = np.linalg.lstsq(A, b, rcond=None)[0]
             
-            return float(result[0]), float(result[1])
+            # Добавляем случайный шум для реалистичности
+            import random
+            x = float(result[0]) + random.uniform(-2, 2)
+            y = float(result[1]) + random.uniform(-2, 2)
+            
+            # Ограничиваем область
+            x = np.clip(x, -50, 50)
+            y = np.clip(y, -50, 50)
+            
+            return x, y
             
         except Exception as e:
             self._log(f"Ошибка трилатерации: {e}")
@@ -569,3 +848,15 @@ class MapView(QtWidgets.QWidget):
         """Обновление от спектра (для интеграции)."""
         # Здесь можно добавить логику обнаружения целей по спектру
         pass
+
+    def get_devices(self) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """Возвращает выбранные устройства."""
+        master = self.master_combo.currentText()
+        slave1 = self.slave1_combo.currentText()
+        slave2 = self.slave2_combo.currentText()
+        
+        master = None if master == "(не выбрано)" else master
+        slave1 = None if slave1 == "(не выбрано)" else slave1
+        slave2 = None if slave2 == "(не выбрано)" else slave2
+        
+        return master, slave1, slave2

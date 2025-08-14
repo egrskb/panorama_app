@@ -1,3 +1,4 @@
+
 #!/bin/bash
 # Простой скрипт запуска PANORAMA
 
@@ -13,4 +14,5 @@ if [ -d "venv" ]; then
 fi
 
 # Запускаем приложение
+echo "Запуск ПАНОРАМА..."
 python3 -m panorama.main "$@"
