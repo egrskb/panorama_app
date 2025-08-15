@@ -19,12 +19,11 @@ if [[ ! -f "$SRC" ]]; then
   exit 1
 fi
 
-gcc -shared -fPIC -O3 -Wall -Wextra \
-  $(pkg-config --cflags libhackrf fftw3f) \
-  -I"$SCRIPT_DIR" \
-  "$SRC" \
-  $(pkg-config --libs libhackrf fftw3f) -lm -pthread \
-  -Wl,-rpath,'$ORIGIN' \
-  -o "$OUT"
+gcc -shared -fPIC -O3 \
+    $(pkg-config --cflags libhackrf fftw3f) \
+    -o libhackrf_qsa.so \
+    hq_sweep.c \
+    $(pkg-config --libs libhackrf fftw3f) \
+    -lm -pthread
 
 echo "✓ Успешно: $OUT"

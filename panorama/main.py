@@ -2,6 +2,7 @@
 import sys, os, stat, getpass, pathlib, logging, time
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import QSettings
+import numpy as np
 
 from panorama.features.spectrum import SpectrumView
 from panorama.features.peaks.ui_improved import AdaptivePeaksWidget

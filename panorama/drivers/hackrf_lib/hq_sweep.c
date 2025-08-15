@@ -16,6 +16,19 @@
 #define OFFSET_HZ                         (7500000u)    /* 7.5 MHz */
 #define BLOCKS_PER_TRANSFER               16
 
+/* -------- Внешние макросы из hq_sweep.h ----------
+ * Должны быть определены:
+ *   BYTES_PER_BLOCK   размер блока в байтах, приходящего из прошивки sweep
+ *   INTERLEAVED       0/1 (обычно INTERLEAVED = 1)
+ * Также там должен быть определён тип колбэка:
+ *   typedef void (*hq_segment_cb)(const double* freqs_hz,
+ *                                 const float*  data_dbm,
+ *                                 int count,
+ *                                 double fft_bin_width_hz,
+ *                                 uint64_t hz_low, uint64_t hz_high,
+ *                                 void* user);
+ */
+
 /* -------- Глобалы устройства/состояние -------- */
 static hackrf_device* dev = NULL;
 static volatile int running = 0;
@@ -283,13 +296,8 @@ int hq_configure(double f_start_mhz, double f_stop_mhz,
     if (!dev) return -1;
 
     /* сетки gain как в hackrf_sweep */
-    if (lna_db < 0) lna_db = 0; 
-    if (lna_db > 40) lna_db = 40; 
-    lna_db -= (lna_db % 8);
-    
-    if (vga_db < 0) vga_db = 0; 
-    if (vga_db > 62) vga_db = 62; 
-    vga_db -= (vga_db % 2);
+    if (lna_db < 0) lna_db = 0; if (lna_db > 40) lna_db = 40; lna_db -= (lna_db % 8);
+    if (vga_db < 0) vga_db = 0; if (vga_db > 62) vga_db = 62; vga_db -= (vga_db % 2);
 
     int r = hackrf_set_lna_gain(dev, lna_db);
     if (r) { set_err("hackrf_set_lna_gain failed: %d", r); return r; }
@@ -305,8 +313,7 @@ int hq_configure(double f_start_mhz, double f_stop_mhz,
     if (requested_bin_hz > 5e6)    requested_bin_hz = 5e6;
 
     int N = (int)floor((double)DEFAULT_SAMPLE_RATE_HZ / requested_bin_hz);
-    if (N < 4) N = 4; 
-    if (N > 8180) N = 8180;
+    if (N < 4) N = 4; if (N > 8180) N = 8180;
     while ((N + 4) % 8) N++;
     fftSize = N;
     fft_bin_width = (double)DEFAULT_SAMPLE_RATE_HZ / (double)fftSize;
@@ -341,15 +348,7 @@ int hq_configure(double f_start_mhz, double f_stop_mhz,
 
     freq_ranges[0] = (uint16_t)floor(f_start_mhz);
     freq_ranges[1] = (uint16_t)ceil (f_stop_mhz);
-    
-    /* Проверка на переполнение uint16_t */
-    if (freq_ranges[1] > 7250) freq_ranges[1] = 7250;
-    
     step_count = (uint32_t)((freq_ranges[1] - freq_ranges[0]) / TUNE_STEP_MHZ) + 1u;
-    
-    /* Отладочная информация */
-    fprintf(stderr, "hq_configure: %u-%u MHz, bin=%d Hz, steps=%u\n", 
-            freq_ranges[0], freq_ranges[1], fftSize, step_count);
 
     return 0;
 }
@@ -357,35 +356,17 @@ int hq_configure(double f_start_mhz, double f_stop_mhz,
 static int rx_callback(hackrf_transfer* transfer)
 {
     if (!running || !g_cb) return 0;
-    
-    static uint64_t last_frequency = 0;
-    static int blocks_processed = 0;
 
     int8_t* buf = (int8_t*)transfer->buffer;
     for (int j=0; j<BLOCKS_PER_TRANSFER; ++j) {
         uint8_t* ubuf = (uint8_t*)buf;
-        
-        /* Проверяем заголовок блока */
-        if (!(ubuf[0]==0x7F && ubuf[1]==0x7F)) { 
-            buf += BYTES_PER_BLOCK; 
-            continue; 
-        }
+        if (!(ubuf[0]==0x7F && ubuf[1]==0x7F)) { buf += BYTES_PER_BLOCK; continue; }
 
         uint64_t frequency =
             ((uint64_t)ubuf[9] << 56) | ((uint64_t)ubuf[8] << 48) |
             ((uint64_t)ubuf[7] << 40) | ((uint64_t)ubuf[6] << 32) |
             ((uint64_t)ubuf[5] << 24) | ((uint64_t)ubuf[4] << 16) |
             ((uint64_t)ubuf[3] << 8)  | (uint64_t)ubuf[2];
-        
-        /* Отладка для высоких частот */
-        if (frequency > 5900000000ULL && frequency < 6100000000ULL) {
-            if (frequency != last_frequency) {
-                fprintf(stderr, "Processing freq: %.1f MHz\n", frequency / 1e6);
-                last_frequency = frequency;
-            }
-        }
-        
-        blocks_processed++;
 
         /* последние fftSize I/Q с конца блока */
         buf += BYTES_PER_BLOCK - (fftSize*2);
@@ -466,6 +447,8 @@ int hq_start(hq_segment_cb cb, void* user)
 
 int hq_device_count(void)
 {
+    int r = hackrf_init();
+    if (r) { set_err("hackrf_init failed: %d", r); return 0; }
     hackrf_device_list_t* lst = hackrf_device_list();
     if (!lst) return 0;
     int n = lst->devicecount;
@@ -476,6 +459,8 @@ int hq_device_count(void)
 int hq_get_device_serial(int idx, char* buf, int buf_len)
 {
     if (!buf || buf_len <= 0) return -1;
+    int r = hackrf_init();
+    if (r) { set_err("hackrf_init failed: %d", r); return r; }
 
     hackrf_device_list_t* lst = hackrf_device_list();
     if (!lst) return -2;
