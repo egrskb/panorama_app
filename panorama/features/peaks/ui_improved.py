@@ -118,16 +118,41 @@ class AdaptivePeaksWidget(QtWidgets.QWidget):
         
         layout.addLayout(buttons_layout)
         
-        # Таблица пиков
+        # Таблица пиков с улучшенным отображением
         self.table = QtWidgets.QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels([
             "Частота (МГц)", "Уровень (дБм)", "Над шумом (дБ)", 
             "Ширина (кГц)", "Q-фактор", "Тип"
         ])
-        self.table.horizontalHeader().setStretchLastSection(True)
+        
+        # Настройка ширины столбцов для лучшего отображения
+        self.table.setColumnWidth(0, 120)  # Частота
+        self.table.setColumnWidth(1, 100)  # Уровень
+        self.table.setColumnWidth(2, 100)  # Над шумом
+        self.table.setColumnWidth(3, 90)   # Ширина
+        self.table.setColumnWidth(4, 80)   # Q-фактор
+        self.table.setColumnWidth(5, 120)  # Тип
+        
+        self.table.horizontalHeader().setStretchLastSection(False)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
+        
+        # Улучшенные стили для таблицы
+        self.table.setStyleSheet("""
+            QTableWidget {
+                gridline-color: #555;
+                font-size: 11px;
+            }
+            QTableWidget::item {
+                padding: 2px;
+            }
+            QHeaderView::section {
+                font-weight: bold;
+                padding: 4px;
+            }
+        """)
+        
         layout.addWidget(self.table)
         
         # Статистика

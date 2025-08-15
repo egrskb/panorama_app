@@ -488,6 +488,19 @@ class MainWindow(QtWidgets.QMainWindow):
         # Спектр → Пики и Детектор
         self.spectrum_tab.newRowReady.connect(self.peaks_tab.update_from_row)
         self.spectrum_tab.newRowReady.connect(self.detector_tab.push_data)
+        
+        # Пики → Спектр (только для навигации по частоте)
+        self.peaks_tab.goToFreq.connect(self.spectrum_tab.set_cursor_freq)
+        # ВАЖНО: Пики НЕ отправляют данные на карту!
+        
+        # Детектор → Карта (только через кнопку пользователя)
+        self.detector_tab.sendToMap.connect(self._send_detection_to_map)
+        self.detector_tab.rangeSelected.connect(self.spectrum_tab.add_roi_region)
+        
+        # Карта → Трилатерация
+        self.map_tab.trilaterationStarted.connect(self._start_trilateration)
+        self.map_tab.trilaterationStopped.connect(self._stop_trilateration)
+        self.spectrum_tab.newRowReady.connect(self.detector_tab.push_data)
         self.spectrum_tab.newRowReady.connect(self._process_for_trilateration)
         
         # Пики → Спектр
@@ -793,13 +806,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 master.serial, slave1.serial, slave2.serial
             )
             
-            # Синхронизируем с картой
-            self.map_tab.sdr_positions = {
-                'master': (master.position_x, master.position_y),
-                'slave1': (slave1.position_x, slave1.position_y),
-                'slave2': (slave2.position_x, slave2.position_y)
-            }
-            self.map_tab._refresh_map()
+            # ВАЖНО: Синхронизируем с картой
+            self.map_tab.update_devices(master, slave1, slave2)
 
     def _update_device_status(self):
         """Обновляет статус устройств в статусбаре."""
@@ -893,7 +901,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.trilateration_engine.add_measurement(measurement)
 
     def _send_detection_to_map(self, detection):
-        """Отправляет обнаружение на карту."""
+        """Отправляет обнаружение на карту (вызывается только пользователем через кнопку)."""
         if self._current_source_type == "sweep":
             QtWidgets.QMessageBox.warning(
                 self, "Карта",
@@ -901,46 +909,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Переключитесь на источник libhackrf."
             )
             return
+        
+        # Добавляем цель на карту
+        target = self.map_tab.add_target_from_detector(detection)
+        
+        if target:
+            self.statusBar().showMessage(
+                f"Цель добавлена на карту: {detection.freq_mhz:.1f} МГц",
+                5000
+            )
             
-        # Используем позицию из трилатерации или добавляем в центр
-        positions = self.trilateration_engine.get_current_positions()
-        
-        if detection.freq_mhz in positions:
-            pos = positions[detection.freq_mhz]
-            x, y = pos.x, pos.y
-        else:
-            # Добавляем в центр карты
-            x, y = 0, 0
-        
-        # Создаем цель для карты
-        from panorama.features.map3d.view import Target
-        target = Target(
-            id=len(self.map_tab.targets) + 1,
-            x=x,
-            y=y,
-            freq_mhz=detection.freq_mhz,
-            power_dbm=detection.power_dbm,
-            confidence=detection.confidence,
-            timestamp=detection.timestamp
-        )
-        
-        self.map_tab.targets.append(target)
-        self.map_tab._refresh_map()
-        
-        # Обновляем таблицу целей на карте
-        row = self.map_tab.targets_table.rowCount()
-        self.map_tab.targets_table.insertRow(row)
-        self.map_tab.targets_table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(target.id)))
-        self.map_tab.targets_table.setItem(row, 1, QtWidgets.QTableWidgetItem(f"({target.x:.1f}, {target.y:.1f})"))
-        self.map_tab.targets_table.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{target.freq_mhz:.3f} МГц"))
-        self.map_tab.targets_table.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{target.power_dbm:.1f} дБм"))
-        
-        self.map_tab.lbl_targets.setText(str(len(self.map_tab.targets)))
-        
-        self.statusBar().showMessage(
-            f"Цель добавлена на карту: {detection.freq_mhz:.1f} МГц @ ({x:.1f}, {y:.1f})",
-            5000
-        )
+            # Переключаемся на вкладку карты
+            self.tabs.setCurrentWidget(self.map_tab)
 
     def _open_signal_database(self):
         """Открывает базу данных сигналов."""
