@@ -9,7 +9,7 @@ from panorama.features.detector.widget import DetectorWidget
 from panorama.features.devices.manager import DeviceManager, DeviceConfigDialog
 from panorama.features.map3d import MapView
 from panorama.features.trilateration.engine import TrilaterationEngine, SignalMeasurement
-
+import numpy as np
 from panorama.drivers.hackrf_sweep import HackRFSweepSource
 from panorama.shared.calibration import load_calibration_csv, get_calibration_lut
 

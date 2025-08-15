@@ -1,38 +1,30 @@
-#!/bin/bash
-# Скрипт компиляции libhackrf_qsa.so для Linux
+#!/usr/bin/env bash
+set -euo pipefail
+echo "Компиляция libhackrf_qsa.so…"
 
-echo "Компиляция libhackrf_qsa.so..."
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SRC="$SCRIPT_DIR/hq_sweep.c"
+OUT="$SCRIPT_DIR/libhackrf_qsa.so"
 
-# Проверяем наличие зависимостей
-if ! pkg-config --exists libhackrf; then
-    echo "Ошибка: libhackrf не найдена"
-    echo "Установите: sudo apt install libhackrf-dev"
+for pc in libhackrf fftw3f; do
+  if ! pkg-config --exists "$pc"; then
+    echo "Ошибка: не найден $pc (sudo apt install libhackrf-dev libfftw3-dev)"
     exit 1
+  fi
+done
+
+if [[ ! -f "$SRC" ]]; then
+  echo "Ошибка: не найден исходник: $SRC"
+  ls -la "$SCRIPT_DIR"
+  exit 1
 fi
 
-if ! pkg-config --exists fftw3f; then
-    echo "Ошибка: fftw3 не найдена"
-    echo "Установите: sudo apt install libfftw3-dev"
-    exit 1
-fi
+gcc -shared -fPIC -O3 -Wall -Wextra \
+  $(pkg-config --cflags libhackrf fftw3f) \
+  -I"$SCRIPT_DIR" \
+  "$SRC" \
+  $(pkg-config --libs libhackrf fftw3f) -lm -pthread \
+  -Wl,-rpath,'$ORIGIN' \
+  -o "$OUT"
 
-# Компилируем
-gcc -shared -fPIC -O3 \
-    $(pkg-config --cflags libhackrf) \
-    $(pkg-config --cflags fftw3f) \
-    -o libhackrf_qsa.so \
-    panorama/drivers/hackrf_lib/hq_sweep.c \
-    $(pkg-config --libs libhackrf) \
-    $(pkg-config --libs fftw3f) \
-    -lm -pthread
-
-if [ $? -eq 0 ]; then
-    echo "✓ Успешно скомпилировано: libhackrf_qsa.so"
-    
-    # Копируем в нужные места
-    cp libhackrf_qsa.so panorama/drivers/hackrf_lib/
-    echo "✓ Скопировано в panorama/drivers/hackrf_lib/"
-else
-    echo "✗ Ошибка компиляции"
-    exit 1
-fi
+echo "✓ Успешно: $OUT"
