@@ -80,15 +80,20 @@ class HackRFLibSource(SourceBackend):
         """Список серийников, которые видит библиотека."""
         out: List[str] = []
         try:
+            # Сначала инициализируем hackrf если не инициализировано
+            # (делается автоматически внутри hq_device_count)
             n = int(self._lib.hq_device_count())
+            print(f"Found {n} HackRF devices")  # Для отладки
+            
             for i in range(n):
                 b = self._ffi.new("char[128]")
                 if self._lib.hq_get_device_serial(i, b, 127) == 0:
                     s = self._ffi.string(b).decode(errors="ignore")
-                    if s:
+                    if s and s != "0000000000000000":  # Фильтруем пустые серийники
                         out.append(s)
-        except Exception:
-            pass
+                        print(f"Device {i}: {s}")  # Для отладки
+        except Exception as e:
+            print(f"Error listing devices: {e}")
         return out
 
     def set_serial_suffix(self, serial: Optional[str]):
@@ -299,9 +304,18 @@ class _Worker(QtCore.QObject, threading.Thread):
                 if n <= 0:
                     return
                 
+                # Отладка для высоких частот
+                if f_low_hz > 5900000000 and f_low_hz < 6100000000:
+                    print(f"CB: {f_low_hz/1e6:.1f}-{f_high_hz/1e6:.1f} MHz, {n} bins")
+                
                 # Копируем данные из C-памяти
                 freqs = np.frombuffer(self._ffi.buffer(freqs_ptr, n * 8), dtype=np.float64, count=n).copy()
                 power = np.frombuffer(self._ffi.buffer(pwr_ptr, n * 4), dtype=np.float32, count=n).copy()
+                
+                # Проверяем валидность данных
+                if np.all(np.isnan(power)) or np.all(power == 0):
+                    print(f"WARNING: Invalid power data at {f_low_hz/1e6:.1f} MHz")
+                    return
                 
                 # Отправляем сегмент как есть
                 bin_hz = int(round(float(fft_bin_width_hz))) or int(self._cfg.bin_hz)
