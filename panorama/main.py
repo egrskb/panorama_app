@@ -77,6 +77,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._lib_source = None
         self._current_source_type = "sweep"
         self._slave_sweep_sources: dict[str, HackRFSweepSource] = {}
+        self._trilat_timer = QtCore.QTimer()
+        self._trilat_timer.setInterval(100)
+        self._trilat_timer.timeout.connect(self._poll_trilat_positions)
         
         if _LIB_AVAILABLE:
             try:
@@ -868,6 +871,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 src.start(cfg_dev)
                 self._slave_sweep_sources[dev.serial] = src
 
+        self._trilat_timer.start()
+
     def _stop_trilateration(self):
         """Останавливает трилатерацию."""
         self.trilateration_engine.stop()
@@ -880,6 +885,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_trilateration.setText("TRI: ГОТОВ")
         self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #66ff66;")
         self.statusBar().showMessage("Трилатерация остановлена", 3000)
+        self._trilat_timer.stop()
 
     def _process_for_trilateration(self, freqs_hz, power_dbm, device_serial):
         """Обрабатывает данные для трилатерации."""
@@ -904,6 +910,12 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
             self.trilateration_engine.add_measurement(measurement)
+
+    def _poll_trilat_positions(self):
+        """Периодически получает координаты целей и обновляет карту."""
+        positions = self.trilateration_engine.get_current_positions()
+        for pos in positions.values():
+            self.map_tab.update_target_position(pos.freq_mhz, pos.x, pos.y, pos.confidence)
 
     def _send_detection_to_map(self, detection):
         """Отправляет обнаружение на карту (вызывается только пользователем через кнопку)."""
