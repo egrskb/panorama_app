@@ -332,8 +332,8 @@ class _Worker(QtCore.QObject, threading.Thread):
                 result = self._assembler.add_segment(freqs, power, int(f_low_hz))
                 if result is not None:
                     full_freqs, full_power = result
-                    # Эмитим полный проход через специальный сигнал
-                    self._parent.fullSweepReady.emit(full_freqs, full_power)
+                    # Эмитим полный проход через специальный сигнал вместе с серийником
+                    self._parent.fullSweepReady.emit(full_freqs, full_power, self._serial)
                     
             except Exception as e:
                 self._parent.status.emit(f"Callback error: {e}")

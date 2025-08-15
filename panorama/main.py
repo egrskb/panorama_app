@@ -874,31 +874,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #66ff66;")
         self.statusBar().showMessage("Трилатерация остановлена", 3000)
 
-    def _process_for_trilateration(self, freqs_hz, power_dbm):
+    def _process_for_trilateration(self, freqs_hz, power_dbm, device_serial):
         """Обрабатывает данные для трилатерации."""
         if not self.trilateration_engine.is_running:
             return
-        
-        # Определяем какое это устройство
-        device_serial = self.device_manager.master or "UNKNOWN"
-        
+
         # Находим пики для трилатерации
         threshold = np.median(power_dbm) + 10
         peaks_mask = power_dbm > threshold
-        
+
         if np.any(peaks_mask):
-            peak_idx = np.argmax(power_dbm)
-            
+            peak_idx = int(np.argmax(power_dbm))
+
             from panorama.features.trilateration.engine import SignalMeasurement
             measurement = SignalMeasurement(
                 timestamp=time.time(),
-                device_serial=device_serial,
+                device_serial=device_serial or "UNKNOWN",
                 freq_mhz=freqs_hz[peak_idx] / 1e6,
-                power_dbm=power_dbm[peak_idx],
+                power_dbm=float(power_dbm[peak_idx]),
                 bandwidth_khz=200,
-                noise_floor_dbm=np.median(power_dbm)
+                noise_floor_dbm=float(np.median(power_dbm))
             )
-            
+
             self.trilateration_engine.add_measurement(measurement)
 
     def _send_detection_to_map(self, detection):
