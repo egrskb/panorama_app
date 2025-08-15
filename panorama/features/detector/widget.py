@@ -629,7 +629,7 @@ class DetectorWidget(QtWidgets.QWidget):
         
         self.detectionStopped.emit()
 
-    def push_data(self, freqs_hz: np.ndarray, row_dbm: np.ndarray):
+    def push_data(self, freqs_hz: np.ndarray, row_dbm: np.ndarray, device_serial=None):
         """Обработка данных от спектра."""
         if not self._state.is_active or not self._state.regions:
             return

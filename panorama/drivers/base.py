@@ -47,7 +47,7 @@ class SourceBackend(QtCore.QObject):
     
     # Сигналы
     sweepLine = QtCore.pyqtSignal(object)       # payload: panorama.shared.parsing.SweepLine
-    fullSweepReady = QtCore.pyqtSignal(object, object)  # (freqs_hz, power_dbm) - полный проход
+    fullSweepReady = QtCore.pyqtSignal(object, object, object)  # (freqs_hz, power_dbm, device_serial)
     status = QtCore.pyqtSignal(str)
     error = QtCore.pyqtSignal(str)
     started = QtCore.pyqtSignal()

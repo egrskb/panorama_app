@@ -267,6 +267,25 @@ class MapView(QtWidgets.QWidget):
         
         self._refresh_map()
 
+    def update_target_position(self, freq_mhz: float, x: float, y: float,
+                               confidence: float = 0.0):
+        """Обновляет позицию цели по частоте."""
+        # Находим цель с близкой частотой
+        for t in self.targets:
+            if abs(t.freq_mhz - freq_mhz) < 0.5:
+                t.x = x
+                t.y = y
+                t.confidence = confidence
+                t.last_update = time.time()
+                t.history_x.append(x)
+                t.history_y.append(y)
+                if len(t.history_x) > 100:
+                    t.history_x.pop(0)
+                    t.history_y.pop(0)
+                self._update_targets_table()
+                self._refresh_map()
+                break
+
     def add_target_from_detector(self, detection):
         """Добавляет цель из детектора (только через кнопку пользователя)."""
         self._target_id_seq += 1

@@ -21,6 +21,7 @@ class HackRFSweepSource(SourceBackend):
         self._buf = bytearray()
         self._assembler = _SweepAssembler()
         self._calibration_lut = None  # Для калибровки
+        self._current_serial: Optional[str] = None
 
     def set_calibration_lut(self, lut: Optional[Tuple[np.ndarray, np.ndarray]]):
         """
@@ -43,6 +44,7 @@ class HackRFSweepSource(SourceBackend):
 
         # Конфигурируем сборщик
         self._assembler.configure(config, self._calibration_lut)
+        self._current_serial = config.serial
 
         # Запускаем процесс
         self._p = QtCore.QProcess(self)
@@ -102,7 +104,7 @@ class HackRFSweepSource(SourceBackend):
                 result = self._assembler.add_segment(sw)
                 if result is not None:
                     full_freqs, full_power = result
-                    self.fullSweepReady.emit(full_freqs, full_power)
+                    self.fullSweepReady.emit(full_freqs, full_power, self._current_serial)
                     
             except Exception as e:
                 self.status.emit(f"Parse error: {str(e)[:120]}")

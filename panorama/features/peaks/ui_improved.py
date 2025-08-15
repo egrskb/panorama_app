@@ -206,7 +206,7 @@ class AdaptivePeaksWidget(QtWidgets.QWidget):
         if self.auto_search.isChecked() and self._freqs is not None:
             self._find_peaks()
             
-    def update_from_row(self, freqs_hz, row_dbm):
+    def update_from_row(self, freqs_hz, row_dbm, device_serial=None):
         """Обновление данных от спектра."""
         self._freqs = np.asarray(freqs_hz, dtype=float)
         self._row = np.asarray(row_dbm, dtype=float)

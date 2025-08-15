@@ -1,5 +1,6 @@
 # panorama/main.py
 import sys, os, stat, getpass, pathlib, logging, time
+from dataclasses import replace
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import QSettings
 import numpy as np
@@ -75,6 +76,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sweep_source = HackRFSweepSource()
         self._lib_source = None
         self._current_source_type = "sweep"
+        self._slave_sweep_sources: dict[str, HackRFSweepSource] = {}
+        self._trilat_timer = QtCore.QTimer()
+        self._trilat_timer.setInterval(100)
+        self._trilat_timer.timeout.connect(self._poll_trilat_positions)
         
         if _LIB_AVAILABLE:
             try:
@@ -486,31 +491,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _connect_signals(self):
         """Подключает все сигналы между компонентами."""
-        # Спектр → Пики и Детектор
+        # Спектр → Пики, Детектор и трилатерация
         self.spectrum_tab.newRowReady.connect(self.peaks_tab.update_from_row)
         self.spectrum_tab.newRowReady.connect(self.detector_tab.push_data)
-        
+        self.spectrum_tab.newRowReady.connect(self._process_for_trilateration)
+
         # Пики → Спектр (только для навигации по частоте)
         self.peaks_tab.goToFreq.connect(self.spectrum_tab.set_cursor_freq)
-        # ВАЖНО: Пики НЕ отправляют данные на карту!
-        
+
         # Детектор → Карта (только через кнопку пользователя)
         self.detector_tab.sendToMap.connect(self._send_detection_to_map)
         self.detector_tab.rangeSelected.connect(self.spectrum_tab.add_roi_region)
-        
-        # Карта → Трилатерация
-        self.map_tab.trilaterationStarted.connect(self._start_trilateration)
-        self.map_tab.trilaterationStopped.connect(self._stop_trilateration)
-        self.spectrum_tab.newRowReady.connect(self.detector_tab.push_data)
-        self.spectrum_tab.newRowReady.connect(self._process_for_trilateration)
-        
-        # Пики → Спектр
-        self.peaks_tab.goToFreq.connect(self.spectrum_tab.set_cursor_freq)
-        
-        # Детектор → Карта
-        self.detector_tab.sendToMap.connect(self._send_detection_to_map)
-        self.detector_tab.rangeSelected.connect(self.spectrum_tab.add_roi_region)
-        
+
         # Карта → Трилатерация
         self.map_tab.trilaterationStarted.connect(self._start_trilateration)
         self.map_tab.trilaterationStopped.connect(self._stop_trilateration)
@@ -806,9 +798,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 (slave2.position_x, slave2.position_y, slave2.position_z),
                 master.serial, slave1.serial, slave2.serial
             )
-            
+
             # ВАЖНО: Синхронизируем с картой
             self.map_tab.update_devices(master, slave1, slave2)
+            self.spectrum_tab.set_device_serial(master.serial)
 
     def _update_device_status(self):
         """Обновляет статус устройств в статусбаре."""
@@ -867,39 +860,62 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #ff6666; font-weight: bold;")
         self.statusBar().showMessage("Трилатерация запущена", 3000)
 
+        # Запускаем свипы на slave-устройствах
+        cfg = self.spectrum_tab._current_cfg
+        master, slave1, slave2 = self.device_manager.get_trilateration_devices()
+        if cfg and slave1 and slave2:
+            for dev in [slave1, slave2]:
+                src = HackRFSweepSource()
+                cfg_dev = replace(cfg, serial=dev.serial)
+                src.fullSweepReady.connect(self._process_for_trilateration)
+                src.start(cfg_dev)
+                self._slave_sweep_sources[dev.serial] = src
+
+        self._trilat_timer.start()
+
     def _stop_trilateration(self):
         """Останавливает трилатерацию."""
         self.trilateration_engine.stop()
+        for src in self._slave_sweep_sources.values():
+            try:
+                src.stop()
+            except Exception:
+                pass
+        self._slave_sweep_sources.clear()
         self.lbl_trilateration.setText("TRI: ГОТОВ")
         self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #66ff66;")
         self.statusBar().showMessage("Трилатерация остановлена", 3000)
+        self._trilat_timer.stop()
 
-    def _process_for_trilateration(self, freqs_hz, power_dbm):
+    def _process_for_trilateration(self, freqs_hz, power_dbm, device_serial):
         """Обрабатывает данные для трилатерации."""
-        if not self.trilateration_engine.is_running:
+        if not self.trilateration_engine.is_running or not device_serial:
             return
-        
-        # Определяем какое это устройство
-        device_serial = self.device_manager.master or "UNKNOWN"
-        
+
         # Находим пики для трилатерации
         threshold = np.median(power_dbm) + 10
         peaks_mask = power_dbm > threshold
-        
+
         if np.any(peaks_mask):
-            peak_idx = np.argmax(power_dbm)
-            
+            peak_idx = int(np.argmax(power_dbm))
+
             from panorama.features.trilateration.engine import SignalMeasurement
             measurement = SignalMeasurement(
                 timestamp=time.time(),
                 device_serial=device_serial,
                 freq_mhz=freqs_hz[peak_idx] / 1e6,
-                power_dbm=power_dbm[peak_idx],
+                power_dbm=float(power_dbm[peak_idx]),
                 bandwidth_khz=200,
-                noise_floor_dbm=np.median(power_dbm)
+                noise_floor_dbm=float(np.median(power_dbm))
             )
-            
+
             self.trilateration_engine.add_measurement(measurement)
+
+    def _poll_trilat_positions(self):
+        """Периодически получает координаты целей и обновляет карту."""
+        positions = self.trilateration_engine.get_current_positions()
+        for pos in positions.values():
+            self.map_tab.update_target_position(pos.freq_mhz, pos.x, pos.y, pos.confidence)
 
     def _send_detection_to_map(self, detection):
         """Отправляет обнаружение на карту (вызывается только пользователем через кнопку)."""

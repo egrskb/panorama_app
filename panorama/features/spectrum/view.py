@@ -15,7 +15,7 @@ from panorama.shared.palettes import get_colormap
 class SpectrumView(QtWidgets.QWidget):
     """Главный виджет спектра с водопадом, маркерами и полной функциональностью."""
     
-    newRowReady = QtCore.pyqtSignal(object, object)  # (freqs_hz, row_dbm)
+    newRowReady = QtCore.pyqtSignal(object, object, object)  # (freqs_hz, row_dbm, device_serial)
     rangeSelected = QtCore.pyqtSignal(float, float)  # (start_mhz, stop_mhz) для детектора
     
     def __init__(self, parent=None):
@@ -25,6 +25,7 @@ class SpectrumView(QtWidgets.QWidget):
         self._model = SpectrumModel(rows=400)
         self._source: Optional[SourceBackend] = None
         self._current_cfg: Optional[SweepConfig] = None
+        self._device_serial: Optional[str] = None
 
         # статистика свипов
         self._sweep_count = 0
@@ -431,6 +432,10 @@ class SpectrumView(QtWidgets.QWidget):
         self._source.started.connect(self._on_started)
         self._source.finished.connect(self._on_finished)
 
+    def set_device_serial(self, serial: Optional[str]):
+        """Устанавливает серийный номер SDR для последующих запусков."""
+        self._device_serial = serial
+
     def set_cursor_freq(self, f_hz: float):
         """Устанавливает позицию курсора."""
         self._vline.setPos(float(f_hz)/1e6)
@@ -463,7 +468,7 @@ class SpectrumView(QtWidgets.QWidget):
     def _on_error(self, text: str):
         QtWidgets.QMessageBox.warning(self, "Источник", text)
 
-    def _on_full_sweep(self, freqs_hz: np.ndarray, power_dbm: np.ndarray):
+    def _on_full_sweep(self, freqs_hz: np.ndarray, power_dbm: np.ndarray, device_serial: str):
         """Обработка полного прохода от источника."""
         if self._model.freqs_hz is None or len(self._model.freqs_hz) != len(freqs_hz):
             self._model.freqs_hz = freqs_hz
@@ -488,7 +493,7 @@ class SpectrumView(QtWidgets.QWidget):
         if not self._update_timer.isActive():
             self._update_timer.start()
         
-        self.newRowReady.emit(freqs_hz, power_dbm)
+        self.newRowReady.emit(freqs_hz, power_dbm, device_serial)
 
     # ---------- запуск/останов ----------
     def _on_start_clicked(self):
@@ -512,6 +517,7 @@ class SpectrumView(QtWidgets.QWidget):
             lna_db=int(self.lna_db.value()),
             vga_db=int(self.vga_db.value()),
             amp_on=bool(self.amp_on.isChecked()),
+            serial=self._device_serial,
         )
         
         self._current_cfg = cfg

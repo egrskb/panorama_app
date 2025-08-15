@@ -239,61 +239,62 @@ class TrilaterationEngine:
         d_slave2 = self._rssi_to_distance(measurement.slave2_power)
         
         # Получаем позиции SDR
-        p_master = np.array(self.device_positions[self.master_serial])
-        p_slave1 = np.array(self.device_positions[self.slave1_serial])
-        p_slave2 = np.array(self.device_positions[self.slave2_serial])
-        
-        # Решаем систему методом наименьших квадратов
-        # Линеаризуем систему уравнений относительно master
-        A = 2 * np.array([
-            p_slave1 - p_master,
-            p_slave2 - p_master
-        ])
-        
-        b = np.array([
-            d_master**2 - d_slave1**2 + np.linalg.norm(p_slave1)**2 - np.linalg.norm(p_master)**2,
-            d_master**2 - d_slave2**2 + np.linalg.norm(p_slave2)**2 - np.linalg.norm(p_master)**2
-        ])
-        
+        p_master = np.array(self.device_positions[self.master_serial], dtype=float)
+        p_slave1 = np.array(self.device_positions[self.slave1_serial], dtype=float)
+        p_slave2 = np.array(self.device_positions[self.slave2_serial], dtype=float)
+
         try:
-            # Решаем для 2D (x, y)
-            solution_2d = np.linalg.lstsq(A[:, :2], b, rcond=None)[0]
-            
-            # Вычисляем z из уравнения сферы
-            x, y = solution_2d
-            z_squared = d_master**2 - (x - p_master[0])**2 - (y - p_master[1])**2
-            z = np.sqrt(max(0, z_squared)) if z_squared > 0 else 0
-            
+            # Алгоритм трилатерации в 3D с использованием базиса {ex, ey, ez}
+            ex = p_slave1 - p_master
+            d = np.linalg.norm(ex)
+            if d == 0:
+                return None
+            ex /= d
+
+            p3p1 = p_slave2 - p_master
+            i = np.dot(ex, p3p1)
+            temp = p3p1 - i * ex
+            j = np.linalg.norm(temp)
+            if j == 0:
+                return None
+            ey = temp / j
+            ez = np.cross(ex, ey)
+
+            x = (d_master**2 - d_slave1**2 + d**2) / (2 * d)
+            y = (d_master**2 - d_slave2**2 + i**2 + j**2) / (2 * j) - (i / j) * x
+            z_sq = d_master**2 - x**2 - y**2
+            z = np.sqrt(max(0.0, z_sq))
+
+            # Переводим из базиса в глобальные координаты
+            pos = p_master + x * ex + y * ey + z * ez
+
             # Оцениваем ошибку
             distances = [
-                np.linalg.norm([x, y, z] - p_master),
-                np.linalg.norm([x, y, z] - p_slave1),
-                np.linalg.norm([x, y, z] - p_slave2)
+                np.linalg.norm(pos - p_master),
+                np.linalg.norm(pos - p_slave1),
+                np.linalg.norm(pos - p_slave2),
             ]
-            
             errors = [
                 abs(distances[0] - d_master),
                 abs(distances[1] - d_slave1),
-                abs(distances[2] - d_slave2)
+                abs(distances[2] - d_slave2),
             ]
-            
-            error_estimate = np.mean(errors)
-            
-            # Вычисляем уверенность на основе ошибки и уровня сигнала
+            error_estimate = float(np.mean(errors))
+
             signal_strength = np.mean([measurement.master_power, measurement.slave1_power, measurement.slave2_power])
             confidence = max(0, min(1, (1.0 - error_estimate / 10.0) * (1.0 + signal_strength / 100.0)))
-            
+
             return TargetPosition(
                 timestamp=measurement.timestamp,
                 freq_mhz=measurement.freq_mhz,
-                x=float(x),
-                y=float(y),
-                z=float(z),
-                error_estimate=float(error_estimate),
+                x=float(pos[0]),
+                y=float(pos[1]),
+                z=float(pos[2]),
+                error_estimate=error_estimate,
                 confidence=float(confidence),
-                measurements_count=3
+                measurements_count=3,
             )
-            
+
         except Exception as e:
             print(f"Trilateration failed: {e}")
             return None
