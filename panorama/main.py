@@ -488,31 +488,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _connect_signals(self):
         """Подключает все сигналы между компонентами."""
-        # Спектр → Пики и Детектор
+        # Спектр → Пики, Детектор и трилатерация
         self.spectrum_tab.newRowReady.connect(self.peaks_tab.update_from_row)
         self.spectrum_tab.newRowReady.connect(self.detector_tab.push_data)
-        
+        self.spectrum_tab.newRowReady.connect(self._process_for_trilateration)
+
         # Пики → Спектр (только для навигации по частоте)
         self.peaks_tab.goToFreq.connect(self.spectrum_tab.set_cursor_freq)
-        # ВАЖНО: Пики НЕ отправляют данные на карту!
-        
+
         # Детектор → Карта (только через кнопку пользователя)
         self.detector_tab.sendToMap.connect(self._send_detection_to_map)
         self.detector_tab.rangeSelected.connect(self.spectrum_tab.add_roi_region)
-        
-        # Карта → Трилатерация
-        self.map_tab.trilaterationStarted.connect(self._start_trilateration)
-        self.map_tab.trilaterationStopped.connect(self._stop_trilateration)
-        self.spectrum_tab.newRowReady.connect(self.detector_tab.push_data)
-        self.spectrum_tab.newRowReady.connect(self._process_for_trilateration)
-        
-        # Пики → Спектр
-        self.peaks_tab.goToFreq.connect(self.spectrum_tab.set_cursor_freq)
-        
-        # Детектор → Карта
-        self.detector_tab.sendToMap.connect(self._send_detection_to_map)
-        self.detector_tab.rangeSelected.connect(self.spectrum_tab.add_roi_region)
-        
+
         # Карта → Трилатерация
         self.map_tab.trilaterationStarted.connect(self._start_trilateration)
         self.map_tab.trilaterationStopped.connect(self._stop_trilateration)
