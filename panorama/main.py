@@ -1,5 +1,6 @@
 # panorama/main.py
 import sys, os, stat, getpass, pathlib, logging, time
+from dataclasses import replace
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import QSettings
 import numpy as np
@@ -75,6 +76,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sweep_source = HackRFSweepSource()
         self._lib_source = None
         self._current_source_type = "sweep"
+        self._slave_sweep_sources: dict[str, HackRFSweepSource] = {}
         
         if _LIB_AVAILABLE:
             try:
@@ -806,9 +808,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 (slave2.position_x, slave2.position_y, slave2.position_z),
                 master.serial, slave1.serial, slave2.serial
             )
-            
+
             # ВАЖНО: Синхронизируем с картой
             self.map_tab.update_devices(master, slave1, slave2)
+            self.spectrum_tab.set_device_serial(master.serial)
 
     def _update_device_status(self):
         """Обновляет статус устройств в статусбаре."""
@@ -867,16 +870,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #ff6666; font-weight: bold;")
         self.statusBar().showMessage("Трилатерация запущена", 3000)
 
+        # Запускаем свипы на slave-устройствах
+        cfg = self.spectrum_tab._current_cfg
+        master, slave1, slave2 = self.device_manager.get_trilateration_devices()
+        if cfg and slave1 and slave2:
+            for dev in [slave1, slave2]:
+                src = HackRFSweepSource()
+                cfg_dev = replace(cfg, serial=dev.serial)
+                src.fullSweepReady.connect(self._process_for_trilateration)
+                src.start(cfg_dev)
+                self._slave_sweep_sources[dev.serial] = src
+
     def _stop_trilateration(self):
         """Останавливает трилатерацию."""
         self.trilateration_engine.stop()
+        for src in self._slave_sweep_sources.values():
+            try:
+                src.stop()
+            except Exception:
+                pass
+        self._slave_sweep_sources.clear()
         self.lbl_trilateration.setText("TRI: ГОТОВ")
         self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #66ff66;")
         self.statusBar().showMessage("Трилатерация остановлена", 3000)
 
     def _process_for_trilateration(self, freqs_hz, power_dbm, device_serial):
         """Обрабатывает данные для трилатерации."""
-        if not self.trilateration_engine.is_running:
+        if not self.trilateration_engine.is_running or not device_serial:
             return
 
         # Находим пики для трилатерации
@@ -889,7 +909,7 @@ class MainWindow(QtWidgets.QMainWindow):
             from panorama.features.trilateration.engine import SignalMeasurement
             measurement = SignalMeasurement(
                 timestamp=time.time(),
-                device_serial=device_serial or "UNKNOWN",
+                device_serial=device_serial,
                 freq_mhz=freqs_hz[peak_idx] / 1e6,
                 power_dbm=float(power_dbm[peak_idx]),
                 bandwidth_khz=200,
