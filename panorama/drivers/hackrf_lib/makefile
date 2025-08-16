@@ -38,7 +38,7 @@ install: $(TARGET)
 	cp $(TARGET) ../../../
 	@echo "✓ Installed to project root"
 
-test: $(TARGET)
+test: $(TARGET) test_lib.c
 	@echo "Running basic library test..."
 	@gcc -o test_lib test_lib.c -L. -lhackrf_multi -Wl,-rpath,. $(LIBS)
 	@./test_lib

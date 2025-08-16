@@ -206,28 +206,65 @@ class AdaptivePeaksWidget(QtWidgets.QWidget):
         if self.auto_search.isChecked() and self._freqs is not None:
             self._find_peaks()
             
+    def clear_history(self):
+        """Очищает историю и baseline."""
+        self._history.clear()
+        self._baseline = None
+        self._last_peaks = []
+        
     def update_from_row(self, freqs_hz, row_dbm):
         """Обновление данных от спектра."""
-        self._freqs = np.asarray(freqs_hz, dtype=float)
-        self._row = np.asarray(row_dbm, dtype=float)
+        freqs_hz = np.asarray(freqs_hz, dtype=float)
+        row_dbm = np.asarray(row_dbm, dtype=float)
         
-        # Добавляем в историю для baseline
-        self._history.append(self._row.copy())
+        # Проверяем, изменились ли размеры данных
+        if self._freqs is not None and self._freqs.size != freqs_hz.size:
+            # Размеры изменились - очищаем историю и baseline
+            print(f"Warning: Frequency array size changed from {self._freqs.size} to {freqs_hz.size}, clearing history")
+            self.clear_history()
+            
+        self._freqs = freqs_hz
+        self._row = row_dbm
         
-        # Пересчитываем baseline
-        self._calculate_baseline()
+        # Проверяем, что данные имеют одинаковую длину
+        if self._freqs.size != self._row.size:
+            print(f"Warning: Size mismatch - freqs: {self._freqs.size}, row: {self._row.size}")
+            return
         
-        if self.auto_search.isChecked():
-            self._find_peaks()
+        # Добавляем в историю для baseline только если размеры совпадают
+        if self._row.size > 0:
+            self._history.append(self._row.copy())
+            
+            # Пересчитываем baseline
+            self._calculate_baseline()
+            
+            if self.auto_search.isChecked():
+                self._find_peaks()
             
     def _calculate_baseline(self):
         """Вычисляет baseline по истории."""
         if len(self._history) < 3:
             return
             
+        # Проверяем, что все массивы в истории имеют одинаковую длину
+        if self._freqs is None:
+            return
+            
+        expected_size = self._freqs.size
+        valid_history = []
+        
+        for hist_row in self._history:
+            if hist_row.size == expected_size:
+                valid_history.append(hist_row)
+            else:
+                print(f"Warning: Skipping history row with size {hist_row.size}, expected {expected_size}")
+        
+        if len(valid_history) < 3:
+            return
+            
         # Ограничиваем историю нужным размером
-        window_size = min(self.baseline_window.value(), len(self._history))
-        history_array = np.array(list(self._history)[-window_size:])
+        window_size = min(self.baseline_window.value(), len(valid_history))
+        history_array = np.array(valid_history[-window_size:])
         
         method = self.baseline_method.currentText()
         
@@ -256,6 +293,10 @@ class AdaptivePeaksWidget(QtWidgets.QWidget):
         if "Адаптивный" in self.threshold_mode.currentText():
             if self._baseline is None:
                 # Если baseline еще не рассчитан, используем минимум текущей строки
+                self._baseline = self._row - 10
+            elif self._baseline.size != self._row.size:
+                # Размеры не совпадают - сбрасываем baseline
+                print(f"Warning: Baseline size mismatch - baseline: {self._baseline.size}, row: {self._row.size}")
                 self._baseline = self._row - 10
                 
             threshold = self._baseline + self.adaptive_offset.value()

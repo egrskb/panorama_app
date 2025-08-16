@@ -7,8 +7,6 @@
 #include <time.h>
 #include <stdio.h>
 
-extern double g_grouping_tolerance_hz;
-
 PeakQueue* peak_queue_create(size_t capacity) {
     PeakQueue* q = malloc(sizeof(PeakQueue));
     if (!q) return NULL;

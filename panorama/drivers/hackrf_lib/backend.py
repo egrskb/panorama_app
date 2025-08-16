@@ -78,6 +78,7 @@ class HackRFLibSource(SourceBackend):
         # Multi-SDR параметры
         self._num_devices = 1
         self._multi_worker: Optional[_MultiWorker] = None
+        self._running = False
         
     def _setup_multi_interface(self):
         """Настройка интерфейса для multi-SDR версии."""
@@ -111,16 +112,27 @@ class HackRFLibSource(SourceBackend):
             int  hq_config_set_rates(uint32_t samp_rate_hz, uint32_t bb_bw_hz);
             int  hq_config_set_gains(uint32_t lna_db, uint32_t vga_db, bool amp_on);
             
+            // Настройка диапазона частот
+            int  hq_config_set_freq_range(double start_hz, double stop_hz, double step_hz);
+            int  hq_config_set_dwell_time(uint32_t dwell_ms);
+            
             int  hq_start(void);
             void hq_stop(void);
             
             int  hq_get_watchlist_snapshot(WatchItem* out, int max_items);
             int  hq_get_recent_peaks(Peak* out, int max_items);
             
+            // Чтение непрерывного спектра от Master SDR
+            int  hq_get_master_spectrum(double* freqs_hz, float* powers_dbm, int max_points);
+            
             void hq_set_grouping_tolerance_hz(double delta_hz);
             void hq_set_ema_alpha(float alpha);
             
             int  hq_get_status(HqStatus* out);
+            
+            // Device enumeration
+            int  hq_list_devices(char* serials[], int max_count);
+            int  hq_get_device_count(void);
         """)
         
     def _setup_single_interface(self):
@@ -159,8 +171,29 @@ class HackRFLibSource(SourceBackend):
     def list_serials(self) -> List[str]:
         """Список серийников устройств."""
         if self._multi_mode:
-            # В multi-mode серийники определяются автоматически при открытии
-            return []
+            # Multi-mode - используем новые функции
+            out: List[str] = []
+            try:
+                count = self._lib.hq_get_device_count()
+                if count > 0:
+                    # Создаем массив указателей на строки
+                    serials = self._ffi.new("char*[]", count)
+                    actual_count = self._lib.hq_list_devices(serials, count)
+                    
+                    for i in range(actual_count):
+                        if serials[i] != self._ffi.NULL:
+                            s = self._ffi.string(serials[i]).decode(errors="ignore")
+                            if s and s != "0000000000000000":
+                                out.append(s)
+                            # Освобождаем память
+                            try:
+                                import ctypes
+                                ctypes.CDLL("libc.so.6").free(serials[i])
+                            except Exception:
+                                pass  # Игнорируем ошибки освобождения памяти
+            except Exception as e:
+                print(f"Error listing devices in multi-mode: {e}")
+            return out
         else:
             # Single mode - используем старый метод
             out: List[str] = []
@@ -225,7 +258,7 @@ class HackRFLibSource(SourceBackend):
     
     def is_running(self) -> bool:
         if self._multi_mode:
-            return self._multi_worker is not None and self._multi_worker.is_alive()
+            return self._running and self._multi_worker is not None and self._multi_worker.is_alive()
         else:
             return self._worker is not None and self._worker.is_alive()
 
@@ -253,6 +286,17 @@ class HackRFLibSource(SourceBackend):
         self._lib.hq_config_set_rates(12000000, 8000000)  # 12 MSPS, 8 MHz BB filter
         self._lib.hq_config_set_gains(config.lna_db, config.vga_db, config.amp_on)
         
+        # Настраиваем диапазон частот
+        start_hz = config.freq_start_hz
+        stop_hz = config.freq_end_hz
+        step_hz = config.bin_hz
+        
+        # Простое последовательное сканирование всего диапазона
+        print(f"Configuring frequency range: {start_hz/1e6:.1f} - {stop_hz/1e6:.1f} MHz, step {step_hz/1e6:.3f} MHz")
+        
+        self._lib.hq_config_set_freq_range(start_hz, stop_hz, step_hz)
+        self._lib.hq_config_set_dwell_time(2)  # 2 ms dwell time
+        
         # Настраиваем параметры группировки
         self._lib.hq_set_grouping_tolerance_hz(250000.0)  # 250 kHz
         self._lib.hq_set_ema_alpha(0.25)
@@ -272,6 +316,9 @@ class HackRFLibSource(SourceBackend):
         self.started.emit()
         self.status.emit(f"Multi-SDR запущен ({self._num_devices} устройств)")
         
+        # Устанавливаем флаг запуска
+        self._running = True
+        
     def _start_single(self, config: SweepConfig):
         """Запуск в single-SDR режиме (обратная совместимость)."""
         self.status.emit("Инициализация single-SDR...")
@@ -286,15 +333,26 @@ class HackRFLibSource(SourceBackend):
         if not self.is_running():
             return
         
+        self.status.emit("Остановка...")
+        
         if self._multi_mode:
-            self._lib.hq_stop()
+            # Останавливаем библиотеку
+            try:
+                self._lib.hq_stop()
+            except Exception as e:
+                print(f"Error stopping library: {e}")
             
+            # Останавливаем worker
             if self._multi_worker:
                 self._multi_worker.stop()
                 self._multi_worker.join(timeout=2.0)
                 self._multi_worker = None
             
-            self._lib.hq_close_all()
+            # Закрываем устройства
+            try:
+                self._lib.hq_close_all()
+            except Exception as e:
+                print(f"Error closing devices: {e}")
         else:
             # Single mode
             try:
@@ -307,7 +365,11 @@ class HackRFLibSource(SourceBackend):
                 self._worker.join(timeout=3.0)
                 self._worker = None
         
+        # Сбрасываем флаг запуска
+        self._running = False
+        
         self.finished.emit(0)
+        self.status.emit("Остановлено")
 
     def _on_worker_finished(self, code: int, msg: str):
         """Обработчик завершения single-mode worker."""
@@ -321,6 +383,7 @@ class HackRFLibSource(SourceBackend):
         if code != 0:
             self.error.emit(msg or f"Multi-SDR завершился с кодом {code}")
         self._multi_worker = None
+        self._running = False
         self.finished.emit(code)
         
     def get_status(self) -> Optional[Dict[str, Any]]:
@@ -367,40 +430,89 @@ class _MultiWorker(QtCore.QObject, threading.Thread):
         
     def run(self):
         # Буферы для чтения данных
-        watchlist_buf = self._ffi.new("WatchItem[100]")
         peaks_buf = self._ffi.new("Peak[100]")
         status_buf = self._ffi.new("HqStatus*")
         
-        # Для сборки полного спектра из watchlist
+        # Для непрерывного спектра от Master SDR
         last_emit_time = time.time()
-        emit_interval = 0.1  # 10 Hz
+        emit_interval = 0.1  # 10 Hz для плавного обновления
+        
+        # Создаем сетку частот для полного диапазона
+        freq_start = self._freq_start
+        freq_end = self._freq_end
+        bin_hz = self._bin_hz  # Используем оригинальный шаг
+        
+        # Вычисляем количество точек по оригинальному шагу
+        n_points = int((freq_end - freq_start) / bin_hz) + 1
+        
+        # Ограничиваем для стабильности
+        if n_points > 50000:
+            print(f"Limiting frequency points from {n_points} to 50000 for stability")
+            n_points = 50000
+            bin_hz = (freq_end - freq_start) / (n_points - 1)
+        
+        freqs_full = np.linspace(freq_start, freq_end, n_points, dtype=np.float64)
+        
+        # Буфер для непрерывного спектра от Master SDR
+        spectrum_buffer = np.full(n_points, -120.0, dtype=np.float32)
+        
+        print(f"Created continuous spectrum grid: {n_points} points, step {bin_hz/1e6:.3f} MHz")
+        print(f"Frequency range: {freq_start/1e6:.1f} - {freq_end/1e6:.1f} MHz")
+        print("Waiting for Master SDR continuous spectrum data...")
         
         while self._running:
             try:
-                # Читаем watchlist
-                n_watch = self._lib.hq_get_watchlist_snapshot(watchlist_buf, 100)
-                
                 current_time = time.time()
                 
-                if n_watch > 0 and (current_time - last_emit_time) >= emit_interval:
-                    # Конвертируем watchlist в спектр
-                    freqs = []
-                    powers = []
+                # Читаем непрерывный спектр от Master SDR
+                try:
+                    freqs_buf = self._ffi.new("double[]", n_points)
+                    powers_buf = self._ffi.new("float[]", n_points)
                     
-                    for i in range(n_watch):
-                        item = watchlist_buf[i]
-                        freqs.append(item.f_center_hz)
-                        powers.append(item.rssi_ema)
+                    n_read = self._lib.hq_get_master_spectrum(freqs_buf, powers_buf, n_points)
                     
-                    if freqs:
-                        # Сортируем по частоте
-                        sorted_data = sorted(zip(freqs, powers))
-                        freqs_array = np.array([f for f, _ in sorted_data], dtype=np.float64)
-                        powers_array = np.array([p for _, p in sorted_data], dtype=np.float32)
+                    if n_read > 0:
+                        # Копируем данные в numpy массивы
+                        freqs_array = np.frombuffer(self._ffi.buffer(freqs_buf), dtype=np.float64, count=n_read)
+                        powers_array = np.frombuffer(self._ffi.buffer(powers_buf), dtype=np.float32, count=n_read)
                         
-                        # Эмитим как полный свип
+                        # Обновляем буфер спектра
+                        if n_read == n_points:
+                            spectrum_buffer[:] = powers_array
+                        else:
+                            # Если размеры не совпадают, обновляем только доступные точки
+                            spectrum_buffer[:n_read] = powers_array[:n_read]
+                        
+                        # Эмитим как непрерывный спектр
+                        print(f"Emitting spectrum: {n_read} points, active: {np.sum(powers_array > -120)}")
                         self._parent.fullSweepReady.emit(freqs_array, powers_array)
                         last_emit_time = current_time
+                        
+                        # Логируем статус
+                        active_points = np.sum(spectrum_buffer > -120)
+                        print(f"Spectrum update: {active_points}/{n_points} active points")
+                    else:
+                        # Если данных нет, эмитим пустой спектр
+                        if (current_time - last_emit_time) >= emit_interval:
+                            freqs_array = freqs_full.copy()
+                            powers_array = spectrum_buffer.copy()
+                            
+                            self._parent.fullSweepReady.emit(freqs_array, powers_array)
+                            last_emit_time = current_time
+                            
+                            print(f"Waiting for Master SDR data... (n_read={n_read})")
+                            
+                except Exception as e:
+                    print(f"Error reading master spectrum: {e}")
+                    # В случае ошибки эмитим пустой спектр
+                    if (current_time - last_emit_time) >= emit_interval:
+                        freqs_array = freqs_full.copy()
+                        powers_array = spectrum_buffer.copy()
+                        
+                        self._parent.fullSweepReady.emit(freqs_array, powers_array)
+                        last_emit_time = current_time
+                        
+                        print("Error reading spectrum, using empty data")
                 
                 # Читаем последние пики
                 n_peaks = self._lib.hq_get_recent_peaks(peaks_buf, 100)

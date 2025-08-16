@@ -4,6 +4,12 @@
 
 #include "hq_init.h"
 
+// Максимальное количество точек спектра
+#define MAX_SPECTRUM_POINTS 50000
+
+// External globals
+extern double g_grouping_tolerance_hz;
+
 typedef struct {
     double start_hz;
     double stop_hz;

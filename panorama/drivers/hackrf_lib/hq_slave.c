@@ -24,7 +24,7 @@ static int slave_rx_callback(hackrf_transfer* transfer) {
     }
     
     // Estimate RSSI
-    float rssi = rssi_estimate_power(transfer->buffer, transfer->valid_length / 2);
+    float rssi = rssi_estimate_power((const int8_t*)transfer->buffer, transfer->valid_length / 2);
     
     // Update watchlist items in current band
     pthread_mutex_lock(&g_watchlist_mutex);

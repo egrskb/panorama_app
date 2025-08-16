@@ -543,6 +543,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spectrum_tab.newRowReady.connect(self.peaks_tab.update_from_row)
         self.spectrum_tab.newRowReady.connect(self.detector_tab.push_data)
         
+        # Спектр → Очистка истории при изменении конфигурации
+        self.spectrum_tab.configChanged.connect(self.peaks_tab.clear_history)
+        
         # Пики → Спектр (только для навигации по частоте)
         self.peaks_tab.goToFreq.connect(self.spectrum_tab.set_cursor_freq)
         # ВАЖНО: Пики НЕ отправляют данные на карту!

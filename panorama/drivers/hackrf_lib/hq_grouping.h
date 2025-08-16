@@ -2,25 +2,12 @@
 #ifndef HQ_GROUPING_H
 #define HQ_GROUPING_H
 
+#include "hq_api.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
 
 #define MAX_WATCHLIST 100
-
-typedef struct {
-    double f_hz;
-    float rssi_dbm;
-    uint64_t last_ns;
-} Peak;
-
-typedef struct {
-    double f_center_hz;
-    double bw_hz;
-    float rssi_ema;
-    uint64_t last_ns;
-    int hit_count;
-} WatchItem;
 
 typedef struct {
     Peak* buffer;

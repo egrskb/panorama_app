@@ -17,6 +17,8 @@ typedef struct {
     uint32_t lna_db;
     uint32_t vga_db;
     bool amp_on;
+    bool dc_offset_enable;      // Включение/выключение DC offset
+    bool dc_offset_auto;        // Автоматическая коррекция DC offset
 } SdrParams;
 
 typedef struct {
@@ -29,6 +31,12 @@ typedef struct {
     uint32_t lna_db;
     uint32_t vga_db;
     bool amp_on;
+    
+    // DC Offset настройки
+    bool dc_offset_enable;
+    bool dc_offset_auto;
+    int16_t dc_offset_i;       // DC offset для I канала
+    int16_t dc_offset_q;       // DC offset для Q канала
     
     // Буферы и статистика
     int8_t* rx_buffer;
@@ -43,5 +51,13 @@ typedef struct {
 int init_devices(SdrCtx* devs, int n, const SdrParams* defaults);
 void teardown_devices(SdrCtx* devs, int n);
 int set_bb_filter(hackrf_device* dev, uint32_t bw_hz);
+
+// DC Offset функции
+int set_dc_offset(hackrf_device* dev, bool enable, bool auto_correct, int16_t i_offset, int16_t q_offset);
+int calibrate_dc_offset(hackrf_device* dev, int16_t* i_offset, int16_t* q_offset);
+
+// Функции для работы с непрерывным спектром
+void hq_update_spectrum(double* freqs, float* powers, int n_points);
+int hq_get_spectrum(double* freqs, float* powers, int max_points);
 
 #endif // HQ_INIT_H

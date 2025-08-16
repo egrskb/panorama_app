@@ -17,6 +17,7 @@ class SpectrumView(QtWidgets.QWidget):
     
     newRowReady = QtCore.pyqtSignal(object, object)  # (freqs_hz, row_dbm)
     rangeSelected = QtCore.pyqtSignal(float, float)  # (start_mhz, stop_mhz) для детектора
+    configChanged = QtCore.pyqtSignal()  # Сигнал об изменении конфигурации
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -30,6 +31,7 @@ class SpectrumView(QtWidgets.QWidget):
         self._sweep_count = 0
         self._last_full_ts: Optional[float] = None
         self._dt_ema: Optional[float] = None
+        self._running = False
 
         # --- верхняя панель параметров ---
         self.start_mhz = QtWidgets.QDoubleSpinBox()
@@ -483,13 +485,58 @@ class SpectrumView(QtWidgets.QWidget):
 
     def _on_full_sweep(self, freqs_hz: np.ndarray, power_dbm: np.ndarray):
         """Обработка полного прохода от источника."""
-        if self._model.freqs_hz is None or len(self._model.freqs_hz) != len(freqs_hz):
+        # Проверяем размеры
+        if freqs_hz.size != power_dbm.size:
+            print(f"Warning: Size mismatch in full sweep - freqs: {freqs_hz.size}, power: {power_dbm.size}")
+            return
+        
+        # Проверяем стабильность размеров
+        if freqs_hz.size > 50000:
+            print(f"Warning: Very large frequency array ({freqs_hz.size} points), this may cause instability")
+        
+        # Проверяем, изменились ли размеры данных
+        if self._model.freqs_hz is None:
+            # Первый запуск - инициализируем модель
             self._model.freqs_hz = freqs_hz
             self._model.last_row = power_dbm
             n = len(freqs_hz)
             self._model.water = np.full((self._model.rows, n), -120.0, dtype=np.float32)
+            
+            # Сбрасываем все при первом запуске
+            self._minhold = None
+            self._maxhold = None
+            self._avg_queue.clear()
+            self._ema_last = None
+            
+            print(f"Initialized spectrum model with {n} frequency points")
+            print(f"Frequency range: {freqs_hz[0]/1e6:.1f} - {freqs_hz[-1]/1e6:.1f} MHz")
+        elif len(self._model.freqs_hz) != len(freqs_hz):
+            # Размеры изменились - нужно переинициализировать
+            print(f"Frequency array size changed from {len(self._model.freqs_hz)} to {len(freqs_hz)}")
+            
+            # ВСЕГДА быстро сбрасываем водопад при изменении размеров
+            # Перенос данных слишком медленный для больших массивов
+            print(f"Resetting waterfall for size change: {len(self._model.freqs_hz)} → {len(freqs_hz)}")
+            
+            # Переинициализируем модель
+            self._model.freqs_hz = freqs_hz
+            self._model.last_row = power_dbm
+            n = len(freqs_hz)
+            self._model.water = np.full((self._model.rows, n), -120.0, dtype=np.float32)
+            
+            # Сбрасываем min/max hold при изменении размера данных
+            self._minhold = None
+            self._maxhold = None
+            self._avg_queue.clear()
+            self._ema_last = None
         else:
+            # Размеры не изменились - добавляем строку в водопад
             self._model.append_row(power_dbm)
+            
+            # Логируем прогресс для отладки
+            if self._sweep_count % 10 == 0:  # Каждые 10 свипов
+                active_points = np.sum(power_dbm > -120)
+                print(f"Sweep {self._sweep_count}: {active_points}/{len(power_dbm)} active points")
         
         t = time.time()
         if self._last_full_ts is not None:
@@ -535,6 +582,12 @@ class SpectrumView(QtWidgets.QWidget):
         self._current_cfg = cfg
         self._model.set_grid(cfg.freq_start_hz, cfg.freq_end_hz, cfg.bin_hz)
         
+        # Сбрасываем min/max hold при изменении конфигурации
+        self._minhold = None
+        self._maxhold = None
+        self._avg_queue.clear()
+        self._ema_last = None
+        
         freqs = self._model.freqs_hz
         if freqs is not None and freqs.size:
             x_mhz = freqs.astype(np.float64) / 1e6
@@ -549,10 +602,25 @@ class SpectrumView(QtWidgets.QWidget):
                 self._update_water_rect(x_mhz, z)
         
         self._source.start(cfg)
+        
+        # Уведомляем об изменении конфигурации
+        self.configChanged.emit()
+        
+        # Блокируем настройки во время работы
+        self._set_controls_enabled(False)
+        
+        # Устанавливаем флаг запуска
+        self._running = True
 
     def _on_stop_clicked(self):
         if self._source and self._source.is_running():
             self._source.stop()
+            
+        # Разблокируем настройки
+        self._set_controls_enabled(True)
+        
+        # Сбрасываем флаг запуска
+        self._running = False
 
     def _on_reset_view(self):
         self.plot.setXRange(self.start_mhz.value(), self.stop_mhz.value(), padding=0)
@@ -586,36 +654,125 @@ class SpectrumView(QtWidgets.QWidget):
         
         x_mhz = freqs.astype(np.float64) / 1e6
         y = row.astype(np.float32)
+        
+        # Дополнительная проверка размеров
+        if y.size != x_mhz.size:
+            print(f"Warning: Size mismatch - x_mhz: {x_mhz.size}, y: {y.size}")
+            return
 
         y_smoothed = self._smooth_freq(y)
         y_now = self._smooth_time_ema(y_smoothed)
         self.curve_now.setData(x_mhz, y_now)
         
-        self._avg_queue.append(y.copy())
-        if len(self._avg_queue) > self.avg_win.value():
-            while len(self._avg_queue) > self.avg_win.value():
-                self._avg_queue.popleft()
-        
-        if self._avg_queue:
-            y_avg = np.mean(self._avg_queue, axis=0).astype(np.float32)
-            y_avg_smooth = self._smooth_freq(y_avg)
-            self.curve_avg.setData(x_mhz, y_avg_smooth)
+        # Проверяем, что длина массива соответствует ожидаемой
+        if y.size == x_mhz.size:
+            self._avg_queue.append(y.copy())
+            if len(self._avg_queue) > self.avg_win.value():
+                while len(self._avg_queue) > self.avg_win.value():
+                    self._avg_queue.popleft()
+            
+            if self._avg_queue:
+                # Проверяем, что все массивы в очереди имеют одинаковую длину
+                if all(arr.size == x_mhz.size for arr in self._avg_queue):
+                    y_avg = np.mean(self._avg_queue, axis=0).astype(np.float32)
+                    y_avg_smooth = self._smooth_freq(y_avg)
+                    self.curve_avg.setData(x_mhz, y_avg_smooth)
         
         # Min/Max hold (без сглаживания для точности)
         if self._maxhold is None:
             self._maxhold = y.copy()
-        else:
+        elif self._maxhold.size == y.size:
             self._maxhold = np.maximum(self._maxhold, y)
         
         if self._minhold is None:
             self._minhold = y.copy()
-        else:
+        elif self._minhold.size == y.size:
             self._minhold = np.minimum(self._minhold, y)
         
-        self.curve_min.setData(x_mhz, self._minhold)
-        self.curve_max.setData(x_mhz, self._maxhold)
+        # Проверяем размеры перед отображением min/max hold
+        if self._minhold is not None and self._minhold.size == x_mhz.size:
+            self.curve_min.setData(x_mhz, self._minhold)
+        if self._maxhold is not None and self._maxhold.size == x_mhz.size:
+            self.curve_max.setData(x_mhz, self._maxhold)
         
         self._update_cursor_label()
+
+    def _transfer_waterfall_data(self, old_freqs: np.ndarray, old_water: np.ndarray, new_freqs: np.ndarray):
+        """Переносит данные водопада со старой сетки на новую."""
+        try:
+            if old_water is None or old_freqs is None:
+                return
+            
+            old_rows, old_cols = old_water.shape
+            new_cols = len(new_freqs)
+            
+            print(f"Transferring waterfall: {old_cols} → {new_cols} points, {old_rows} rows")
+            
+            # Создаем новую матрицу водопада
+            new_water = np.full((old_rows, new_cols), -120.0, dtype=np.float32)
+            
+            # Для каждой строки переносим данные
+            for row in range(min(old_rows, self._model.rows)):
+                # Интерполируем данные со старой сетки на новую
+                for new_idx, new_freq in enumerate(new_freqs):
+                    # Ищем ближайшие точки на старой сетке
+                    old_indices = np.searchsorted(old_freqs, new_freq)
+                    
+                    # Проверяем границы массива
+                    if old_indices == 0:
+                        # Меньше минимальной частоты
+                        if old_cols > 0:
+                            new_water[row, new_idx] = old_water[row, 0]
+                    elif old_indices >= old_cols:
+                        # Больше максимальной частоты
+                        if old_cols > 0:
+                            new_water[row, new_idx] = old_water[row, old_cols - 1]
+                    else:
+                        # Интерполируем между двумя точками
+                        idx_low = max(0, old_indices - 1)
+                        idx_high = min(old_cols - 1, old_indices)
+                        
+                        # Проверяем, что индексы в пределах массива
+                        if 0 <= idx_low < old_cols and 0 <= idx_high < old_cols:
+                            freq_low = old_freqs[idx_low]
+                            freq_high = old_freqs[idx_high]
+                            
+                            if freq_high > freq_low:
+                                # Линейная интерполяция
+                                weight = (new_freq - freq_low) / (freq_high - freq_low)
+                                new_water[row, new_idx] = (
+                                    old_water[row, idx_low] * (1 - weight) + 
+                                    old_water[row, idx_high] * weight
+                                )
+                            else:
+                                new_water[row, new_idx] = old_water[row, idx_low]
+                        else:
+                            # Fallback - берем ближайшую точку
+                            if 0 <= old_indices < old_cols:
+                                new_water[row, new_idx] = old_water[row, old_indices]
+            
+            # Обновляем модель
+            self._model.water = new_water
+            
+            print(f"✓ Waterfall data transferred successfully")
+            
+        except Exception as e:
+            print(f"Error transferring waterfall data: {e}")
+            # В случае ошибки просто создаем пустой водопад
+            self._model.water = np.full((self._model.rows, len(new_freqs)), -120.0, dtype=np.float32)
+
+    def _set_controls_enabled(self, enabled: bool):
+        """Блокирует/разблокирует настройки во время работы."""
+        self.start_mhz.setEnabled(enabled)
+        self.stop_mhz.setEnabled(enabled)
+        self.bin_khz.setEnabled(enabled)
+        self.lna_db.setEnabled(enabled)
+        self.vga_db.setEnabled(enabled)
+        self.amp_on.setEnabled(enabled)
+        
+        # Кнопки
+        self.btn_start.setEnabled(enabled)
+        self.btn_stop.setEnabled(not enabled)
 
     def _update_water_rect(self, x_mhz: np.ndarray, z: np.ndarray):
         """Устанавливает правильные координаты для изображения водопада."""
