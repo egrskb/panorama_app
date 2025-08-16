@@ -410,6 +410,14 @@ class AdaptivePeaksWidget(QtWidgets.QWidget):
     def _fill_table(self):
         """Заполнение таблицы найденными пиками."""
         self.table.setRowCount(len(self._last_peaks))
+        # Используем темную тему-совместимые цвета
+        colors = {
+        'very_strong': QtGui.QColor(255, 100, 100),  # Красный
+        'strong': QtGui.QColor(255, 200, 100),       # Оранжевый  
+        'medium': QtGui.QColor(100, 255, 100),       # Зеленый
+        'weak': QtGui.QColor(100, 150, 255)          # Голубой
+        }
+    
         
         for row, peak in enumerate(self._last_peaks):
             # Частота
@@ -423,16 +431,21 @@ class AdaptivePeaksWidget(QtWidgets.QWidget):
             
             # Цветовая индикация по уровню
             level = peak['level_dbm']
+            
+            # Выбираем цвет по уровню
+            level = peak['level_dbm']
             if level >= -30:
-                color = QtGui.QColor(255, 200, 200)  # Красный - очень сильный
+                color = colors['very_strong']
             elif level >= -50:
-                color = QtGui.QColor(255, 255, 200)  # Желтый - сильный
+                color = colors['strong']
             elif level >= -70:
-                color = QtGui.QColor(200, 255, 200)  # Зеленый - средний
+                color = colors['medium']
             else:
-                color = QtGui.QColor(200, 230, 255)  # Голубой - слабый
-                
+                color = colors['weak']
+
+            # Применяем цвет с учетом темной темы
             level_item.setBackground(QtGui.QBrush(color))
+            level_item.setForeground(QtGui.QBrush(QtCore.Qt.white))
             self.table.setItem(row, 1, level_item)
             
             # SNR (превышение над порогом)

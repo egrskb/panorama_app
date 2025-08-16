@@ -331,6 +331,24 @@ class SpectrumView(QtWidgets.QWidget):
         self.sp_wf_min.setValue(vmin)
         self.sp_wf_max.setValue(vmax)
 
+
+    def _on_stop_clicked(self):
+        """Полная остановка с гарантией освобождения ресурсов."""
+        if self._source and self._source.is_running():
+            self._source.stop()
+            # Ждем завершения
+            timeout = time.time() + 2.0
+            while self._source.is_running() and time.time() < timeout:
+                QtCore.QCoreApplication.processEvents()
+                time.sleep(0.01)
+            
+            # Разблокируем UI
+            self.btn_start.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+            
+            # Обновляем статус
+            self.status.emit("Остановлено")
+
     # ---------- ROI для детектора ----------
     def add_roi_region(self, start_mhz: float, stop_mhz: float):
         """Добавляет визуальный регион ROI на графики."""

@@ -1,6 +1,7 @@
+# panorama/drivers/hackrf_lib/backend.py
 from __future__ import annotations
 import os, threading, time
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 from PyQt5 import QtCore
 import numpy as np
 from cffi import FFI
@@ -9,34 +10,121 @@ from panorama.drivers.base import SourceBackend, SweepConfig
 from panorama.shared.parsing import SweepLine
 
 
-def _candidates() -> List[str]:
+def _find_library() -> List[str]:
     """Ищем библиотеку в разных местах."""
     here = os.path.abspath(os.path.dirname(__file__))
-    names = ["libhackrf_qsa.so", "libhackrf_qsa.dylib", "hackrf_qsa.dll"]
+    
+    # Новые имена для multi-SDR версии
+    names = ["libhackrf_multi.so", "libhackrf_multi.dylib", "hackrf_multi.dll"]
+    
+    # Старые имена для обратной совместимости
+    old_names = ["libhackrf_qsa.so", "libhackrf_qsa.dylib", "hackrf_qsa.dll"]
+    
     candidates = []
     
     # Сначала ищем рядом с этим файлом
-    for n in names:
+    for n in names + old_names:
         candidates.append(os.path.join(here, n))
     
     # Потом в корне проекта
     root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
-    for n in names:
+    for n in names + old_names:
         candidates.append(os.path.join(root, n))
     
     # И наконец просто имена для dlopen
-    candidates.extend(names)
+    candidates.extend(names + old_names)
     
     return candidates
 
 
 class HackRFLibSource(SourceBackend):
-    """Источник через CFFI + dlopen libhackrf_qsa с полной поддержкой калибровки."""
+    """Источник через CFFI с поддержкой multi-SDR режима."""
     
     def __init__(self, lib_path: Optional[str] = None, serial_suffix: Optional[str] = None, parent=None):
         super().__init__(parent)
         
         self._ffi = FFI()
+        
+        # Определяем интерфейс в зависимости от найденной библиотеки
+        self._multi_mode = False
+        self._lib = None
+        
+        # Пробуем загрузить библиотеку
+        for p in ([lib_path] if lib_path else _find_library()):
+            if not p:
+                continue
+            try:
+                # Проверяем тип библиотеки по имени
+                if 'multi' in p.lower():
+                    self._setup_multi_interface()
+                    self._multi_mode = True
+                else:
+                    self._setup_single_interface()
+                    self._multi_mode = False
+                
+                self._lib = self._ffi.dlopen(p)
+                print(f"Loaded library: {p} (multi-mode: {self._multi_mode})")
+                break
+            except Exception as e:
+                continue
+        
+        if self._lib is None:
+            raise RuntimeError(f"Не удалось загрузить библиотеку HackRF")
+
+        self._serial_suffix = serial_suffix
+        self._worker: Optional[_Worker] = None
+        self._assembler = _SweepAssembler()
+        
+        # Multi-SDR параметры
+        self._num_devices = 1
+        self._multi_worker: Optional[_MultiWorker] = None
+        
+    def _setup_multi_interface(self):
+        """Настройка интерфейса для multi-SDR версии."""
+        self._ffi.cdef(r"""
+            // Структуры данных для multi-SDR
+            typedef struct {
+                double f_center_hz;
+                double bw_hz;
+                float rssi_ema;
+                uint64_t last_ns;
+                int hit_count;
+            } WatchItem;
+            
+            typedef struct {
+                double f_hz;
+                float rssi_dbm;
+                uint64_t last_ns;
+            } Peak;
+            
+            typedef struct {
+                int master_running;
+                int slave_running[2];
+                double retune_ms_avg;
+                int watch_items;
+            } HqStatus;
+            
+            // Multi-SDR API
+            int  hq_open_all(int num_expected);
+            void hq_close_all(void);
+            
+            int  hq_config_set_rates(uint32_t samp_rate_hz, uint32_t bb_bw_hz);
+            int  hq_config_set_gains(uint32_t lna_db, uint32_t vga_db, bool amp_on);
+            
+            int  hq_start(void);
+            void hq_stop(void);
+            
+            int  hq_get_watchlist_snapshot(WatchItem* out, int max_items);
+            int  hq_get_recent_peaks(Peak* out, int max_items);
+            
+            void hq_set_grouping_tolerance_hz(double delta_hz);
+            void hq_set_ema_alpha(float alpha);
+            
+            int  hq_get_status(HqStatus* out);
+        """)
+        
+    def _setup_single_interface(self):
+        """Настройка интерфейса для single-SDR версии (обратная совместимость)."""
         self._ffi.cdef(r"""
             typedef void (*hq_segment_cb)(const double*, const float*, int, double, uint64_t, uint64_t, void*);
             const char* hq_last_error(void);
@@ -56,95 +144,137 @@ class HackRFLibSource(SourceBackend):
             int  hq_calibration_loaded(void);
         """)
 
-        self._lib = None
-        last_err = None
+    # ---------- Общие методы ----------
+    
+    def set_num_devices(self, num: int):
+        """Устанавливает количество устройств для multi-SDR режима."""
+        if num < 1 or num > 3:
+            raise ValueError("Поддерживается от 1 до 3 устройств")
+        self._num_devices = num
         
-        for p in ([lib_path] if lib_path else _candidates()):
-            if not p:
-                continue
-            try:
-                self._lib = self._ffi.dlopen(p)
-                break
-            except Exception as e:
-                last_err = e
+    def is_multi_capable(self) -> bool:
+        """Проверяет, поддерживает ли библиотека multi-SDR режим."""
+        return self._multi_mode
         
-        if self._lib is None:
-            raise RuntimeError(f"Не удалось загрузить libhackrf_qsa: {last_err}")
-
-        self._serial_suffix = serial_suffix
-        self._worker: Optional[_Worker] = None
-        self._assembler = _SweepAssembler()  # Для сборки полных проходов
-
-    # ---------- утилиты ----------
     def list_serials(self) -> List[str]:
-        """Список серийников, которые видит библиотека."""
-        out: List[str] = []
-        try:
-            # Сначала инициализируем hackrf если не инициализировано
-            # (делается автоматически внутри hq_device_count)
-            n = int(self._lib.hq_device_count())
-            print(f"Found {n} HackRF devices")  # Для отладки
-            
-            for i in range(n):
-                b = self._ffi.new("char[128]")
-                if self._lib.hq_get_device_serial(i, b, 127) == 0:
-                    s = self._ffi.string(b).decode(errors="ignore")
-                    if s and s != "0000000000000000":  # Фильтруем пустые серийники
-                        out.append(s)
-                        print(f"Device {i}: {s}")  # Для отладки
-        except Exception as e:
-            print(f"Error listing devices: {e}")
-        return out
+        """Список серийников устройств."""
+        if self._multi_mode:
+            # В multi-mode серийники определяются автоматически при открытии
+            return []
+        else:
+            # Single mode - используем старый метод
+            out: List[str] = []
+            try:
+                n = int(self._lib.hq_device_count())
+                for i in range(n):
+                    b = self._ffi.new("char[128]")
+                    if self._lib.hq_get_device_serial(i, b, 127) == 0:
+                        s = self._ffi.string(b).decode(errors="ignore")
+                        if s and s != "0000000000000000":
+                            out.append(s)
+            except Exception as e:
+                print(f"Error listing devices: {e}")
+            return out
 
     def set_serial_suffix(self, serial: Optional[str]):
-        """Задать суффикс серийника для следующего запуска."""
+        """Задать суффикс серийника (только для single mode)."""
         self._serial_suffix = serial or None
 
     def load_calibration(self, csv_path: str) -> bool:
-        """Загружает калибровку из CSV файла формата: freq_mhz,lna,vga,amp,offset_db"""
-        try:
-            c = self._ffi.new("char[]", csv_path.encode("utf-8"))
-            ok = (self._lib.hq_load_calibration(c) == 0)
-            if ok:
-                self._lib.hq_enable_calibration(1)
-            return bool(ok)
-        except Exception:
-            return False
+        """Загружает калибровку (только для single mode)."""
+        if not self._multi_mode:
+            try:
+                c = self._ffi.new("char[]", csv_path.encode("utf-8"))
+                ok = (self._lib.hq_load_calibration(c) == 0)
+                if ok:
+                    self._lib.hq_enable_calibration(1)
+                return bool(ok)
+            except Exception:
+                return False
+        return False
 
     def set_calibration_enabled(self, enable: bool):
-        """Включить/выключить применение калибровки."""
-        try:
-            self._lib.hq_enable_calibration(1 if enable else 0)
-        except Exception:
-            pass
+        """Включить/выключить калибровку (только для single mode)."""
+        if not self._multi_mode:
+            try:
+                self._lib.hq_enable_calibration(1 if enable else 0)
+            except Exception:
+                pass
 
     def calibration_loaded(self) -> bool:
-        """Проверка, загружена ли калибровка."""
-        try:
-            return bool(self._lib.hq_calibration_loaded())
-        except Exception:
-            return False
+        """Проверка загруженной калибровки (только для single mode)."""
+        if not self._multi_mode:
+            try:
+                return bool(self._lib.hq_calibration_loaded())
+            except Exception:
+                pass
+        return False
 
     def last_error(self) -> str:
-        """Получить последнее сообщение об ошибке из библиотеки."""
-        try:
-            c = self._lib.hq_last_error()
-            if c != self._ffi.NULL:
-                return self._ffi.string(c).decode(errors="ignore")
-        except Exception:
-            pass
+        """Получить последнее сообщение об ошибке (только для single mode)."""
+        if not self._multi_mode:
+            try:
+                c = self._lib.hq_last_error()
+                if c != self._ffi.NULL:
+                    return self._ffi.string(c).decode(errors="ignore")
+            except Exception:
+                pass
         return ""
 
     # ---------- API SourceBackend ----------
+    
     def is_running(self) -> bool:
-        return self._worker is not None and self._worker.is_alive()
+        if self._multi_mode:
+            return self._multi_worker is not None and self._multi_worker.is_alive()
+        else:
+            return self._worker is not None and self._worker.is_alive()
 
     def start(self, config: SweepConfig):
         if self.is_running():
             self.status.emit("Уже запущено")
             return
         
-        self.status.emit("Инициализация libhackrf_qsa…")
+        if self._multi_mode:
+            self._start_multi(config)
+        else:
+            self._start_single(config)
+            
+    def _start_multi(self, config: SweepConfig):
+        """Запуск в multi-SDR режиме."""
+        self.status.emit(f"Инициализация multi-SDR ({self._num_devices} устройств)...")
+        
+        # Открываем устройства
+        r = self._lib.hq_open_all(self._num_devices)
+        if r != 0:
+            self.error.emit(f"Не удалось открыть {self._num_devices} устройств (код: {r})")
+            return
+        
+        # Конфигурируем
+        self._lib.hq_config_set_rates(12000000, 8000000)  # 12 MSPS, 8 MHz BB filter
+        self._lib.hq_config_set_gains(config.lna_db, config.vga_db, config.amp_on)
+        
+        # Настраиваем параметры группировки
+        self._lib.hq_set_grouping_tolerance_hz(250000.0)  # 250 kHz
+        self._lib.hq_set_ema_alpha(0.25)
+        
+        # Запускаем
+        r = self._lib.hq_start()
+        if r != 0:
+            self.error.emit(f"Не удалось запустить multi-SDR (код: {r})")
+            self._lib.hq_close_all()
+            return
+        
+        # Запускаем worker для чтения данных
+        self._multi_worker = _MultiWorker(self, self._ffi, self._lib, config)
+        self._multi_worker.finished_sig.connect(self._on_multi_worker_finished)
+        self._multi_worker.start()
+        
+        self.started.emit()
+        self.status.emit(f"Multi-SDR запущен ({self._num_devices} устройств)")
+        
+    def _start_single(self, config: SweepConfig):
+        """Запуск в single-SDR режиме (обратная совместимость)."""
+        self.status.emit("Инициализация single-SDR...")
         self._assembler.configure(config)
         
         self._worker = _Worker(self, self._ffi, self._lib, config, self._serial_suffix, self._assembler)
@@ -156,26 +286,172 @@ class HackRFLibSource(SourceBackend):
         if not self.is_running():
             return
         
-        # Останавливаем через библиотеку
-        try:
+        if self._multi_mode:
             self._lib.hq_stop()
-        except Exception:
-            pass
+            
+            if self._multi_worker:
+                self._multi_worker.stop()
+                self._multi_worker.join(timeout=2.0)
+                self._multi_worker = None
+            
+            self._lib.hq_close_all()
+        else:
+            # Single mode
+            try:
+                self._lib.hq_stop()
+            except Exception:
+                pass
+            
+            if self._worker:
+                self._worker.ask_stop()
+                self._worker.join(timeout=3.0)
+                self._worker = None
         
-        self._worker.ask_stop()
-        self._worker.join(timeout=3.0)
-        self._worker = None
         self.finished.emit(0)
 
     def _on_worker_finished(self, code: int, msg: str):
+        """Обработчик завершения single-mode worker."""
         if code != 0:
             self.error.emit(msg or f"libhackrf завершился с кодом {code}")
         self._worker = None
         self.finished.emit(code)
+        
+    def _on_multi_worker_finished(self, code: int, msg: str):
+        """Обработчик завершения multi-mode worker."""
+        if code != 0:
+            self.error.emit(msg or f"Multi-SDR завершился с кодом {code}")
+        self._multi_worker = None
+        self.finished.emit(code)
+        
+    def get_status(self) -> Optional[Dict[str, Any]]:
+        """Получить статус multi-SDR системы."""
+        if self._multi_mode and self.is_running():
+            try:
+                status = self._ffi.new("HqStatus*")
+                r = self._lib.hq_get_status(status)
+                if r == 0:
+                    return {
+                        'master_running': bool(status.master_running),
+                        'slave1_running': bool(status.slave_running[0]),
+                        'slave2_running': bool(status.slave_running[1]),
+                        'retune_ms': status.retune_ms_avg,
+                        'watch_items': status.watch_items
+                    }
+            except Exception as e:
+                print(f"Error getting status: {e}")
+        return None
+
+
+class _MultiWorker(QtCore.QObject, threading.Thread):
+    """Worker для multi-SDR режима."""
+    
+    finished_sig = QtCore.pyqtSignal(int, str)
+    
+    def __init__(self, parent: HackRFLibSource, ffi, lib, config: SweepConfig):
+        QtCore.QObject.__init__(self)
+        threading.Thread.__init__(self, daemon=True)
+        
+        self._parent = parent
+        self._ffi = ffi
+        self._lib = lib
+        self._config = config
+        self._running = True
+        
+        # Настраиваем диапазон для мастера
+        self._freq_start = config.freq_start_hz
+        self._freq_end = config.freq_end_hz
+        self._bin_hz = config.bin_hz
+        
+    def stop(self):
+        self._running = False
+        
+    def run(self):
+        # Буферы для чтения данных
+        watchlist_buf = self._ffi.new("WatchItem[100]")
+        peaks_buf = self._ffi.new("Peak[100]")
+        status_buf = self._ffi.new("HqStatus*")
+        
+        # Для сборки полного спектра из watchlist
+        last_emit_time = time.time()
+        emit_interval = 0.1  # 10 Hz
+        
+        while self._running:
+            try:
+                # Читаем watchlist
+                n_watch = self._lib.hq_get_watchlist_snapshot(watchlist_buf, 100)
+                
+                current_time = time.time()
+                
+                if n_watch > 0 and (current_time - last_emit_time) >= emit_interval:
+                    # Конвертируем watchlist в спектр
+                    freqs = []
+                    powers = []
+                    
+                    for i in range(n_watch):
+                        item = watchlist_buf[i]
+                        freqs.append(item.f_center_hz)
+                        powers.append(item.rssi_ema)
+                    
+                    if freqs:
+                        # Сортируем по частоте
+                        sorted_data = sorted(zip(freqs, powers))
+                        freqs_array = np.array([f for f, _ in sorted_data], dtype=np.float64)
+                        powers_array = np.array([p for _, p in sorted_data], dtype=np.float32)
+                        
+                        # Эмитим как полный свип
+                        self._parent.fullSweepReady.emit(freqs_array, powers_array)
+                        last_emit_time = current_time
+                
+                # Читаем последние пики
+                n_peaks = self._lib.hq_get_recent_peaks(peaks_buf, 100)
+                
+                for i in range(n_peaks):
+                    peak = peaks_buf[i]
+                    # Создаем SweepLine для совместимости
+                    sw = SweepLine(
+                        ts=None,
+                        f_low_hz=int(peak.f_hz - 100000),
+                        f_high_hz=int(peak.f_hz + 100000),
+                        bin_hz=200000,
+                        power_dbm=np.array([peak.rssi_dbm], dtype=np.float32)
+                    )
+                    self._parent.sweepLine.emit(sw)
+                
+                # Читаем статус
+                self._lib.hq_get_status(status_buf)
+                status = status_buf[0]
+                
+                # Формируем текст статуса
+                status_parts = []
+                if status.master_running:
+                    status_parts.append("Master: ON")
+                else:
+                    status_parts.append("Master: OFF")
+                    
+                if status.slave_running[0]:
+                    status_parts.append("Slave1: ON")
+                if status.slave_running[1]:
+                    status_parts.append("Slave2: ON")
+                    
+                status_parts.append(f"Targets: {status.watch_items}")
+                
+                if status.retune_ms_avg > 0:
+                    status_parts.append(f"Retune: {status.retune_ms_avg:.1f}ms")
+                
+                self._parent.status.emit(", ".join(status_parts))
+                
+                time.sleep(0.05)  # 20 Hz polling rate
+                
+            except Exception as e:
+                if self._running:
+                    self._parent.error.emit(f"Multi-worker error: {e}")
+                break
+        
+        self.finished_sig.emit(0, "Multi-worker stopped")
 
 
 class _SweepAssembler:
-    """Собирает полный проход из сегментов, детектирует обмотку."""
+    """Собирает полный проход из сегментов (для single-mode)."""
     
     def __init__(self):
         self.f0_hz = 0
@@ -212,20 +488,15 @@ class _SweepAssembler:
         self.prev_low = None
     
     def add_segment(self, f_hz: np.ndarray, p_dbm: np.ndarray, hz_low: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """
-        Добавляет сегмент. Если детектирована обмотка и покрытие достаточное,
-        возвращает (freqs, power) полного прохода.
-        """
+        """Добавляет сегмент и возвращает полный проход если готов."""
         if self.grid is None or self.n_bins == 0:
             return None
         
-        # Детекция обмотки (новый проход)
+        # Детекция обмотки
         if self.prev_low is not None and hz_low < self.prev_low - 10e6:
-            # Началcя новый проход, финализируем старый
             result = self._finalize()
             self.reset()
             self.prev_low = hz_low
-            # Добавляем текущий сегмент в новый проход
             self._add_to_grid(f_hz, p_dbm)
             return result
         
@@ -261,7 +532,7 @@ class _SweepAssembler:
             return None
         
         coverage = float(self.seen.sum()) / float(self.n_bins)
-        if coverage < 0.5:  # Слишком мало данных
+        if coverage < 0.5:
             return None
         
         p = np.full(self.n_bins, np.nan, np.float32)
@@ -279,9 +550,11 @@ class _SweepAssembler:
 
 
 class _Worker(QtCore.QObject, threading.Thread):
-    finished_sig = QtCore.pyqtSignal(int, str)  # (code, message)
+    """Worker для single-SDR режима (обратная совместимость)."""
+    
+    finished_sig = QtCore.pyqtSignal(int, str)
 
-    def __init__(self, parent_obj: HackRFLibSource, ffi: FFI, lib, cfg: SweepConfig, 
+    def __init__(self, parent_obj: HackRFLibSource, ffi, lib, cfg: SweepConfig, 
                  serial_suffix: Optional[str], assembler: _SweepAssembler):
         QtCore.QObject.__init__(self)
         threading.Thread.__init__(self, daemon=True)
@@ -304,20 +577,15 @@ class _Worker(QtCore.QObject, threading.Thread):
                 if n <= 0:
                     return
                 
-                # Отладка для высоких частот
-                if f_low_hz > 5900000000 and f_low_hz < 6100000000:
-                    print(f"CB: {f_low_hz/1e6:.1f}-{f_high_hz/1e6:.1f} MHz, {n} bins")
-                
-                # Копируем данные из C-памяти
+                # Копируем данные
                 freqs = np.frombuffer(self._ffi.buffer(freqs_ptr, n * 8), dtype=np.float64, count=n).copy()
                 power = np.frombuffer(self._ffi.buffer(pwr_ptr, n * 4), dtype=np.float32, count=n).copy()
                 
-                # Проверяем валидность данных
+                # Проверяем валидность
                 if np.all(np.isnan(power)) or np.all(power == 0):
-                    print(f"WARNING: Invalid power data at {f_low_hz/1e6:.1f} MHz")
                     return
                 
-                # Отправляем сегмент как есть
+                # Отправляем сегмент
                 bin_hz = int(round(float(fft_bin_width_hz))) or int(self._cfg.bin_hz)
                 sw = SweepLine(
                     ts=None,
@@ -332,13 +600,12 @@ class _Worker(QtCore.QObject, threading.Thread):
                 result = self._assembler.add_segment(freqs, power, int(f_low_hz))
                 if result is not None:
                     full_freqs, full_power = result
-                    # Эмитим полный проход через специальный сигнал
                     self._parent.fullSweepReady.emit(full_freqs, full_power)
                     
             except Exception as e:
                 self._parent.status.emit(f"Callback error: {e}")
 
-        self._cb = _cb  # Сохраняем ссылку, чтобы GC не удалил
+        self._cb = _cb
 
     def run(self):
         code = 0

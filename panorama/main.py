@@ -52,6 +52,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings = settings
         self._calibration_profiles = {}
         
+        # Загружаем шрифт с эмодзи поддержкой
+        self._load_emoji_font()
+        
         # Менеджер устройств
         self.device_manager = DeviceManager()
         
@@ -121,6 +124,56 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Автозагрузка калибровки если есть
         self._try_load_default_calibration()
+        
+    def _load_emoji_font(self):
+        """Загружает шрифт с поддержкой эмодзи."""
+        from PyQt5.QtGui import QFontDatabase
+        
+        # Пробуем загрузить системные шрифты с эмодзи
+        emoji_fonts = [
+            "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+            "/System/Library/Fonts/Apple Color Emoji.ttc",
+            "C:/Windows/Fonts/seguiemj.ttf"
+        ]
+        
+        for font_path in emoji_fonts:
+            if os.path.exists(font_path):
+                QFontDatabase.addApplicationFont(font_path)
+                break
+
+
+
+    def _connect_signals(self):
+        """Подключает все сигналы между компонентами с учетом блокировок."""
+        # ... existing connections ...
+        
+        # Блокировки при активации детектора
+        self.detector_tab.detectionStarted.connect(self._on_detector_started)
+        self.detector_tab.detectionStopped.connect(self._on_detector_stopped)
+        
+    def _on_detector_started(self):
+        """При запуске детектора блокируем несовместимые вкладки."""
+        # Блокируем вкладки Пики и Карта
+        self.tabs.setTabEnabled(self.tabs.indexOf(self.peaks_tab), False)
+        self.tabs.setTabEnabled(self.tabs.indexOf(self.map_tab), False)
+        
+        # Блокируем изменение параметров в Спектре
+        self.spectrum_tab.start_mhz.setEnabled(False)
+        self.spectrum_tab.stop_mhz.setEnabled(False)
+        self.spectrum_tab.bin_khz.setEnabled(False)
+        
+        self.statusBar().showMessage("Детектор активен - вкладки Пики и Карта заблокированы", 5000)
+        
+    def _on_detector_stopped(self):
+        """При остановке детектора разблокируем вкладки."""
+        self.tabs.setTabEnabled(self.tabs.indexOf(self.peaks_tab), True)
+        self.tabs.setTabEnabled(self.tabs.indexOf(self.map_tab), True)
+        
+        self.spectrum_tab.start_mhz.setEnabled(True)
+        self.spectrum_tab.stop_mhz.setEnabled(True)
+        self.spectrum_tab.bin_khz.setEnabled(True)
+        
+        self.statusBar().showMessage("Детектор остановлен - все вкладки доступны", 5000)
 
     def _apply_dark_theme(self):
         """Применяет улучшенную темную тему с хорошей читаемостью."""
