@@ -363,6 +363,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Подключает все сигналы между компонентами."""
         print("🔌 Подключаю сигналы...")
         
+        # ИСПРАВЛЕНИЕ: Используем правильный сигнал newRowReady
         # Автопики работают автоматически всегда
         self.spectrum_tab.newRowReady.connect(self.peaks_tab.update_from_row)
         print("✅ Автопики подключены к данным")
@@ -729,53 +730,166 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stop_multi_sdr()
 
     def _start_multi_sdr(self):
-        """Запускает multi-SDR режим."""
-        # Проверяем настройку устройств
-        master, slave1, slave2 = self.device_manager.get_trilateration_devices()
-        if not (master and slave1 and slave2):
-            QtWidgets.QMessageBox.warning(
+        """Запускает multi-SDR режим с проверкой устройств."""
+        # ИСПРАВЛЕНИЕ: Сначала проверяем физическое наличие устройств
+        if not self._lib_source:
+            QtWidgets.QMessageBox.critical(
                 self, "Multi-SDR",
-                "Настройте 3 SDR устройства для multi-SDR режима!\n"
-                "Источник → Настройка SDR устройств"
+                "libhackrf_multi не загружена!"
             )
             self.act_multi_sdr.setChecked(False)
             return
         
-        # Устанавливаем количество устройств
-        if self._lib_source:
-            self._lib_source.set_num_devices(3)
+        # Получаем список реальных устройств
+        try:
+            available_serials = self._lib_source.list_serials()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Multi-SDR",
+                f"Ошибка при получении списка устройств:\n{e}"
+            )
+            self.act_multi_sdr.setChecked(False)
+            return
+        
+        if len(available_serials) < 3:
+            QtWidgets.QMessageBox.critical(
+                self, "Multi-SDR",
+                f"Для Multi-SDR режима требуется 3 устройства!\n"
+                f"Найдено устройств: {len(available_serials)}\n\n"
+                f"Подключите 3 HackRF устройства и попробуйте снова."
+            )
+            self.act_multi_sdr.setChecked(False)
+            return
+        
+        # Проверяем настройку устройств в менеджере
+        master, slave1, slave2 = self.device_manager.get_trilateration_devices()
+        
+        if not (master and slave1 and slave2):
+            # Автоматически назначаем первые 3 устройства
+            reply = QtWidgets.QMessageBox.question(
+                self, "Multi-SDR",
+                f"Устройства не настроены.\n"
+                f"Найдено {len(available_serials)} устройств.\n\n"
+                f"Автоматически настроить первые 3 устройства?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+            )
             
-            # Если есть worker, передаем параметры детектора
-            if hasattr(self._lib_source, '_multi_worker') and self._lib_source._multi_worker:
-                if hasattr(self.detector_tab, 'threshold_offset'):
-                    self._lib_source._multi_worker.set_detector_params(
-                        self.detector_tab.threshold_offset.value(),
-                        self.detector_tab.min_width.value()
+            if reply == QtWidgets.QMessageBox.Yes:
+                # Автоматическая настройка
+                self.device_manager.update_device_list(available_serials)
+                
+                if len(available_serials) >= 3:
+                    self.device_manager.set_device_role(available_serials[0], "master")
+                    self.device_manager.set_device_role(available_serials[1], "slave1")
+                    self.device_manager.set_device_role(available_serials[2], "slave2")
+                    
+                    # Устанавливаем позиции по умолчанию
+                    self.device_manager.set_device_position(available_serials[0], 0, 0, 0)
+                    self.device_manager.set_device_position(available_serials[1], 10, 0, 0)
+                    self.device_manager.set_device_position(available_serials[2], 0, 10, 0)
+                    
+                    self.device_manager.save_config()
+                    self._on_devices_configured()
+                    
+                    self.statusBar().showMessage("Устройства автоматически настроены", 3000)
+                else:
+                    self.act_multi_sdr.setChecked(False)
+                    return
+            else:
+                # Открываем диалог настройки
+                self._configure_devices()
+                self.act_multi_sdr.setChecked(False)
+                return
+        
+        # Проверяем что назначенные устройства действительно подключены
+        if master.serial not in available_serials:
+            QtWidgets.QMessageBox.critical(
+                self, "Multi-SDR",
+                f"Master устройство {master.nickname} ({master.serial}) не найдено!\n"
+                f"Переназначьте устройства в настройках."
+            )
+            self.act_multi_sdr.setChecked(False)
+            return
+        
+        if slave1.serial not in available_serials:
+            QtWidgets.QMessageBox.critical(
+                self, "Multi-SDR",
+                f"Slave1 устройство {slave1.nickname} ({slave1.serial}) не найдено!\n"
+                f"Переназначьте устройства в настройках."
+            )
+            self.act_multi_sdr.setChecked(False)
+            return
+        
+        if slave2.serial not in available_serials:
+            QtWidgets.QMessageBox.critical(
+                self, "Multi-SDR",
+                f"Slave2 устройство {slave2.nickname} ({slave2.serial}) не найдено!\n"
+                f"Переназначьте устройства в настройках."
+            )
+            self.act_multi_sdr.setChecked(False)
+            return
+        
+        # Все проверки пройдены - запускаем
+        try:
+            # Устанавливаем количество устройств
+            if self._lib_source:
+                self._lib_source.set_num_devices(3)
+                
+                # Передаем параметры детектора если он активен
+                if self._detector_active and hasattr(self.detector_tab, 'threshold_offset'):
+                    threshold = self.detector_tab.threshold_offset.value()
+                    min_width = self.detector_tab.min_width.value()
+                    min_sweeps = self.detector_tab.min_sweeps.value()
+                    timeout = self.detector_tab.signal_timeout.value()
+                    
+                    self._lib_source.set_detector_params(
+                        threshold, min_width, min_sweeps, timeout
                     )
-        
-        self._multi_sdr_active = True
-        self._status_timer.start()
-        
-        self.lbl_multi_sdr.setText("MULTI: INIT")
-        self.lbl_multi_sdr.setStyleSheet("padding: 0 10px; color: #ffff66;")
-        
-        # Тихий вывод - только важное
-        self.log.log("Multi-SDR режим активирован", level="important")
+            
+            self._multi_sdr_active = True
+            self._status_timer.start()
+            
+            self.lbl_multi_sdr.setText("MULTI: INIT")
+            self.lbl_multi_sdr.setStyleSheet("padding: 0 10px; color: #ffff66;")
+            
+            self.log.log(f"Multi-SDR режим активирован с {len(available_serials)} устройствами", level="important")
+            self.statusBar().showMessage("Multi-SDR режим активирован", 3000)
+            
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Multi-SDR",
+                f"Ошибка при запуске Multi-SDR:\n{e}"
+            )
+            self.act_multi_sdr.setChecked(False)
+            self._multi_sdr_active = False
 
     def _stop_multi_sdr(self):
-        """Останавливает multi-SDR режим."""
+        """Останавливает multi-SDR режим с корректным закрытием устройств."""
         self._multi_sdr_active = False
         self._status_timer.stop()
         
+        # ИСПРАВЛЕНИЕ: Правильно останавливаем источник если он работает
+        if self._lib_source and self._lib_source.is_running():
+            try:
+                self._lib_source.stop()
+                # Ждем завершения
+                QtWidgets.QApplication.processEvents()
+                time.sleep(0.5)
+            except Exception as e:
+                self.log.log(f"Ошибка при остановке источника: {e}", level="warning")
+        
         # Возвращаем на 1 устройство
         if self._lib_source:
-            self._lib_source.set_num_devices(1)
+            try:
+                self._lib_source.set_num_devices(1)
+            except Exception as e:
+                self.log.log(f"Ошибка при сбросе количества устройств: {e}", level="warning")
         
         self.lbl_multi_sdr.setText("MULTI: OFF")
         self.lbl_multi_sdr.setStyleSheet("padding: 0 10px;")
         
-        self.statusBar().showMessage("Multi-SDR режим деактивирован", 5000)
-        self.log.log("Multi-SDR mode disabled", level="important")
+        self.statusBar().showMessage("Multi-SDR режим деактивирован", 3000)
+        self.log.log("Multi-SDR режим деактивирован", level="important")
 
     def _build_shortcuts(self):
         """Горячие клавиши."""
@@ -1146,10 +1260,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _export_current_csv(self):
         """Экспорт текущего свипа в CSV."""
-        freqs, row = self.spectrum_tab.get_current_row()
-        if freqs is None or row is None:
+        # ИСПРАВЛЕНИЕ: Используем правильные поля модели
+        if self.spectrum_tab._model.freqs_hz is None or self.spectrum_tab._model.last_row is None:
             QtWidgets.QMessageBox.information(self, "Экспорт", "Нет данных для экспорта")
             return
+        
+        freqs = self.spectrum_tab._model.freqs_hz
+        row = self.spectrum_tab._model.last_row
         
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Сохранить CSV", 

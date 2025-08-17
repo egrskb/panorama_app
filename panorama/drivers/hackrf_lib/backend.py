@@ -293,25 +293,35 @@ class HackRFLibSource(SourceBackend):
         """Запуск в multi-SDR режиме."""
         self.status.emit(f"Инициализация multi-SDR ({self._num_devices} устройств)...")
         
+        # ИСПРАВЛЕНИЕ: Проверяем количество реальных устройств
+        actual_count = self._lib.hq_get_device_count()
+        if actual_count < self._num_devices:
+            self.error.emit(f"Требуется {self._num_devices} устройств, найдено только {actual_count}")
+            return
+        
         # Открываем устройства
         r = self._lib.hq_open_all(self._num_devices)
         if r != 0:
-            self.error.emit(f"Не удалось открыть {self._num_devices} устройств (код: {r})")
+            error_msg = {
+                -16: "Устройства заняты другим процессом",
+                -19: "Нет доступа к устройствам (проверьте права)",
+                -2: "Устройства не найдены",
+            }.get(r, f"Не удалось открыть {self._num_devices} устройств (код: {r})")
+            self.error.emit(error_msg)
             return
         
-        # Конфигурируем
+        # Конфигурируем с правильными параметрами
         self._lib.hq_config_set_rates(12000000, 8000000)  # 12 MSPS, 8 MHz BB filter
         self._lib.hq_config_set_gains(config.lna_db, config.vga_db, config.amp_on)
         
-        # Настраиваем диапазон частот
-        start_hz = config.freq_start_hz
-        stop_hz = config.freq_end_hz
-        step_hz = config.bin_hz
+        # ИСПРАВЛЕНИЕ: Ограничиваем диапазон частот
+        start_hz = max(config.freq_start_hz, 1000000)     # Минимум 1 МГц
+        stop_hz = min(config.freq_end_hz, 6000000000)      # Максимум 6 ГГц
+        step_hz = max(config.bin_hz, 100000)               # Минимум 100 кГц шаг
         
-        # Простое последовательное сканирование всего диапазона
         print(f"Configuring frequency range: {start_hz/1e6:.1f} - {stop_hz/1e6:.1f} MHz, step {step_hz/1e6:.3f} MHz")
         
-        self._lib.hq_config_set_freq_range(start_hz, stop_hz, step_hz)
+        self._lib.hq_config_set_freq_range(float(start_hz), float(stop_hz), float(step_hz))
         self._lib.hq_config_set_dwell_time(2)  # 2 ms dwell time
         
         # Настраиваем параметры группировки
@@ -347,6 +357,7 @@ class HackRFLibSource(SourceBackend):
         self.started.emit()
 
     def stop(self):
+        """Исправленный метод stop()."""
         if not self.is_running():
             return
         
@@ -365,7 +376,7 @@ class HackRFLibSource(SourceBackend):
                 self._multi_worker.join(timeout=2.0)
                 self._multi_worker = None
             
-            # Закрываем устройства
+            # ИСПРАВЛЕНИЕ: Закрываем все устройства при остановке
             try:
                 self._lib.hq_close_all()
             except Exception as e:
@@ -426,7 +437,7 @@ class HackRFLibSource(SourceBackend):
 # Заменить класс _MultiWorker целиком
 
 class _MultiWorker(QtCore.QObject, threading.Thread):
-    """Worker для multi-SDR режима с корректной обработкой."""
+    """Worker для multi-SDR режима с правильной обработкой широкополосных сигналов."""
     
     finished_sig = QtCore.pyqtSignal(int, str)
     
@@ -445,9 +456,13 @@ class _MultiWorker(QtCore.QObject, threading.Thread):
         self._freq_end = config.freq_end_hz
         self._bin_hz = config.bin_hz
         
-        # Параметры детектора (получаем из родителя если есть)
+        # Параметры детектора
         self._threshold_offset = 20.0  # дБ над шумом по умолчанию
         self._min_width_bins = 3
+        
+        # Счетчики для отладки
+        self._spectrum_updates = 0
+        self._watchlist_updates = 0
         
     def stop(self):
         self._running = False
@@ -458,7 +473,9 @@ class _MultiWorker(QtCore.QObject, threading.Thread):
         self._min_width_bins = min_width_bins
         
     def run(self):
-        """Worker для multi-SDR режима."""
+        """Worker для multi-SDR режима с улучшенной обработкой."""
+        print("MultiWorker: Started")
+        
         # Буферы для чтения данных
         watchlist_buf = self._ffi.new("WatchItem[100]")
         peaks_buf = self._ffi.new("Peak[100]")
@@ -466,7 +483,7 @@ class _MultiWorker(QtCore.QObject, threading.Thread):
 
         # Параметры для спектра
         last_emit_time = time.time()
-        emit_interval = 0.05  # 20 Hz
+        emit_interval = 0.05  # 20 Hz для плавности
         
         # Вычисляем количество точек спектра
         n_points = int((self._freq_end - self._freq_start) / self._bin_hz) + 1
@@ -475,15 +492,19 @@ class _MultiWorker(QtCore.QObject, threading.Thread):
         if n_points > 50000:
             n_points = 50000
             self._bin_hz = (self._freq_end - self._freq_start) / (n_points - 1)
+            print(f"MultiWorker: Limited to {n_points} points")
 
         # Буферы для спектра
         freqs_buf = self._ffi.new("double[]", n_points)
         powers_buf = self._ffi.new("float[]", n_points)
 
         # Счетчики для отладки
-        update_count = 0
         last_status_time = time.time()
         last_watchlist_count = 0
+        error_count = 0
+        max_errors = 10
+
+        print(f"MultiWorker: Configured for {n_points} points, {self._freq_start/1e6:.1f}-{self._freq_end/1e6:.1f} MHz")
 
         while self._running:
             try:
@@ -504,56 +525,93 @@ class _MultiWorker(QtCore.QObject, threading.Thread):
                         dtype=np.float32,
                     ).copy()
 
-                    # Эмитим полный спектр для UI
-                    if (current_time - last_emit_time) >= emit_interval:
-                        self._parent.fullSweepReady.emit(freqs_array, powers_array)
-                        last_emit_time = current_time
-                        update_count += 1
+                    # Проверяем валидность данных
+                    if not np.all(np.isnan(powers_array)) and np.max(powers_array) > -150:
+                        # Эмитим полный спектр для UI
+                        if (current_time - last_emit_time) >= emit_interval:
+                            self._parent.fullSweepReady.emit(freqs_array, powers_array)
+                            last_emit_time = current_time
+                            self._spectrum_updates += 1
+                            
+                            # Периодический лог (каждые 100 обновлений)
+                            if self._spectrum_updates % 100 == 0:
+                                max_power = np.max(powers_array)
+                                print(f"MultiWorker: {self._spectrum_updates} updates, max power: {max_power:.1f} dBm")
 
                 # 2. Читаем watchlist (цели для slave SDR)
                 n_watchlist = self._lib.hq_get_watchlist_snapshot(watchlist_buf, 100)
                 
                 if n_watchlist > 0 and n_watchlist != last_watchlist_count:
                     last_watchlist_count = n_watchlist
+                    self._watchlist_updates += 1
                     
-                    # Логируем только изменения
-                    for i in range(min(n_watchlist, 5)):  # Показываем первые 5
+                    # Обрабатываем широкополосные сигналы
+                    wideband_signals = []
+                    for i in range(n_watchlist):
                         w = watchlist_buf[i]
-                        if w.rssi_ema > -80:  # Только сильные сигналы
+                        
+                        # Фильтруем по мощности и ширине
+                        if w.rssi_ema > -100 and w.bw_hz > 100000:  # > 100 кГц
+                            wideband_signals.append({
+                                'freq': w.f_center_hz / 1e6,
+                                'bw': w.bw_hz / 1e6,
+                                'rssi': w.rssi_ema
+                            })
+                            
                             # Создаем SweepLine для совместимости с детектором
-                            sw = SweepLine(
-                                ts=None,
-                                f_low_hz=int(w.f_center_hz - w.bw_hz/2),
-                                f_high_hz=int(w.f_center_hz + w.bw_hz/2),
-                                bin_hz=int(w.bw_hz) if w.bw_hz > 0 else 200000,
-                                power_dbm=np.array([w.rssi_ema], dtype=np.float32),
-                            )
-                            self._parent.sweepLine.emit(sw)
+                            if w.rssi_ema > -80:  # Сильные сигналы
+                                sw = SweepLine(
+                                    ts=None,
+                                    f_low_hz=int(w.f_center_hz - w.bw_hz/2),
+                                    f_high_hz=int(w.f_center_hz + w.bw_hz/2),
+                                    bin_hz=int(w.bw_hz/10) if w.bw_hz > 0 else 200000,
+                                    power_dbm=np.array([w.rssi_ema], dtype=np.float32),
+                                )
+                                self._parent.sweepLine.emit(sw)
+                    
+                    # Логируем широкополосные сигналы
+                    if wideband_signals and self._watchlist_updates % 10 == 0:
+                        print(f"MultiWorker: {len(wideband_signals)} wideband signals detected")
+                        for sig in wideband_signals[:3]:  # Первые 3
+                            print(f"  {sig['freq']:.1f} MHz, BW: {sig['bw']:.2f} MHz, RSSI: {sig['rssi']:.1f} dBm")
 
                 # 3. Читаем статус системы
                 r = self._lib.hq_get_status(status_buf)
                 if r == 0:
                     status = status_buf[0]
                     
-                    # Формируем краткий статус
-                    active_slaves = sum([status.slave_running[0], status.slave_running[1]])
-                    
+                    # Периодический статус (каждые 2 секунды)
                     if current_time - last_status_time > 2.0:
-                        if status.watch_items > 0:
+                        active_slaves = sum([status.slave_running[0], status.slave_running[1]])
+                        
+                        if status.watch_items > 0 or active_slaves > 0:
                             self._parent.status.emit(
-                                f"Targets: {status.watch_items}, Slaves: {active_slaves}"
+                                f"Targets: {status.watch_items}, Slaves: {active_slaves}, "
+                                f"Retune: {status.retune_ms_avg:.1f}ms"
                             )
                         last_status_time = current_time
 
-                # Небольшая задержка
+                # Небольшая задержка для снижения нагрузки
                 time.sleep(0.02)  # 50 Hz polling
+                
+                # Сброс счетчика ошибок при успешной итерации
+                error_count = 0
 
             except Exception as e:
-                if self._running:
+                error_count += 1
+                if error_count <= 3:  # Логируем только первые 3 ошибки
+                    print(f"MultiWorker error #{error_count}: {e}")
                     import traceback
                     traceback.print_exc()
-                break
+                
+                if error_count >= max_errors:
+                    print(f"MultiWorker: Too many errors ({max_errors}), stopping")
+                    break
+                
+                time.sleep(0.1)  # Пауза при ошибке
 
+        print(f"MultiWorker: Stopped after {self._spectrum_updates} spectrum updates, "
+              f"{self._watchlist_updates} watchlist updates")
         self.finished_sig.emit(0, "Multi-worker stopped")
 
 

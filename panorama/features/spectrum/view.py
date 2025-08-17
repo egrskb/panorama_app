@@ -556,6 +556,9 @@ class SpectrumView(QtWidgets.QWidget):
             self._update_timer.start()
         if self._sweep_count == 5:
             self._auto_levels()
+            
+        # Эмитим сигнал для автопиков и детектора
+        self.newRowReady.emit(freqs_hz, power_dbm)
     # ---------- сглаживания ----------
     def _smooth_freq(self, y: np.ndarray) -> np.ndarray:
         if not self.chk_smooth.isChecked() or y.size < 3:

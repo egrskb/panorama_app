@@ -293,15 +293,32 @@ class MapView(QtWidgets.QWidget):
         if not self._trilateration_active:
             return
         
-        # Ищем цель в диапазоне ±5 МГц (для широкополосных)
+        # ИСПРАВЛЕНИЕ: Увеличиваем диапазон поиска для широкополосных сигналов
+        # Ищем цель в диапазоне ±10 МГц (для широкополосных видеосигналов)
         target = None
+        tolerance = 10.0  # МГц
+        
         for t in self.targets:
-            if abs(t.freq_mhz - freq_mhz) < 5.0:
+            if abs(t.freq_mhz - freq_mhz) < tolerance:
+                # Нашли подходящую цель
                 target = t
                 break
         
         if not target:
-            return  # Не создаем новые цели автоматически
+            # Если нет цели - создаем новую автоматически при трилатерации
+            self._target_id_seq += 1
+            target = Target(
+                id=self._target_id_seq,
+                x=0.0,
+                y=0.0,
+                freq_mhz=freq_mhz,
+                power_dbm=rssi_master,  # Используем мощность от мастера
+                confidence=0.5,
+                timestamp=time.time(),
+                source="trilateration"
+            )
+            self.targets.append(target)
+            self._update_targets_table()
         
         # Обновляем RSSI
         target.rssi_master = rssi_master
@@ -312,37 +329,57 @@ class MapView(QtWidgets.QWidget):
         # Вычисляем позицию
         new_pos = self._calculate_position(rssi_master, rssi_slave1, rssi_slave2)
         if new_pos:
-            # Сглаживание EMA
-            alpha = 0.3
-            target.x = alpha * new_pos[0] + (1 - alpha) * target.x
-            target.y = alpha * new_pos[1] + (1 - alpha) * target.y
+            # Сглаживание EMA с более сильным коэффициентом
+            alpha = 0.5  # Увеличено для более быстрой реакции
+            if target.x == 0 and target.y == 0:
+                # Первое измерение - устанавливаем сразу
+                target.x, target.y = new_pos
+            else:
+                target.x = alpha * new_pos[0] + (1 - alpha) * target.x
+                target.y = alpha * new_pos[1] + (1 - alpha) * target.y
             
             # История для траектории
             target.history_x.append(target.x)
             target.history_y.append(target.y)
-            if len(target.history_x) > 50:
+            if len(target.history_x) > 100:  # Увеличиваем историю
                 target.history_x.pop(0)
                 target.history_y.pop(0)
         
         self._refresh_map()
 
     def _calculate_position(self, rssi_m: float, rssi_s1: float, rssi_s2: float):
-        """Трилатерация по RSSI."""
+        """Трилатерация по RSSI с улучшенной моделью."""
         def rssi_to_distance(rssi: float) -> float:
-            # Модель затухания: d = 10^((P0 - RSSI) / (10 * n))
-            P0 = -40.0  # RSSI на 1м
-            n = 2.5     # Коэффициент затухания
-            return 10.0 ** ((P0 - rssi) / (10.0 * n))
+            # Улучшенная модель затухания для реальных условий
+            # RSSI = P0 - 10*n*log10(d/d0)
+            # где P0 - мощность на расстоянии d0 (1м)
+            P0 = -30.0  # Скорректированное значение для HackRF
+            n = 2.2     # Коэффициент затухания для помещения
+            
+            # Ограничиваем RSSI разумными пределами
+            rssi = max(-120, min(-20, rssi))
+            
+            # Вычисляем расстояние
+            path_loss = P0 - rssi
+            distance = 10.0 ** (path_loss / (10.0 * n))
+            
+            # Ограничиваем расстояние
+            return max(0.5, min(100.0, distance))
         
         d0 = rssi_to_distance(rssi_m)
         d1 = rssi_to_distance(rssi_s1)
         d2 = rssi_to_distance(rssi_s2)
+        
+        # Логируем для отладки
+        print(f"Distances: M={d0:.1f}m, S1={d1:.1f}m, S2={d2:.1f}m")
         
         p0 = np.array(self.sdr_positions['master'])
         p1 = np.array(self.sdr_positions['slave1'])
         p2 = np.array(self.sdr_positions['slave2'])
         
         try:
+            # Улучшенный алгоритм трилатерации
+            # Используем метод наименьших квадратов
             A = 2 * np.array([
                 [p1[0] - p0[0], p1[1] - p0[1]],
                 [p2[0] - p0[0], p2[1] - p0[1]]
@@ -353,9 +390,21 @@ class MapView(QtWidgets.QWidget):
                 d0**2 - d2**2 - np.linalg.norm(p0)**2 + np.linalg.norm(p2)**2
             ])
             
+            # Проверяем обусловленность матрицы
+            if np.linalg.cond(A) > 1e10:
+                print("Warning: Poorly conditioned matrix")
+                return None
+            
             result = np.linalg.lstsq(A, b, rcond=None)[0]
-            return (np.clip(result[0], -50, 50), np.clip(result[1], -50, 50))
-        except:
+            
+            # Ограничиваем результат областью карты
+            x = np.clip(result[0], -50, 50)
+            y = np.clip(result[1], -50, 50)
+            
+            return (x, y)
+            
+        except Exception as e:
+            print(f"Trilateration error: {e}")
             return None
 
     def _refresh_map(self):
@@ -478,14 +527,17 @@ class MapView(QtWidgets.QWidget):
             self.lbl_tracking.setText(f"ID {self._tracking_target.id}")
 
     def _update_tracking(self):
-        """Обновление трекинга."""
+        """Обновление трекинга с увеличенным таймаутом."""
         if self._tracking_target:
-            # Проверка таймаута
-            if time.time() - self._tracking_target.last_update > 5.0:
+            # ИСПРАВЛЕНИЕ: Увеличиваем таймаут до 10 секунд для медленных обновлений
+            if time.time() - self._tracking_target.last_update > 10.0:
                 self._tracking_target.is_tracking = False
                 self._tracking_target = None
                 self.update_timer.stop()
                 self.lbl_tracking.setText("ПОТЕРЯНА")
+            else:
+                # Обновляем статус
+                self.lbl_tracking.setText(f"ID {self._tracking_target.id} ({self._tracking_target.freq_mhz:.1f} МГц)")
 
     def _clear_targets(self):
         """Очистка целей."""
