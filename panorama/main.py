@@ -1,11 +1,12 @@
 # panorama/main.py
 import sys, os, stat, getpass, pathlib, logging, time
+from typing import List, Tuple
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import QSettings
 import numpy as np
 
 from panorama.features.spectrum import SpectrumView
-from panorama.features.peaks.ui_improved import AdaptivePeaksWidget
+from panorama.features.peaks.unified_peaks import UnifiedPeaksWidget
 from panorama.features.detector.widget import DetectorWidget
 from panorama.features.devices.manager import DeviceManager, DeviceConfigDialog
 from panorama.features.map3d import MapView
@@ -142,7 +143,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Остальные вкладки
         self.map_tab = MapView()
-        self.peaks_tab = AdaptivePeaksWidget()
+        self.peaks_tab = UnifiedPeaksWidget()
         self.detector_tab = DetectorWidget()
 
         # Добавляем вкладки
@@ -150,6 +151,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.peaks_tab, "📍 Автопики")
         self.tabs.addTab(self.detector_tab, "🎯 Детектор")
         self.tabs.addTab(self.map_tab, "🗺️ Карта")
+        
+
         
         # Провязка сигналов
         self._connect_signals()
@@ -182,6 +185,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self._status_timer = QtCore.QTimer()
         self._status_timer.timeout.connect(self._update_multi_sdr_status)
         self._status_timer.setInterval(1000)  # 1 Hz
+        
+        # Питаем автопики данными — подключаемся к сигналу виджета пиков
+        # ОЖИДАЕМ список вида [(freq_hz, dbm), ...]. Если у тебя объект с полями, просто трансформируй тут.
+        try:
+            self.peaks_tab.peaksReady.connect(self._on_peaks_ready)
+        except Exception:
+            # Если сигнала нет — можно подключить к твоему детектору либо к SpectrumView (через локальный пик-файндер)
+            pass
+
+    @QtCore.pyqtSlot(object)
+    def _on_peaks_ready(self, peaks):
+        """peaks: List[Tuple[freq_hz, dbm]] — добавляем/обновляем записи автопиков."""
+        # Передаем данные в виджет автопиков
+        if hasattr(self.peaks_tab, 'get_engine'):
+            engine = self.peaks_tab.get_engine()
+            flat: List[Tuple[float, float]] = []
+            for p in peaks:
+                try:
+                    # поддержка форматов (f, dbm) или объектов с полями
+                    if isinstance(p, (list, tuple)) and len(p) >= 2:
+                        f, dbm = float(p[0]), float(p[1])
+                    else:
+                        f, dbm = float(getattr(p, "freq_hz")), float(getattr(p, "dbm"))
+                    flat.append((f, dbm))
+                except Exception:
+                    continue
+            if flat:
+                engine.ingest(flat)
         
     def _load_emoji_font(self):
         """Загружает шрифт с поддержкой эмодзи."""
@@ -831,6 +862,12 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Все проверки пройдены - запускаем
         try:
+            # Если источник уже работает, останавливаем его
+            if self._lib_source and self._lib_source.is_running():
+                self._lib_source.stop()
+                QtWidgets.QApplication.processEvents()
+                time.sleep(0.5)
+            
             # Устанавливаем количество устройств
             if self._lib_source:
                 self._lib_source.set_num_devices(3)
@@ -845,6 +882,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._lib_source.set_detector_params(
                         threshold, min_width, min_sweeps, timeout
                     )
+                
+                # Перезапускаем источник в multi-mode
+                if hasattr(self.spectrum_tab, '_source') and self.spectrum_tab._source:
+                    # Получаем текущую конфигурацию из spectrum_tab
+                    if hasattr(self.spectrum_tab, '_current_cfg') and self.spectrum_tab._current_cfg:
+                        self.spectrum_tab._source.start(self.spectrum_tab._current_cfg)
             
             self._multi_sdr_active = True
             self._status_timer.start()
@@ -881,7 +924,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # Возвращаем на 1 устройство
         if self._lib_source:
             try:
+
                 self._lib_source.set_num_devices(1)
+                
+                # Перезапускаем источник в single-mode
+                if hasattr(self.spectrum_tab, '_source') and self.spectrum_tab._source:
+                    # Получаем текущую конфигурацию из spectrum_tab
+                    if hasattr(self.spectrum_tab, '_current_cfg') and self.spectrum_tab._current_cfg:
+                        self.spectrum_tab._source.start(self.spectrum_tab._current_cfg)
+                    
             except Exception as e:
                 self.log.log(f"Ошибка при сбросе количества устройств: {e}", level="warning")
         

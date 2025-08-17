@@ -284,6 +284,7 @@ class HackRFLibSource(SourceBackend):
             self.status.emit("Уже запущено")
             return
         
+        # MultiWorker запускается ТОЛЬКО в multi-mode
         if self._multi_mode:
             self._start_multi(config)
         else:
@@ -297,6 +298,11 @@ class HackRFLibSource(SourceBackend):
         actual_count = self._lib.hq_get_device_count()
         if actual_count < self._num_devices:
             self.error.emit(f"Требуется {self._num_devices} устройств, найдено только {actual_count}")
+            return
+            
+        # MultiWorker запускается ТОЛЬКО если устройств больше 1
+        if self._num_devices <= 1:
+            self.status.emit("Single-SDR режим - MultiWorker не нужен")
             return
         
         # Открываем устройства
@@ -351,6 +357,7 @@ class HackRFLibSource(SourceBackend):
         self.status.emit("Инициализация single-SDR...")
         self._assembler.configure(config)
         
+        # В single-mode НЕ запускаем MultiWorker
         self._worker = _Worker(self, self._ffi, self._lib, config, self._serial_suffix, self._assembler)
         self._worker.finished_sig.connect(self._on_worker_finished)
         self._worker.start()
