@@ -1,4 +1,4 @@
-// hq_slave.c
+// hq_slave.c - ПОЛНАЯ ЗАМЕНА ФАЙЛА
 #include "hq_slave.h"
 #include "hq_rssi.h"
 #include "hq_grouping.h"
@@ -8,50 +8,121 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include <fftw3.h>
 
 typedef struct {
     SdrCtx* ctx;
     int slave_idx;
-    volatile int* rx_count;
+    
+    // FFT processing
+    fftwf_complex* fft_in;
+    fftwf_complex* fft_out;
+    fftwf_plan fft_plan;
+    int fft_size;
+    float* window;
+    
+    // Target tracking
+    double target_freq_hz;
+    double bandwidth_hz;
+    bool has_target;
+    uint64_t last_target_update_ns;
 } SlaveData;
+
+// Создание окна для FFT
+static void create_window(float* window, int size) {
+    for (int i = 0; i < size; i++) {
+        double a0 = 0.35875;
+        double a1 = 0.48829;
+        double a2 = 0.14128;
+        double a3 = 0.01168;
+        double phase = 2.0 * M_PI * i / (size - 1);
+        window[i] = a0 - a1 * cos(phase) + a2 * cos(2 * phase) - a3 * cos(3 * phase);
+    }
+}
 
 static int slave_rx_callback(hackrf_transfer* transfer) {
     SlaveData* data = (SlaveData*)transfer->rx_ctx;
     SdrCtx* ctx = data->ctx;
     
     if (!ctx->running) {
-        return -1;  // Stop receiving
+        return -1;
     }
     
-    // Estimate RSSI
-    float rssi = rssi_estimate_power((const int8_t*)transfer->buffer, transfer->valid_length / 2);
+    // Обрабатываем только если есть цель
+    if (!data->has_target) {
+        return 0;
+    }
     
-    // Update watchlist items in current band
-    pthread_mutex_lock(&g_watchlist_mutex);
+    // Преобразуем I/Q в комплексные числа
+    int8_t* buf = (int8_t*)transfer->buffer;
+    int samples = transfer->valid_length / 2;
     
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    uint64_t now_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    // Заполняем FFT буфер
+    for (int i = 0; i < samples && i < data->fft_size; i++) {
+        float i_val = (float)buf[i*2] / 128.0f;
+        float q_val = (float)buf[i*2 + 1] / 128.0f;
+        
+        data->fft_in[i][0] = i_val * data->window[i];
+        data->fft_in[i][1] = q_val * data->window[i];
+    }
     
-    for (size_t i = 0; i < g_watchlist_count; i++) {
-        // Check if target is within ±4 MHz of current center
-        if (fabs(g_watchlist[i].f_center_hz - ctx->center_hz) < 4e6) {
-            // Simple model: adjust RSSI based on offset from center
-            float offset_mhz = (g_watchlist[i].f_center_hz - ctx->center_hz) / 1e6;
-            float adjusted_rssi = rssi - fabs(offset_mhz) * 0.5f;
-            
-            // Update with EMA
-            g_watchlist[i].rssi_ema = rssi_apply_ema(
-                g_watchlist[i].rssi_ema, adjusted_rssi, g_ema_alpha
-            );
-            g_watchlist[i].last_ns = now_ns;
-            g_watchlist[i].hit_count++;
+    // FFT
+    fftwf_execute(data->fft_plan);
+    
+    // Анализируем спектр в области цели
+    float bin_width_hz = (float)ctx->samp_rate / data->fft_size;
+    float max_power = -120.0f;
+    double peak_freq = data->target_freq_hz;
+    
+    for (int i = 0; i < data->fft_size; i++) {
+        int idx = (i + data->fft_size/2) % data->fft_size;
+        
+        float re = data->fft_out[idx][0];
+        float im = data->fft_out[idx][1];
+        float power = 10.0f * log10f(re*re + im*im + 1e-20f);
+        
+        double freq_hz = ctx->center_hz + (i - data->fft_size/2) * bin_width_hz;
+        
+        // Проверяем попадание в область цели
+        if (fabs(freq_hz - data->target_freq_hz) < data->bandwidth_hz / 2) {
+            if (power > max_power) {
+                max_power = power;
+                peak_freq = freq_hz;
+            }
         }
     }
     
-    pthread_mutex_unlock(&g_watchlist_mutex);
-    
-    (*data->rx_count)++;
+    // Обновляем измерение для цели
+    if (max_power > -100.0f) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t now_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+        
+        // Обновляем в watchlist
+        pthread_mutex_lock(&g_watchlist_mutex);
+        
+        for (size_t i = 0; i < g_watchlist_count; i++) {
+            if (fabs(g_watchlist[i].f_center_hz - peak_freq) < data->bandwidth_hz) {
+                // Обновляем RSSI с EMA
+                g_watchlist[i].rssi_ema = rssi_apply_ema(
+                    g_watchlist[i].rssi_ema, max_power, g_ema_alpha
+                );
+                g_watchlist[i].last_ns = now_ns;
+                g_watchlist[i].hit_count++;
+                
+                // Добавляем в очередь пиков для трилатерации
+                Peak peak = {
+                    .f_hz = peak_freq,
+                    .rssi_dbm = max_power,
+                    .last_ns = now_ns
+                };
+                peak_queue_push(g_peaks_queue, &peak);
+                break;
+            }
+        }
+        
+        pthread_mutex_unlock(&g_watchlist_mutex);
+    }
     
     return 0;
 }
@@ -63,92 +134,104 @@ static void* slave_thread_fn(void* arg) {
     
     printf("Slave %d thread started\n", slave_idx);
     
-    struct timespec ts_start, ts_end;
-    double current_center = 0;
-    WatchItem local_targets[MAX_WATCHLIST];
-    size_t num_targets = 0;
-    volatile int rx_count = 0;
-    data->rx_count = &rx_count;
+    // Инициализация FFT
+    data->fft_size = 4096;  // Меньше чем у master для скорости
+    data->fft_in = fftwf_alloc_complex(data->fft_size);
+    data->fft_out = fftwf_alloc_complex(data->fft_size);
+    data->fft_plan = fftwf_plan_dft_1d(data->fft_size, data->fft_in, data->fft_out,
+                                        FFTW_FORWARD, FFTW_ESTIMATE);
     
-    // Start RX
+    data->window = malloc(data->fft_size * sizeof(float));
+    create_window(data->window, data->fft_size);
+    
+    // Начальные параметры
+    data->has_target = false;
+    data->bandwidth_hz = 8e6;  // 8 МГц полоса обзора
+    
+    // Запускаем RX
     int r = hackrf_start_rx(ctx->dev, slave_rx_callback, data);
     if (r != HACKRF_SUCCESS) {
-        fprintf(stderr, "Slave %d: hackrf_start_rx failed: %s\n", 
+        fprintf(stderr, "Slave %d: start_rx failed: %s\n", 
                 slave_idx, hackrf_error_name(r));
-        return NULL;
+        goto cleanup;
     }
     
+    struct timespec ts;
+    double current_center = 0;
+    
     while (ctx->running) {
-        clock_gettime(CLOCK_MONOTONIC, &ts_start);
-        rx_count = 0;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t now_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
         
-        // Get snapshot of targets to monitor
+        // Получаем цель из watchlist
         pthread_mutex_lock(&g_watchlist_mutex);
-        num_targets = g_watchlist_count < MAX_WATCHLIST ? g_watchlist_count : MAX_WATCHLIST;
-        if (num_targets > 0) {
-            memcpy(local_targets, g_watchlist, num_targets * sizeof(WatchItem));
-        }
-        pthread_mutex_unlock(&g_watchlist_mutex);
         
-        if (num_targets == 0) {
-            usleep(50000);  // 50ms if no targets
-            continue;
-        }
-        
-        // Find best center frequency to cover maximum targets
-        double best_center = 0;
-        int max_coverage = 0;
-        
-        for (size_t i = 0; i < num_targets; i++) {
-            double f = local_targets[i].f_center_hz;
-            int coverage = 0;
+        if (g_watchlist_count > 0) {
+            // Выбираем цель для этого slave
+            // Slave 1 берет нечетные индексы, Slave 2 - четные
+            int target_idx = -1;
             
-            // Count how many targets fall within ±4 MHz
-            for (size_t j = 0; j < num_targets; j++) {
-                if (fabs(local_targets[j].f_center_hz - f) < 4e6) {
-                    coverage++;
+            for (size_t i = 0; i < g_watchlist_count; i++) {
+                if ((slave_idx == 1 && (i % 2) == 1) ||
+                    (slave_idx == 2 && (i % 2) == 0)) {
+                    
+                    // Проверяем актуальность цели
+                    if ((now_ns - g_watchlist[i].last_ns) < 2000000000ULL) {  // 2 секунды
+                        target_idx = i;
+                        break;
+                    }
                 }
             }
             
-            if (coverage > max_coverage) {
-                max_coverage = coverage;
-                best_center = f;
+            if (target_idx >= 0) {
+                double new_freq = g_watchlist[target_idx].f_center_hz;
+                
+                // Перестраиваемся если нужно
+                if (!data->has_target || fabs(new_freq - data->target_freq_hz) > 1e6) {
+                    data->target_freq_hz = new_freq;
+                    data->has_target = true;
+                    data->last_target_update_ns = now_ns;
+                    
+                    // Центрируемся на цели
+                    ctx->center_hz = new_freq;
+                    r = hackrf_set_freq(ctx->dev, (uint64_t)new_freq);
+                    if (r != HACKRF_SUCCESS) {
+                        fprintf(stderr, "Slave %d: retune to %.1f MHz failed\n",
+                                slave_idx, new_freq/1e6);
+                    } else {
+                        printf("Slave %d: tracking target at %.1f MHz (RSSI: %.1f dBm)\n",
+                               slave_idx, new_freq/1e6, g_watchlist[target_idx].rssi_ema);
+                    }
+                    
+                    current_center = new_freq;
+                    ctx->retune_count++;
+                }
+            } else {
+                // Нет подходящей цели
+                if (data->has_target && (now_ns - data->last_target_update_ns) > 5000000000ULL) {
+                    printf("Slave %d: lost target\n", slave_idx);
+                    data->has_target = false;
+                }
             }
+        } else {
+            data->has_target = false;
         }
         
-        // Retune if necessary
-        if (best_center > 0 && fabs(current_center - best_center) > 100e3) {
-            current_center = best_center;
-            ctx->center_hz = current_center;
-            
-            r = hackrf_set_freq(ctx->dev, (uint64_t)current_center);
-            if (r != HACKRF_SUCCESS) {
-                fprintf(stderr, "Slave %d retune failed: %s\n", 
-                        slave_idx, hackrf_error_name(r));
-                continue;
-            }
-            
-            usleep(2000);  // 2ms for stabilization
-        }
+        pthread_mutex_unlock(&g_watchlist_mutex);
         
-        // Wait for some data collection
-        usleep(20000);  // 20ms
-        
-        // Update statistics
-        clock_gettime(CLOCK_MONOTONIC, &ts_end);
-        uint64_t elapsed_ns = (ts_end.tv_sec - ts_start.tv_sec) * 1000000000ULL +
-                             (ts_end.tv_nsec - ts_start.tv_nsec);
-        ctx->last_retune_ns = elapsed_ns;
-        ctx->retune_count++;
-        
-        // Target 50 Hz update rate
-        if (elapsed_ns < 20000000) {  // Less than 20ms
-            usleep((20000000 - elapsed_ns) / 1000);
-        }
+        // Небольшая задержка
+        usleep(50000);  // 50ms
     }
     
-    // Stop RX
+    // Останавливаем RX
     hackrf_stop_rx(ctx->dev);
+    
+cleanup:
+    // Очистка ресурсов
+    if (data->fft_in) fftwf_free(data->fft_in);
+    if (data->fft_out) fftwf_free(data->fft_out);
+    if (data->fft_plan) fftwf_destroy_plan(data->fft_plan);
+    if (data->window) free(data->window);
     
     printf("Slave %d thread stopped\n", slave_idx);
     free(data);
@@ -165,8 +248,10 @@ int start_slave(SdrCtx* slave, int slave_idx) {
         return -2;
     }
     
+    memset(data, 0, sizeof(SlaveData));
     data->ctx = slave;
     data->slave_idx = slave_idx;
+    
     slave->thread_data = data;
     slave->running = true;
     

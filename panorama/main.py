@@ -44,13 +44,18 @@ def _fix_runtime_dir():
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    """Главное окно приложения ПАНОРАМА."""
+    """Главное окно приложения ПАНОРАМА с multi-SDR поддержкой."""
     
     def __init__(self, logger: logging.Logger, settings: QSettings):
         super().__init__()
         self.log = logger
         self.settings = settings
         self._calibration_profiles = {}
+        
+        # Флаги состояния multi-SDR
+        self._multi_sdr_active = False
+        self._trilateration_active = False
+        self._detector_active = False
         
         # Загружаем шрифт с эмодзи поддержкой
         self._load_emoji_font()
@@ -83,11 +88,13 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 self._lib_source = HackRFLibSource()
                 self._lib_available = True
+                self.log.info("libhackrf_multi успешно загружена")
             except Exception as e:
                 self._lib_available = False
-                self.log.warning(f"libhackrf недоступна: {e}")
+                self.log.warning(f"libhackrf_multi недоступна: {e}")
         else:
             self._lib_available = False
+            self.log.warning("libhackrf_multi не скомпилирована")
 
         self._source = self._sweep_source
         self.spectrum_tab.set_source(self._source)
@@ -98,14 +105,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.peaks_tab = AdaptivePeaksWidget()
         self.detector_tab = DetectorWidget()
 
+        # Добавляем вкладки
+        self.tabs.addTab(self.spectrum_tab, "📊 Спектр")
+        self.tabs.addTab(self.peaks_tab, "📍 Пики")
+        self.tabs.addTab(self.detector_tab, "🎯 Детектор")
+        self.tabs.addTab(self.map_tab, "🗺️ Карта")
+        
         # Провязка сигналов
         self._connect_signals()
-
-        # Добавляем вкладки (без эмодзи для совместимости)
-        self.tabs.addTab(self.spectrum_tab, "Спектр")
-        self.tabs.addTab(self.peaks_tab, "Пики")
-        self.tabs.addTab(self.detector_tab, "Детектор")
-        self.tabs.addTab(self.map_tab, "Карта")
         
         # Отключаем вкладки, требующие libhackrf, если используется hackrf_sweep
         self._update_tabs_availability()
@@ -125,6 +132,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # Автозагрузка калибровки если есть
         self._try_load_default_calibration()
         
+        # Таймер для обновления статуса multi-SDR
+        self._status_timer = QtCore.QTimer()
+        self._status_timer.timeout.connect(self._update_multi_sdr_status)
+        self._status_timer.setInterval(1000)  # 1 Hz
+        
     def _load_emoji_font(self):
         """Загружает шрифт с поддержкой эмодзи."""
         from PyQt5.QtGui import QFontDatabase
@@ -141,42 +153,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 QFontDatabase.addApplicationFont(font_path)
                 break
 
-
-
-    def _connect_signals(self):
-        """Подключает все сигналы между компонентами с учетом блокировок."""
-        # ... existing connections ...
-        
-        # Блокировки при активации детектора
-        self.detector_tab.detectionStarted.connect(self._on_detector_started)
-        self.detector_tab.detectionStopped.connect(self._on_detector_stopped)
-        
-    def _on_detector_started(self):
-        """При запуске детектора блокируем несовместимые вкладки."""
-        # Блокируем вкладки Пики и Карта
-        self.tabs.setTabEnabled(self.tabs.indexOf(self.peaks_tab), False)
-        self.tabs.setTabEnabled(self.tabs.indexOf(self.map_tab), False)
-        
-        # Блокируем изменение параметров в Спектре
-        self.spectrum_tab.start_mhz.setEnabled(False)
-        self.spectrum_tab.stop_mhz.setEnabled(False)
-        self.spectrum_tab.bin_khz.setEnabled(False)
-        
-        self.statusBar().showMessage("Детектор активен - вкладки Пики и Карта заблокированы", 5000)
-        
-    def _on_detector_stopped(self):
-        """При остановке детектора разблокируем вкладки."""
-        self.tabs.setTabEnabled(self.tabs.indexOf(self.peaks_tab), True)
-        self.tabs.setTabEnabled(self.tabs.indexOf(self.map_tab), True)
-        
-        self.spectrum_tab.start_mhz.setEnabled(True)
-        self.spectrum_tab.stop_mhz.setEnabled(True)
-        self.spectrum_tab.bin_khz.setEnabled(True)
-        
-        self.statusBar().showMessage("Детектор остановлен - все вкладки доступны", 5000)
-
     def _apply_dark_theme(self):
-        """Применяет улучшенную темную тему с хорошей читаемостью."""
+        """Применяет улучшенную темную тему."""
         dark_stylesheet = """
         /* Основные элементы */
         QMainWindow {
@@ -211,6 +189,11 @@ class MainWindow(QtWidgets.QMainWindow):
         
         QTabBar::tab:hover {
             background-color: #505050;
+        }
+        
+        QTabBar::tab:disabled {
+            background-color: #2b2b2b;
+            color: #666;
         }
         
         /* Группы */
@@ -282,7 +265,7 @@ class MainWindow(QtWidgets.QMainWindow):
             font-weight: bold;
         }
         
-        /* Поля ввода */
+        /* Остальные стили */
         QLineEdit, QTextEdit, QPlainTextEdit {
             background-color: #404040;
             color: #e0e0e0;
@@ -292,11 +275,6 @@ class MainWindow(QtWidgets.QMainWindow):
             selection-background-color: #4a90e2;
         }
         
-        QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {
-            border: 1px solid #4a90e2;
-        }
-        
-        /* Комбобоксы и спинбоксы */
         QComboBox, QSpinBox, QDoubleSpinBox {
             background-color: #404040;
             color: #e0e0e0;
@@ -305,99 +283,20 @@ class MainWindow(QtWidgets.QMainWindow):
             border-radius: 3px;
         }
         
-        QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover {
-            border: 1px solid #4a90e2;
-        }
-        
-        QComboBox::drop-down {
-            border: none;
-            padding-right: 4px;
-        }
-        
-        QComboBox::down-arrow {
-            image: none;
-            border-left: 4px solid transparent;
-            border-right: 4px solid transparent;
-            border-top: 6px solid #e0e0e0;
-            margin-right: 4px;
-        }
-        
-        QComboBox QAbstractItemView {
-            background-color: #404040;
-            color: #e0e0e0;
-            selection-background-color: #4a90e2;
-            border: 1px solid #555;
-        }
-        
-        /* Метки */
         QLabel {
             color: #e0e0e0;
             background-color: transparent;
         }
         
-        /* Чекбоксы */
         QCheckBox {
             color: #e0e0e0;
             spacing: 5px;
         }
         
-        QCheckBox::indicator {
-            width: 16px;
-            height: 16px;
-            border: 1px solid #555;
-            background-color: #404040;
-            border-radius: 3px;
-        }
-        
-        QCheckBox::indicator:checked {
-            background-color: #4a90e2;
-            border: 1px solid #4a90e2;
-        }
-        
-        QCheckBox::indicator:checked:after {
-            content: "";
-            width: 4px;
-            height: 8px;
-            border: solid white;
-            border-width: 0 2px 2px 0;
-            transform: rotate(45deg);
-            margin: 2px 0 0 5px;
-            display: block;
-        }
-        
-        /* Радиокнопки */
-        QRadioButton {
-            color: #e0e0e0;
-            spacing: 5px;
-        }
-        
-        QRadioButton::indicator {
-            width: 16px;
-            height: 16px;
-            border: 1px solid #555;
-            background-color: #404040;
-            border-radius: 8px;
-        }
-        
-        QRadioButton::indicator:checked {
-            background-color: #4a90e2;
-            border: 1px solid #4a90e2;
-        }
-        
-        /* Меню */
         QMenuBar {
             background-color: #353535;
             color: #e0e0e0;
             border-bottom: 1px solid #555;
-        }
-        
-        QMenuBar::item {
-            padding: 4px 8px;
-            background-color: transparent;
-        }
-        
-        QMenuBar::item:selected {
-            background-color: #4a90e2;
         }
         
         QMenu {
@@ -406,139 +305,16 @@ class MainWindow(QtWidgets.QMainWindow):
             border: 1px solid #555;
         }
         
-        QMenu::item {
-            padding: 6px 20px;
-        }
-        
-        QMenu::item:selected {
-            background-color: #4a90e2;
-        }
-        
-        QMenu::separator {
-            height: 1px;
-            background-color: #555;
-            margin: 4px 10px;
-        }
-        
-        /* Статусбар */
         QStatusBar {
             background-color: #353535;
             color: #e0e0e0;
             border-top: 1px solid #555;
         }
-        
-        /* Скроллбары */
-        QScrollBar:vertical {
-            background-color: #353535;
-            width: 12px;
-            border: none;
-        }
-        
-        QScrollBar::handle:vertical {
-            background-color: #555;
-            border-radius: 6px;
-            min-height: 20px;
-        }
-        
-        QScrollBar::handle:vertical:hover {
-            background-color: #666;
-        }
-        
-        QScrollBar:horizontal {
-            background-color: #353535;
-            height: 12px;
-            border: none;
-        }
-        
-        QScrollBar::handle:horizontal {
-            background-color: #555;
-            border-radius: 6px;
-            min-width: 20px;
-        }
-        
-        QScrollBar::handle:horizontal:hover {
-            background-color: #666;
-        }
-        
-        /* Слайдеры */
-        QSlider::groove:horizontal {
-            background-color: #404040;
-            height: 6px;
-            border-radius: 3px;
-        }
-        
-        QSlider::handle:horizontal {
-            background-color: #4a90e2;
-            width: 16px;
-            height: 16px;
-            border-radius: 8px;
-            margin: -5px 0;
-        }
-        
-        QSlider::handle:horizontal:hover {
-            background-color: #5aa0f2;
-        }
-        
-        /* Прогрессбар */
-        QProgressBar {
-            background-color: #404040;
-            border: 1px solid #555;
-            border-radius: 3px;
-            text-align: center;
-            color: white;
-        }
-        
-        QProgressBar::chunk {
-            background-color: #4a90e2;
-            border-radius: 2px;
-        }
-        
-        /* Списки */
-        QListWidget {
-            background-color: #353535;
-            color: #e0e0e0;
-            border: 1px solid #555;
-            selection-background-color: #4a90e2;
-        }
-        
-        QListWidget::item:hover {
-            background-color: #404040;
-        }
-        
-        QListWidget::item:selected {
-            background-color: #4a90e2;
-            color: white;
-        }
-        
-        /* Деревья */
-        QTreeWidget {
-            background-color: #353535;
-            color: #e0e0e0;
-            border: 1px solid #555;
-            selection-background-color: #4a90e2;
-        }
-        
-        QTreeWidget::item:hover {
-            background-color: #404040;
-        }
-        
-        QTreeWidget::item:selected {
-            background-color: #4a90e2;
-            color: white;
-        }
-        
-        /* Тултипы */
-        QToolTip {
-            background-color: #404040;
-            color: #e0e0e0;
-            border: 1px solid #555;
-            padding: 4px;
-        }
         """
         self.setStyleSheet(dark_stylesheet)
 
     def _connect_signals(self):
-        """Подключает все сигналы между компонентами."""
+        """Подключает все сигналы между компонентами с учетом multi-SDR."""
         # Спектр → Пики и Детектор
         self.spectrum_tab.newRowReady.connect(self.peaks_tab.update_from_row)
         self.spectrum_tab.newRowReady.connect(self.detector_tab.push_data)
@@ -546,30 +322,70 @@ class MainWindow(QtWidgets.QMainWindow):
         # Спектр → Очистка истории при изменении конфигурации
         self.spectrum_tab.configChanged.connect(self.peaks_tab.clear_history)
         
-        # Пики → Спектр (только для навигации по частоте)
+        # Пики → Спектр (навигация)
         self.peaks_tab.goToFreq.connect(self.spectrum_tab.set_cursor_freq)
-        # ВАЖНО: Пики НЕ отправляют данные на карту!
         
-        # Детектор → Карта (только через кнопку пользователя)
+        # Детектор → Карта и multi-SDR
         self.detector_tab.sendToMap.connect(self._send_detection_to_map)
         self.detector_tab.rangeSelected.connect(self.spectrum_tab.add_roi_region)
+        self.detector_tab.signalDetected.connect(self._on_signal_detected)
+        
+        # Блокировки при активации детектора
+        self.detector_tab.detectionStarted.connect(self._on_detector_started)
+        self.detector_tab.detectionStopped.connect(self._on_detector_stopped)
         
         # Карта → Трилатерация
         self.map_tab.trilaterationStarted.connect(self._start_trilateration)
         self.map_tab.trilaterationStopped.connect(self._stop_trilateration)
-        self.spectrum_tab.newRowReady.connect(self.detector_tab.push_data)
-        self.spectrum_tab.newRowReady.connect(self._process_for_trilateration)
         
-        # Пики → Спектр
-        self.peaks_tab.goToFreq.connect(self.spectrum_tab.set_cursor_freq)
+        # Обработка данных для трилатерации
+        if self._lib_available:
+            self.spectrum_tab.newRowReady.connect(self._process_for_trilateration)
+            
+    def _on_signal_detected(self, detection):
+        """Обработчик обнаружения сигнала детектором для multi-SDR."""
+        if not self._multi_sdr_active:
+            return
+            
+        # Логируем обнаружение
+        self.log.info(f"Signal detected: {detection.freq_mhz:.3f} MHz, "
+                     f"{detection.power_dbm:.1f} dBm, "
+                     f"BW: {detection.bandwidth_khz:.1f} kHz")
         
-        # Детектор → Карта
-        self.detector_tab.sendToMap.connect(self._send_detection_to_map)
-        self.detector_tab.rangeSelected.connect(self.spectrum_tab.add_roi_region)
+        # Для multi-SDR сигналы автоматически передаются через watchlist в libhackrf
+        self.statusBar().showMessage(
+            f"📡 Цель {detection.freq_mhz:.1f} МГц → Slave SDR", 
+            3000
+        )
         
-        # Карта → Трилатерация
-        self.map_tab.trilaterationStarted.connect(self._start_trilateration)
-        self.map_tab.trilaterationStopped.connect(self._stop_trilateration)
+    def _on_detector_started(self):
+        """При запуске детектора блокируем несовместимые вкладки."""
+        self._detector_active = True
+        
+        # В multi-SDR режиме не блокируем карту
+        if not self._multi_sdr_active:
+            self.tabs.setTabEnabled(self.tabs.indexOf(self.peaks_tab), False)
+            self.tabs.setTabEnabled(self.tabs.indexOf(self.map_tab), False)
+        
+        # Блокируем изменение параметров в Спектре
+        self.spectrum_tab.start_mhz.setEnabled(False)
+        self.spectrum_tab.stop_mhz.setEnabled(False)
+        self.spectrum_tab.bin_khz.setEnabled(False)
+        
+        self.statusBar().showMessage("🎯 Детектор активен", 5000)
+        
+    def _on_detector_stopped(self):
+        """При остановке детектора разблокируем вкладки."""
+        self._detector_active = False
+        
+        self.tabs.setTabEnabled(self.tabs.indexOf(self.peaks_tab), True)
+        self.tabs.setTabEnabled(self.tabs.indexOf(self.map_tab), True)
+        
+        self.spectrum_tab.start_mhz.setEnabled(True)
+        self.spectrum_tab.stop_mhz.setEnabled(True)
+        self.spectrum_tab.bin_khz.setEnabled(True)
+        
+        self.statusBar().showMessage("⚪ Детектор остановлен", 5000)
 
     def _build_statusbar(self):
         """Создает статусбар с индикаторами."""
@@ -584,6 +400,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_devices = QtWidgets.QLabel("SDR: 0")
         self.lbl_devices.setStyleSheet("padding: 0 10px;")
         self.statusBar().addPermanentWidget(self.lbl_devices)
+        
+        # Индикатор multi-SDR
+        self.lbl_multi_sdr = QtWidgets.QLabel("MULTI: OFF")
+        self.lbl_multi_sdr.setStyleSheet("padding: 0 10px;")
+        self.statusBar().addPermanentWidget(self.lbl_multi_sdr)
         
         # Индикатор калибровки
         self.lbl_calibration = QtWidgets.QLabel("CAL: НЕТ")
@@ -652,6 +473,34 @@ class MainWindow(QtWidgets.QMainWindow):
         """Вызывается при остановке источника."""
         if code != 0:
             self.statusBar().showMessage(f"Источник завершен с кодом {code}", 5000)
+        
+        # Отключаем multi-SDR режим при остановке
+        if self._multi_sdr_active:
+            self._stop_multi_sdr()
+
+    def _update_multi_sdr_status(self):
+        """Обновляет статус multi-SDR системы."""
+        if not self._lib_available or not self._lib_source:
+            return
+        
+        status = self._lib_source.get_status()
+        if status:
+            parts = []
+            if status['master_running']:
+                parts.append("M:SWEEP")
+            if status['slave1_running']:
+                parts.append("S1:TRACK")
+            if status['slave2_running']:
+                parts.append("S2:TRACK")
+            if status['watch_items'] > 0:
+                parts.append(f"T:{status['watch_items']}")
+            
+            if parts:
+                self.lbl_multi_sdr.setText(f"MULTI: {' '.join(parts)}")
+                self.lbl_multi_sdr.setStyleSheet("padding: 0 10px; color: #66ff66;")
+            else:
+                self.lbl_multi_sdr.setText("MULTI: READY")
+                self.lbl_multi_sdr.setStyleSheet("padding: 0 10px; color: #ffff66;")
 
     def _build_menu(self):
         menubar = self.menuBar()
@@ -686,7 +535,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_src_sweep.toggled.connect(lambda on: on and self._switch_source("sweep"))
         
         if self._lib_available:
-            self.act_src_lib = QtWidgets.QAction("libhackrf (CFFI)", self, checkable=True, checked=False)
+            self.act_src_lib = QtWidgets.QAction("libhackrf_multi (CFFI)", self, checkable=True, checked=False)
             m_source.addAction(self.act_src_lib)
             self.src_group.addAction(self.act_src_lib)
             self.act_src_lib.toggled.connect(lambda on: on and self._switch_source("lib"))
@@ -696,6 +545,13 @@ class MainWindow(QtWidgets.QMainWindow):
         act_devices = QtWidgets.QAction("Настройка SDR устройств...", self)
         act_devices.triggered.connect(self._configure_devices)
         m_source.addAction(act_devices)
+        
+        m_source.addSeparator()
+        
+        # Multi-SDR режим
+        self.act_multi_sdr = QtWidgets.QAction("Multi-SDR режим (3 устройства)", self, checkable=True)
+        self.act_multi_sdr.triggered.connect(self._toggle_multi_sdr)
+        m_source.addAction(self.act_multi_sdr)
 
         # === Калибровка ===
         m_cal = menubar.addMenu("&Калибровка")
@@ -735,6 +591,69 @@ class MainWindow(QtWidgets.QMainWindow):
         act_about = QtWidgets.QAction("О программе", self)
         act_about.triggered.connect(self._show_about)
         m_help.addAction(act_about)
+
+    def _toggle_multi_sdr(self):
+        """Переключает multi-SDR режим."""
+        if not self._lib_available or self._current_source_type != "lib":
+            QtWidgets.QMessageBox.warning(
+                self, "Multi-SDR",
+                "Multi-SDR режим требует источник libhackrf_multi!\n\n"
+                "Переключитесь на libhackrf_multi в меню Источник."
+            )
+            self.act_multi_sdr.setChecked(False)
+            return
+        
+        if self.act_multi_sdr.isChecked():
+            self._start_multi_sdr()
+        else:
+            self._stop_multi_sdr()
+
+    def _start_multi_sdr(self):
+        """Запускает multi-SDR режим."""
+        # Проверяем настройку устройств
+        master, slave1, slave2 = self.device_manager.get_trilateration_devices()
+        if not (master and slave1 and slave2):
+            QtWidgets.QMessageBox.warning(
+                self, "Multi-SDR",
+                "Настройте 3 SDR устройства для multi-SDR режима!\n"
+                "Источник → Настройка SDR устройств"
+            )
+            self.act_multi_sdr.setChecked(False)
+            return
+        
+        # Устанавливаем количество устройств
+        if self._lib_source:
+            self._lib_source.set_num_devices(3)
+        
+        self._multi_sdr_active = True
+        self._status_timer.start()
+        
+        self.lbl_multi_sdr.setText("MULTI: INIT")
+        self.lbl_multi_sdr.setStyleSheet("padding: 0 10px; color: #ffff66;")
+        
+        # Передаем параметры детектора в библиотеку
+        if hasattr(self.detector_tab, 'threshold_offset'):
+            threshold_offset = self.detector_tab.threshold_offset.value()
+            min_width = self.detector_tab.min_width.value()
+            # TODO: добавить API в библиотеку для передачи параметров детектора
+        
+        self.statusBar().showMessage("Multi-SDR режим активирован: Master sweep, Slaves tracking", 5000)
+        self.log.info("Multi-SDR mode enabled")
+
+    def _stop_multi_sdr(self):
+        """Останавливает multi-SDR режим."""
+        self._multi_sdr_active = False
+        self._status_timer.stop()
+        
+        # Возвращаем на 1 устройство
+        if self._lib_source:
+            self._lib_source.set_num_devices(1)
+        
+        self.lbl_multi_sdr.setText("MULTI: OFF")
+        self.lbl_multi_sdr.setStyleSheet("padding: 0 10px;")
+        
+        self.statusBar().showMessage("Multi-SDR режим деактивирован", 5000)
+        self.log.info("Multi-SDR mode disabled")
 
     def _build_shortcuts(self):
         """Горячие клавиши."""
@@ -781,10 +700,12 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(
             self, "О программе",
             f"<b>{APP_TITLE}</b><br>"
-            "Advanced HackRF Sweep Analyzer<br><br>"
+            "Advanced HackRF Multi-SDR Analyzer<br><br>"
             "<b>Возможности:</b><br>"
+            "• Multi-SDR режим: Master sweep + Slave tracking<br>"
             "• Адаптивный детектор с baseline + N порогом<br>"
             "• Трилатерация целей с 3 SDR<br>"
+            "• Группировка широкополосных сигналов<br>"
             "• Классификация сигналов по диапазонам<br>"
             "• Менеджер устройств с никнеймами<br>"
             "• Фильтр Калмана для траекторий<br>"
@@ -809,16 +730,27 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._source and self._source.is_running():
             self._source.stop()
 
+        # Отключаем multi-SDR при смене источника
+        if self._multi_sdr_active:
+            self._stop_multi_sdr()
+            self.act_multi_sdr.setChecked(False)
+
         if name == "lib" and self._lib_available and self._lib_source:
             self._source = self._lib_source
             self._current_source_type = "lib"
-            self.lbl_source.setText("Источник: libhackrf")
-            self.statusBar().showMessage("Источник: libhackrf (CFFI)", 3000)
+            self.lbl_source.setText("Источник: libhackrf_multi")
+            self.statusBar().showMessage("Источник: libhackrf_multi (CFFI)", 3000)
+            
+            # Включаем опцию multi-SDR
+            self.act_multi_sdr.setEnabled(True)
         else:
             self._source = self._sweep_source
             self._current_source_type = "sweep"
             self.lbl_source.setText("Источник: hackrf_sweep")
             self.statusBar().showMessage("Источник: hackrf_sweep", 3000)
+            
+            # Отключаем опцию multi-SDR
+            self.act_multi_sdr.setEnabled(False)
 
         self.spectrum_tab.set_source(self._source)
         self._wire_source(self._source)
@@ -885,8 +817,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._current_source_type == "sweep":
             QtWidgets.QMessageBox.warning(
                 self, "Трилатерация",
-                "Трилатерация требует libhackrf!\n\n"
-                "Переключитесь на источник libhackrf в меню Источник."
+                "Трилатерация требует libhackrf_multi!\n\n"
+                "Переключитесь на источник libhackrf_multi в меню Источник."
             )
             return
             
@@ -901,24 +833,39 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         # Показываем информацию о готовности
-        QtWidgets.QMessageBox.information(
-            self, "Трилатерация готова",
-            f"<b>Устройства настроены:</b><br><br>"
-            f"Master: {master.nickname} ({master.serial})<br>"
-            f"Позиция: ({master.position_x:.1f}, {master.position_y:.1f}, {master.position_z:.1f})<br><br>"
-            f"Slave 1: {slave1.nickname} ({slave1.serial})<br>"
-            f"Позиция: ({slave1.position_x:.1f}, {slave1.position_y:.1f}, {slave1.position_z:.1f})<br><br>"
-            f"Slave 2: {slave2.nickname} ({slave2.serial})<br>"
-            f"Позиция: ({slave2.position_x:.1f}, {slave2.position_y:.1f}, {slave2.position_z:.1f})<br><br>"
-            f"Переключитесь на вкладку <b>Карта</b> для запуска!"
-        )
+        info_msg = f"<b>Устройства настроены:</b><br><br>"
+        info_msg += f"Master: {master.nickname} ({master.serial})<br>"
+        info_msg += f"Позиция: ({master.position_x:.1f}, {master.position_y:.1f}, {master.position_z:.1f})<br><br>"
+        info_msg += f"Slave 1: {slave1.nickname} ({slave1.serial})<br>"
+        info_msg += f"Позиция: ({slave1.position_x:.1f}, {slave1.position_y:.1f}, {slave1.position_z:.1f})<br><br>"
+        info_msg += f"Slave 2: {slave2.nickname} ({slave2.serial})<br>"
+        info_msg += f"Позиция: ({slave2.position_x:.1f}, {slave2.position_y:.1f}, {slave2.position_z:.1f})<br><br>"
         
-        # Переключаемся на карту
-        self.tabs.setCurrentWidget(self.map_tab)
+        if self._multi_sdr_active:
+            info_msg += "<b>Multi-SDR режим активен!</b><br>"
+            info_msg += "Переключитесь на вкладку <b>Карта</b> для запуска трилатерации!"
+        else:
+            info_msg += "Активируйте <b>Multi-SDR режим</b> в меню Источник,<br>"
+            info_msg += "затем переключитесь на вкладку <b>Карта</b>!"
+        
+        QtWidgets.QMessageBox.information(self, "Трилатерация", info_msg)
+        
+        # Переключаемся на карту если multi-SDR активен
+        if self._multi_sdr_active:
+            self.tabs.setCurrentWidget(self.map_tab)
 
     def _start_trilateration(self):
         """Запускает трилатерацию."""
+        if not self._multi_sdr_active:
+            QtWidgets.QMessageBox.warning(
+                self, "Трилатерация",
+                "Активируйте Multi-SDR режим перед запуском трилатерации!\n"
+                "Источник → Multi-SDR режим"
+            )
+            return
+        
         self.trilateration_engine.start()
+        self._trilateration_active = True
         self.lbl_trilateration.setText("TRI: АКТИВНА")
         self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #ff6666; font-weight: bold;")
         self.statusBar().showMessage("Трилатерация запущена", 3000)
@@ -926,17 +873,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def _stop_trilateration(self):
         """Останавливает трилатерацию."""
         self.trilateration_engine.stop()
+        self._trilateration_active = False
         self.lbl_trilateration.setText("TRI: ГОТОВ")
         self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #66ff66;")
         self.statusBar().showMessage("Трилатерация остановлена", 3000)
 
     def _process_for_trilateration(self, freqs_hz, power_dbm):
         """Обрабатывает данные для трилатерации."""
-        if not self.trilateration_engine.is_running:
+        if not self._trilateration_active or not self.trilateration_engine.is_running:
             return
         
         # Определяем какое это устройство
-        device_serial = self.device_manager.master or "UNKNOWN"
+        device_serial = self.device_manager.master.serial if self.device_manager.master else "UNKNOWN"
         
         # Находим пики для трилатерации
         threshold = np.median(power_dbm) + 10
@@ -945,7 +893,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if np.any(peaks_mask):
             peak_idx = np.argmax(power_dbm)
             
-            from panorama.features.trilateration.engine import SignalMeasurement
             measurement = SignalMeasurement(
                 timestamp=time.time(),
                 device_serial=device_serial,
@@ -962,8 +909,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._current_source_type == "sweep":
             QtWidgets.QMessageBox.warning(
                 self, "Карта",
-                "Работа с картой требует libhackrf!\n\n"
-                "Переключитесь на источник libhackrf."
+                "Работа с картой требует libhackrf_multi!\n\n"
+                "Переключитесь на источник libhackrf_multi."
             )
             return
         
@@ -993,9 +940,16 @@ class MainWindow(QtWidgets.QMainWindow):
             "• 433 МГц - ISM 433<br>"
             "• 868 МГц - ISM 868<br>"
             "• 900-960 МГц - GSM<br>"
+            "• 1090 МГц - ADS-B<br>"
+            "• 1575 МГц - GPS L1<br>"
             "• 2.4 ГГц - WiFi/Bluetooth<br>"
-            "• 5.8 ГГц - FPV Video<br>"
-            "• 1.5-1.6 ГГц - GPS/GNSS"
+            "• 5.8 ГГц - FPV Video/WiFi 5G<br><br>"
+            "<b>Типы по ширине полосы:</b><br>"
+            "• < 25 кГц - Narrowband (PMR, голос)<br>"
+            "• 25-200 кГц - Voice/Data<br>"
+            "• 200 кГц-2 МГц - Wideband<br>"
+            "• 2-10 МГц - Video/WiFi<br>"
+            "• > 10 МГц - Ultra-Wide"
         )
 
     def _try_load_default_calibration(self):
@@ -1118,6 +1072,13 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             if self._source and self._source.is_running():
                 self._source.stop()
+        except Exception:
+            pass
+        
+        # Останавливаем multi-SDR
+        try:
+            if self._multi_sdr_active:
+                self._stop_multi_sdr()
         except Exception:
             pass
         

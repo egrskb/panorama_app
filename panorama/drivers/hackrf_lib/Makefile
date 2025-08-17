@@ -1,16 +1,22 @@
-# Makefile for multi-SDR HackRF library
+# Makefile - ОБНОВЛЕНИЕ
 CC = gcc
 CFLAGS = -fPIC -O3 -Wall -Wextra -pthread -g
 LDFLAGS = -shared
-LIBS = $(shell pkg-config --libs libhackrf) -lm -lpthread
+LIBS = $(shell pkg-config --libs libhackrf) $(shell pkg-config --libs fftw3f) -lm -lpthread
 
-# Check for libhackrf
+# Check for libhackrf and fftw3
 HACKRF_CHECK := $(shell pkg-config --exists libhackrf && echo yes)
+FFTW_CHECK := $(shell pkg-config --exists fftw3f && echo yes)
+
 ifneq ($(HACKRF_CHECK),yes)
     $(error libhackrf not found. Install hackrf development package)
 endif
 
-CFLAGS += $(shell pkg-config --cflags libhackrf)
+ifneq ($(FFTW_CHECK),yes)
+    $(error fftw3f not found. Install libfftw3-dev package)
+endif
+
+CFLAGS += $(shell pkg-config --cflags libhackrf) $(shell pkg-config --cflags fftw3f)
 
 TARGET = libhackrf_multi.so
 SOURCES = hq_init.c hq_master.c hq_slave.c hq_rssi.c \
@@ -34,24 +40,13 @@ clean:
 	rm -f $(OBJECTS) $(TARGET)
 	@echo "✓ Cleaned"
 
-install: $(TARGET)
-	cp $(TARGET) ../../../
-	@echo "✓ Installed to project root"
+# install: $(TARGET)
+# 	cp $(TARGET) ../../../
+# 	@echo "✓ Installed to project root"
 
-test: $(TARGET) test_lib.c
-	@echo "Running basic library test..."
+test: $(TARGET)
+	@echo "Testing library..."
 	@gcc -o test_lib test_lib.c -L. -lhackrf_multi -Wl,-rpath,. $(LIBS)
 	@./test_lib
 	@rm -f test_lib
 	@echo "✓ Test passed"
-
-# Simple test program
-test_lib.c:
-	@echo '#include <stdio.h>' > test_lib.c
-	@echo '#include "hq_api.h"' >> test_lib.c
-	@echo 'int main() {' >> test_lib.c
-	@echo '    HqStatus status;' >> test_lib.c
-	@echo '    int r = hq_get_status(&status);' >> test_lib.c
-	@echo '    printf("Library test: get_status returned %d\\n", r);' >> test_lib.c
-	@echo '    return 0;' >> test_lib.c
-	@echo '}' >> test_lib.c

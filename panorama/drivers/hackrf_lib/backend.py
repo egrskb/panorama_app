@@ -429,137 +429,135 @@ class _MultiWorker(QtCore.QObject, threading.Thread):
         self._running = False
         
     def run(self):
+        """Worker для multi-SDR режима с правильной обработкой sweep."""
         # Буферы для чтения данных
         peaks_buf = self._ffi.new("Peak[100]")
         status_buf = self._ffi.new("HqStatus*")
-        
-        # Для непрерывного спектра от Master SDR
+
+        # Параметры для непрерывного спектра
         last_emit_time = time.time()
-        emit_interval = 0.1  # 10 Hz для плавного обновления
-        
+        emit_interval = 0.05  # 20 Hz для плавного обновления
+
         # Создаем сетку частот для полного диапазона
         freq_start = self._freq_start
         freq_end = self._freq_end
-        bin_hz = self._bin_hz  # Используем оригинальный шаг
-        
-        # Вычисляем количество точек по оригинальному шагу
+        bin_hz = self._bin_hz
+
+        # Вычисляем количество точек
         n_points = int((freq_end - freq_start) / bin_hz) + 1
-        
+
         # Ограничиваем для стабильности
         if n_points > 50000:
-            print(f"Limiting frequency points from {n_points} to 50000 for stability")
+            print(f"Limiting frequency points from {n_points} to 50000")
             n_points = 50000
             bin_hz = (freq_end - freq_start) / (n_points - 1)
-        
-        freqs_full = np.linspace(freq_start, freq_end, n_points, dtype=np.float64)
-        
-        # Буфер для непрерывного спектра от Master SDR
-        spectrum_buffer = np.full(n_points, -120.0, dtype=np.float32)
-        
-        print(f"Created continuous spectrum grid: {n_points} points, step {bin_hz/1e6:.3f} MHz")
-        print(f"Frequency range: {freq_start/1e6:.1f} - {freq_end/1e6:.1f} MHz")
-        print("Waiting for Master SDR continuous spectrum data...")
-        
+
+        # Буферы для спектра
+        freqs_buf = self._ffi.new("double[]", n_points)
+        powers_buf = self._ffi.new("float[]", n_points)
+
+        # Инициализируем частоты
+        for i in range(n_points):
+            freqs_buf[i] = freq_start + i * bin_hz
+
+        print(
+            f"Multi-SDR worker started: {n_points} points, "
+            f"{freq_start/1e6:.1f}-{freq_end/1e6:.1f} MHz"
+        )
+
+        # Счетчик для диагностики
+        update_count = 0
+        last_status_time = time.time()
+
         while self._running:
             try:
                 current_time = time.time()
-                
-                # Читаем непрерывный спектр от Master SDR
-                try:
-                    freqs_buf = self._ffi.new("double[]", n_points)
-                    powers_buf = self._ffi.new("float[]", n_points)
-                    
-                    n_read = self._lib.hq_get_master_spectrum(freqs_buf, powers_buf, n_points)
-                    
-                    if n_read > 0:
-                        # Копируем данные в numpy массивы
-                        freqs_array = np.frombuffer(self._ffi.buffer(freqs_buf), dtype=np.float64, count=n_read)
-                        powers_array = np.frombuffer(self._ffi.buffer(powers_buf), dtype=np.float32, count=n_read)
-                        
-                        # Обновляем буфер спектра
-                        if n_read == n_points:
-                            spectrum_buffer[:] = powers_array
-                        else:
-                            # Если размеры не совпадают, обновляем только доступные точки
-                            spectrum_buffer[:n_read] = powers_array[:n_read]
-                        
-                        # Эмитим как непрерывный спектр
-                        print(f"Emitting spectrum: {n_read} points, active: {np.sum(powers_array > -120)}")
-                        self._parent.fullSweepReady.emit(freqs_array, powers_array)
-                        last_emit_time = current_time
-                        
-                        # Логируем статус
-                        active_points = np.sum(spectrum_buffer > -120)
-                        print(f"Spectrum update: {active_points}/{n_points} active points")
-                    else:
-                        # Если данных нет, эмитим пустой спектр
-                        if (current_time - last_emit_time) >= emit_interval:
-                            freqs_array = freqs_full.copy()
-                            powers_array = spectrum_buffer.copy()
-                            
-                            self._parent.fullSweepReady.emit(freqs_array, powers_array)
-                            last_emit_time = current_time
-                            
-                            print(f"Waiting for Master SDR data... (n_read={n_read})")
-                            
-                except Exception as e:
-                    print(f"Error reading master spectrum: {e}")
-                    # В случае ошибки эмитим пустой спектр
-                    if (current_time - last_emit_time) >= emit_interval:
-                        freqs_array = freqs_full.copy()
-                        powers_array = spectrum_buffer.copy()
-                        
-                        self._parent.fullSweepReady.emit(freqs_array, powers_array)
-                        last_emit_time = current_time
-                        
-                        print("Error reading spectrum, using empty data")
-                
-                # Читаем последние пики
-                n_peaks = self._lib.hq_get_recent_peaks(peaks_buf, 100)
-                
-                for i in range(n_peaks):
-                    peak = peaks_buf[i]
-                    # Создаем SweepLine для совместимости
-                    sw = SweepLine(
-                        ts=None,
-                        f_low_hz=int(peak.f_hz - 100000),
-                        f_high_hz=int(peak.f_hz + 100000),
-                        bin_hz=200000,
-                        power_dbm=np.array([peak.rssi_dbm], dtype=np.float32)
+
+                # Читаем спектр от Master SDR
+                n_read = self._lib.hq_get_master_spectrum(freqs_buf, powers_buf, n_points)
+
+                if n_read > 0:
+                    # Копируем данные
+                    freqs_array = np.frombuffer(
+                        self._ffi.buffer(freqs_buf, n_read * 8),
+                        dtype=np.float64,
                     )
-                    self._parent.sweepLine.emit(sw)
-                
-                # Читаем статус
+                    powers_array = np.frombuffer(
+                        self._ffi.buffer(powers_buf, n_read * 4),
+                        dtype=np.float32,
+                    )
+
+                    # Эмитим полный спектр
+                    if (current_time - last_emit_time) >= emit_interval:
+                        self._parent.fullSweepReady.emit(
+                            freqs_array.copy(), powers_array.copy()
+                        )
+                        last_emit_time = current_time
+                        update_count += 1
+
+                        # Диагностика каждые 2 секунды
+                        if current_time - last_status_time > 2.0:
+                            active_points = np.sum(powers_array > -110)
+                            print(
+                                f"Spectrum update #{update_count}: "
+                                f"{active_points}/{n_read} active points"
+                            )
+                            last_status_time = current_time
+
+                # Читаем последние пики для отображения целей
+                n_peaks = self._lib.hq_get_recent_peaks(peaks_buf, 100)
+
+                if n_peaks > 0:
+                    for i in range(n_peaks):
+                        peak = peaks_buf[i]
+
+                        # Создаем SweepLine для совместимости с детектором
+                        sw = SweepLine(
+                            ts=None,
+                            f_low_hz=int(peak.f_hz - 100000),
+                            f_high_hz=int(peak.f_hz + 100000),
+                            bin_hz=200000,
+                            power_dbm=np.array([peak.rssi_dbm], dtype=np.float32),
+                        )
+                        self._parent.sweepLine.emit(sw)
+
+                # Читаем статус системы
                 self._lib.hq_get_status(status_buf)
                 status = status_buf[0]
-                
+
                 # Формируем текст статуса
                 status_parts = []
                 if status.master_running:
-                    status_parts.append("Master: ON")
+                    status_parts.append("Master: SWEEP")
                 else:
                     status_parts.append("Master: OFF")
-                    
+
+                slave_count = 0
                 if status.slave_running[0]:
-                    status_parts.append("Slave1: ON")
+                    status_parts.append("S1: TRACK")
+                    slave_count += 1
                 if status.slave_running[1]:
-                    status_parts.append("Slave2: ON")
-                    
-                status_parts.append(f"Targets: {status.watch_items}")
-                
-                if status.retune_ms_avg > 0:
-                    status_parts.append(f"Retune: {status.retune_ms_avg:.1f}ms")
-                
-                self._parent.status.emit(", ".join(status_parts))
-                
-                time.sleep(0.05)  # 20 Hz polling rate
-                
+                    status_parts.append("S2: TRACK")
+                    slave_count += 1
+
+                if status.watch_items > 0:
+                    status_parts.append(f"Targets: {status.watch_items}")
+
+                self._parent.status.emit(" | ".join(status_parts))
+
+                # Небольшая задержка
+                time.sleep(0.02)  # 50 Hz polling
+
             except Exception as e:
                 if self._running:
-                    self._parent.error.emit(f"Multi-worker error: {e}")
+                    print(f"Multi-worker error: {e}")
+                    import traceback
+                    traceback.print_exc()
                 break
-        
+
+        print("Multi-SDR worker stopped")
         self.finished_sig.emit(0, "Multi-worker stopped")
+
 
 
 class _SweepAssembler:
