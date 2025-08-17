@@ -5,6 +5,7 @@ from collections import deque
 from PyQt5 import QtWidgets, QtCore, QtGui
 import numpy as np
 import json
+import time
 
 
 class AdaptivePeaksWidget(QtWidgets.QWidget):
@@ -21,6 +22,7 @@ class AdaptivePeaksWidget(QtWidgets.QWidget):
         self._history: Deque[np.ndarray] = deque(maxlen=10)  # История для baseline
         self._baseline: Optional[np.ndarray] = None
         self._last_peaks: List[dict] = []
+        self._peaks_history: List[dict] = []  # История всех найденных пиков
         
         self._build_ui()
         
@@ -28,8 +30,27 @@ class AdaptivePeaksWidget(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         
         # Панель параметров
-        params_group = QtWidgets.QGroupBox("Параметры детектора пиков")
+        params_group = QtWidgets.QGroupBox("Параметры автопиков")
         params_layout = QtWidgets.QFormLayout(params_group)
+        
+        # Включение/выключение автопиков
+        self.auto_peaks_enabled = QtWidgets.QCheckBox("Автопики включены")
+        self.auto_peaks_enabled.setChecked(True)
+        self.auto_peaks_enabled.setToolTip("Включить/выключить автоматический поиск пиков")
+        self.auto_peaks_enabled.toggled.connect(self._on_autopeaks_toggled)
+        
+        # Статус автопиков
+        self.lbl_autopeaks_status = QtWidgets.QLabel("🟢 Автопики активны")
+        self.lbl_autopeaks_status.setStyleSheet("""
+            QLabel {
+                color: #4CAF50;
+                font-weight: bold;
+                padding: 5px;
+                border: 1px solid #4CAF50;
+                border-radius: 3px;
+                background-color: rgba(76, 175, 80, 0.1);
+            }
+        """)
         
         # Режим порога
         self.threshold_mode = QtWidgets.QComboBox()
@@ -93,6 +114,8 @@ class AdaptivePeaksWidget(QtWidgets.QWidget):
         params_layout.addRow("Метод baseline:", self.baseline_method)
         params_layout.addRow("Персентиль:", self.baseline_percentile)
         params_layout.addRow(self.auto_search)
+        params_layout.addRow(self.auto_peaks_enabled)
+        params_layout.addRow("Статус:", self.lbl_autopeaks_status)
         
         layout.addWidget(params_group)
         
@@ -110,10 +133,12 @@ class AdaptivePeaksWidget(QtWidgets.QWidget):
         """)
         
         self.btn_clear = QtWidgets.QPushButton("🗑 Очистить")
+        self.btn_history = QtWidgets.QPushButton("📊 История")
         self.btn_export = QtWidgets.QPushButton("💾 Экспорт")
         
         buttons_layout.addWidget(self.btn_find)
         buttons_layout.addWidget(self.btn_clear)
+        buttons_layout.addWidget(self.btn_history)
         buttons_layout.addWidget(self.btn_export)
         
         layout.addLayout(buttons_layout)
@@ -172,6 +197,7 @@ class AdaptivePeaksWidget(QtWidgets.QWidget):
         # Подключение сигналов
         self.btn_find.clicked.connect(self._find_peaks)
         self.btn_clear.clicked.connect(self._clear_peaks)
+        self.btn_history.clicked.connect(self._show_history)
         self.btn_export.clicked.connect(self._export_peaks)
         self.table.doubleClicked.connect(self._on_double_click)
         self.threshold_mode.currentTextChanged.connect(self._on_threshold_mode_changed)
@@ -191,19 +217,19 @@ class AdaptivePeaksWidget(QtWidgets.QWidget):
         self.baseline_window.setEnabled(is_adaptive)
         self.baseline_method.setEnabled(is_adaptive)
         
-        if self.auto_search.isChecked() and self._freqs is not None:
+        if self.auto_peaks_enabled.isChecked() and self._freqs is not None:
             self._find_peaks()
             
     def _on_baseline_method_changed(self, text):
         """Изменение метода расчета baseline."""
         self.baseline_percentile.setEnabled("Персентиль" in text)
         
-        if self.auto_search.isChecked() and self._freqs is not None:
+        if self.auto_peaks_enabled.isChecked() and self._freqs is not None:
             self._find_peaks()
             
     def _on_params_changed(self):
         """При изменении параметров."""
-        if self.auto_search.isChecked() and self._freqs is not None:
+        if self.auto_peaks_enabled.isChecked() and self._freqs is not None:
             self._find_peaks()
             
     def clear_history(self):
@@ -211,11 +237,46 @@ class AdaptivePeaksWidget(QtWidgets.QWidget):
         self._history.clear()
         self._baseline = None
         self._last_peaks = []
+        self._peaks_history.clear()  # Очищаем также историю активности
+        
+    def _on_autopeaks_toggled(self, enabled: bool):
+        """Обработчик переключения автопиков."""
+        if enabled:
+            self.lbl_autopeaks_status.setText("🟢 Автопики активны")
+            self.lbl_autopeaks_status.setStyleSheet("""
+                QLabel {
+                    color: #4CAF50;
+                    font-weight: bold;
+                    padding: 5px;
+                    border: 1px solid #4CAF50;
+                    border-radius: 3px;
+                    background-color: rgba(76, 175, 80, 0.1);
+                }
+            """)
+        else:
+            self.lbl_autopeaks_status.setText("🔴 Автопики отключены")
+            self.lbl_autopeaks_status.setStyleSheet("""
+                QLabel {
+                    color: #f44336;
+                    font-weight: bold;
+                    padding: 5px;
+                    border: 1px solid #f44336;
+                    border-radius: 3px;
+                    background-color: rgba(244, 67, 54, 0.1);
+                }
+            """)
+        
+        # Если автопики включены и есть данные, сразу ищем пики
+        if enabled and self._freqs is not None and self._row is not None:
+            self._find_peaks()
         
     def update_from_row(self, freqs_hz, row_dbm):
         """Обновление данных от спектра."""
         freqs_hz = np.asarray(freqs_hz, dtype=float)
         row_dbm = np.asarray(row_dbm, dtype=float)
+        
+        # Отладочная информация
+        print(f"Автопики получили данные: freqs={freqs_hz.size}, row={row_dbm.size}")
         
         # Проверяем, изменились ли размеры данных
         if self._freqs is not None and self._freqs.size != freqs_hz.size:
@@ -238,7 +299,8 @@ class AdaptivePeaksWidget(QtWidgets.QWidget):
             # Пересчитываем baseline
             self._calculate_baseline()
             
-            if self.auto_search.isChecked():
+            # Автопики работают всегда, если включены
+            if self.auto_peaks_enabled.isChecked():
                 self._find_peaks()
             
     def _calculate_baseline(self):
@@ -348,12 +410,207 @@ class AdaptivePeaksWidget(QtWidgets.QWidget):
         # Сортируем по уровню (сильнейшие сверху)
         peaks.sort(key=lambda x: x['level_dbm'], reverse=True)
         
+        # Добавляем новые пики в историю активности
+        self._add_peaks_to_history(peaks)
+        
+        # Обновляем текущие пики
         self._last_peaks = peaks
         self._fill_table()
         
         # Эмитим сигналы о найденных пиках
         for peak in peaks:
             self.peakDetected.emit(peak)
+            
+    def _add_peaks_to_history(self, new_peaks: List[dict]):
+        """Добавляет новые пики в историю активности, обновляя существующие на той же частоте."""
+        if not new_peaks:
+            return
+            
+        for new_peak in new_peaks:
+            freq_mhz = new_peak['freq_mhz']
+            
+            # Ищем существующий пик на той же частоте
+            existing_peak = None
+            for i, hist_peak in enumerate(self._peaks_history):
+                if abs(hist_peak['freq_mhz'] - freq_mhz) < 0.001:  # Точность 1 кГц
+                    existing_peak = i
+                    break
+            
+            if existing_peak is not None:
+                # Обновляем существующий пик
+                old_peak = self._peaks_history[existing_peak]
+                self._peaks_history[existing_peak] = {
+                    **old_peak,
+                    'level_dbm': new_peak['level_dbm'],
+                    'last_seen': time.time(),
+                    'detection_count': old_peak.get('detection_count', 1) + 1,
+                    'max_level_dbm': max(old_peak.get('max_level_dbm', old_peak['level_dbm']), new_peak['level_dbm']),
+                    'min_level_dbm': min(old_peak.get('min_level_dbm', old_peak['level_dbm']), new_peak['level_dbm'])
+                }
+            else:
+                # Добавляем новый пик
+                new_peak['first_seen'] = time.time()
+                new_peak['last_seen'] = time.time()
+                new_peak['detection_count'] = 1
+                new_peak['max_level_dbm'] = new_peak['level_dbm']
+                new_peak['min_level_dbm'] = new_peak['level_dbm']
+                self._peaks_history.append(new_peak)
+            
+    def _show_history(self):
+        """Показывает историю активности пиков."""
+        if not self._peaks_history:
+            QtWidgets.QMessageBox.information(self, "История", "История активности пуста")
+            return
+            
+        # Создаем диалог с историей
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("История активности пиков")
+        dialog.setModal(True)
+        dialog.resize(800, 600)
+        
+        layout = QtWidgets.QVBoxLayout(dialog)
+        
+        # Таблица истории
+        history_table = QtWidgets.QTableWidget(0, 8)
+        history_table.setHorizontalHeaderLabels([
+            "Частота (МГц)", "Уровень (дБм)", "Макс (дБм)", "Мин (дБм)",
+            "Ширина (кГц)", "Тип", "Обнаружений", "Последний раз"
+        ])
+        
+        # Настройка ширины столбцов
+        history_table.setColumnWidth(0, 100)  # Частота
+        history_table.setColumnWidth(1, 80)   # Уровень
+        history_table.setColumnWidth(2, 80)   # Макс
+        history_table.setColumnWidth(3, 80)   # Мин
+        history_table.setColumnWidth(4, 80)   # Ширина
+        history_table.setColumnWidth(5, 100)  # Тип
+        history_table.setColumnWidth(6, 80)   # Обнаружений
+        history_table.setColumnWidth(7, 120)  # Последний раз
+        
+        history_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        history_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        history_table.setAlternatingRowColors(True)
+        
+        # Заполняем таблицу
+        history_table.setRowCount(len(self._peaks_history))
+        for row, peak in enumerate(self._peaks_history):
+            # Частота
+            history_table.setItem(row, 0, QtWidgets.QTableWidgetItem(f"{peak['freq_mhz']:.3f}"))
+            
+            # Текущий уровень
+            history_table.setItem(row, 1, QtWidgets.QTableWidgetItem(f"{peak['level_dbm']:.1f}"))
+            
+            # Максимальный уровень
+            max_level = peak.get('max_level_dbm', peak['level_dbm'])
+            history_table.setItem(row, 2, QtWidgets.QTableWidgetItem(f"{max_level:.1f}"))
+            
+            # Минимальный уровень
+            min_level = peak.get('min_level_dbm', peak['level_dbm'])
+            history_table.setItem(row, 3, QtWidgets.QTableWidgetItem(f"{min_level:.1f}"))
+            
+            # Ширина
+            history_table.setItem(row, 4, QtWidgets.QTableWidgetItem(f"{peak['width_khz']:.1f}"))
+            
+            # Тип
+            history_table.setItem(row, 5, QtWidgets.QTableWidgetItem(peak['signal_type']))
+            
+            # Количество обнаружений
+            count = peak.get('detection_count', 1)
+            history_table.setItem(row, 6, QtWidgets.QTableWidgetItem(str(count)))
+            
+            # Время последнего обнаружения
+            last_seen = peak.get('last_seen', 0)
+            if last_seen > 0:
+                from datetime import datetime
+                dt = datetime.fromtimestamp(last_seen)
+                time_str = dt.strftime("%H:%M:%S")
+            else:
+                time_str = "—"
+            history_table.setItem(row, 7, QtWidgets.QTableWidgetItem(time_str))
+        
+        layout.addWidget(history_table)
+        
+        # Кнопки
+        buttons_layout = QtWidgets.QHBoxLayout()
+        btn_export_history = QtWidgets.QPushButton("💾 Экспорт истории")
+        btn_clear_history = QtWidgets.QPushButton("🗑 Очистить историю")
+        btn_close = QtWidgets.QPushButton("Закрыть")
+        
+        btn_export_history.clicked.connect(lambda: self._export_history())
+        btn_clear_history.clicked.connect(lambda: self._clear_history(dialog))
+        btn_close.clicked.connect(dialog.accept)
+        
+        buttons_layout.addWidget(btn_export_history)
+        buttons_layout.addWidget(btn_clear_history)
+        buttons_layout.addStretch()
+        buttons_layout.addWidget(btn_close)
+        
+        layout.addLayout(buttons_layout)
+        
+        dialog.exec_()
+            
+    def _export_history(self):
+        """Экспортирует историю активности в CSV файл."""
+        if not self._peaks_history:
+            QtWidgets.QMessageBox.warning(self, "Экспорт", "История активности пуста")
+            return
+            
+        from PyQt5.QtWidgets import QFileDialog
+        from PyQt5.QtCore import QDateTime
+        
+        default_name = f"peaks_history_{QDateTime.currentDateTime().toString('yyyyMMdd_HHmmss')}.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить историю активности", default_name, "CSV files (*.csv)"
+        )
+        
+        if not path:
+            return
+            
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                # Заголовок
+                f.write("Частота (МГц),Уровень (дБм),Макс (дБм),Мин (дБм),"
+                        "Ширина (кГц),Тип,Обнаружений,Последний раз\n")
+                
+                # Данные
+                for peak in self._peaks_history:
+                    last_seen = peak.get('last_seen', 0)
+                    if last_seen > 0:
+                        from datetime import datetime
+                        dt = datetime.fromtimestamp(last_seen)
+                        time_str = dt.strftime("%H:%M:%S")
+                    else:
+                        time_str = "—"
+                        
+                    f.write(f"{peak['freq_mhz']:.3f},{peak['level_dbm']:.1f},"
+                           f"{peak.get('max_level_dbm', peak['level_dbm']):.1f},"
+                           f"{peak.get('min_level_dbm', peak['level_dbm']):.1f},"
+                           f"{peak['width_khz']:.1f},{peak['signal_type']},"
+                           f"{peak.get('detection_count', 1)},{time_str}\n")
+            
+            QtWidgets.QMessageBox.information(
+                self, "Экспорт", 
+                f"История активности экспортирована в:\n{path}"
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Ошибка", f"Ошибка при экспорте:\n{str(e)}"
+            )
+            
+    def _clear_history(self, dialog=None):
+        """Очищает историю активности."""
+        reply = QtWidgets.QMessageBox.question(
+            self, "Очистка истории", 
+            "Вы уверены, что хотите очистить всю историю активности?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No
+        )
+        
+        if reply == QtWidgets.QMessageBox.Yes:
+            self._peaks_history.clear()
+            if dialog:
+                dialog.accept()
+            QtWidgets.QMessageBox.information(self, "История", "История активности очищена")
             
     def _calculate_peak_width(self, peak_idx: int) -> int:
         """Вычисляет ширину пика в бинах."""

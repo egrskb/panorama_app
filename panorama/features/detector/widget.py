@@ -180,6 +180,21 @@ class DetectorWidget(QtWidgets.QWidget):
         grp_manual = QtWidgets.QGroupBox("Ручной ввод диапазона")
         manual_layout = QtWidgets.QHBoxLayout(grp_manual)
         
+        # Статус детектора и автопиков
+        self.lbl_detector_status = QtWidgets.QLabel("🔴 Детектор неактивен, автопики работают")
+        self.lbl_detector_status.setStyleSheet("""
+            QLabel {
+                color: #f44336;
+                font-weight: bold;
+                padding: 8px;
+                border: 2px solid #f44336;
+                border-radius: 5px;
+                background-color: rgba(244, 67, 54, 0.1);
+                margin: 5px;
+            }
+        """)
+        left_panel.addWidget(self.lbl_detector_status)
+        
         self.manual_start = QtWidgets.QDoubleSpinBox()
         self.manual_start.setRange(0, 7000)
         self.manual_start.setDecimals(3)
@@ -633,6 +648,20 @@ class DetectorWidget(QtWidgets.QWidget):
             }
         """)
         
+        # Обновляем статус детектора и автопиков
+        self.lbl_detector_status.setText("🟢 Детектор активен, автопики заблокированы")
+        self.lbl_detector_status.setStyleSheet("""
+            QLabel {
+                color: #4CAF50;
+                font-weight: bold;
+                padding: 8px;
+                border: 2px solid #4CAF50;
+                border-radius: 5px;
+                background-color: rgba(76, 175, 80, 0.1);
+                margin: 5px;
+            }
+        """)
+        
         self.detectionStarted.emit()
 
     def _stop_detection(self):
@@ -651,12 +680,29 @@ class DetectorWidget(QtWidgets.QWidget):
             }
         """)
         
+        # Обновляем статус детектора и автопиков
+        self.lbl_detector_status.setText("🔴 Детектор неактивен, автопики работают")
+        self.lbl_detector_status.setStyleSheet("""
+            QLabel {
+                color: #f44336;
+                font-weight: bold;
+                padding: 8px;
+                border: 2px solid #f44336;
+                border-radius: 5px;
+                background-color: rgba(244, 67, 54, 0.1);
+                margin: 5px;
+            }
+        """)
+        
         self.detectionStopped.emit()
 
     def push_data(self, freqs_hz: np.ndarray, row_dbm: np.ndarray):
         """Обработка данных от спектра."""
         if not self._state.is_active or not self._state.regions:
             return
+        
+        # Отладочная информация
+        print(f"Детектор получил данные: freqs={freqs_hz.size}, row={row_dbm.size}, active={self._state.is_active}, regions={len(self._state.regions)}")
         
         freqs_mhz = freqs_hz / 1e6
         current_time = time.time()

@@ -147,7 +147,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Добавляем вкладки
         self.tabs.addTab(self.spectrum_tab, "📊 Спектр")
-        self.tabs.addTab(self.peaks_tab, "📍 Пики")
+        self.tabs.addTab(self.peaks_tab, "📍 Автопики")
         self.tabs.addTab(self.detector_tab, "🎯 Детектор")
         self.tabs.addTab(self.map_tab, "🗺️ Карта")
         
@@ -157,8 +157,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Отключаем вкладки, требующие libhackrf, если используется hackrf_sweep
         self._update_tabs_availability()
         
-        # Инициализируем подключение к пикам
-        self._on_tab_changed(0)
+        # Инициализируем подключение к автопикам
+        # self._on_tab_changed(0)  # Больше не нужно
         
         # Связываем параметры детектора с multi-SDR
         self._connect_detector_to_multisdr()
@@ -361,20 +361,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _connect_signals(self):
         """Подключает все сигналы между компонентами."""
-        # Спектр → Пики (только при активации вкладки пиков)
-        # НЕ подключаем автоматически к детектору!
+        print("🔌 Подключаю сигналы...")
         
-        # Подключение к пикам только когда вкладка активна
-        self.tabs.currentChanged.connect(self._on_tab_changed)
+        # Автопики работают автоматически всегда
+        self.spectrum_tab.newRowReady.connect(self.peaks_tab.update_from_row)
+        print("✅ Автопики подключены к данным")
         
         # Детектор работает только при явном запуске
         self.detector_tab.detectionStarted.connect(self._on_detector_started_manual)
         self.detector_tab.detectionStopped.connect(self._on_detector_stopped_manual)
+        print("✅ Сигналы детектора подключены")
         
-        # Спектр → Очистка истории при изменении конфигурации
+        # Спектр → Очистка истории автопиков при изменении конфигурации
         self.spectrum_tab.configChanged.connect(self.peaks_tab.clear_history)
         
-        # Пики → Спектр (навигация)
+        # Автопики → Спектр (навигация)
         self.peaks_tab.goToFreq.connect(self.spectrum_tab.set_cursor_freq)
         
         # Детектор → Карта и multi-SDR
@@ -389,6 +390,21 @@ class MainWindow(QtWidgets.QMainWindow):
         # Обработка данных для трилатерации
         if self._lib_available:
             self.spectrum_tab.newRowReady.connect(self._process_for_trilateration)
+            
+        # Показываем статус автопиков
+        self._show_autopeaks_status()
+        print("✅ Все сигналы подключены")
+
+    def _show_autopeaks_status(self):
+        """Показывает статус автопиков."""
+        if not self._detector_active:
+            status_msg = "📍 Автопики активны - автоматический поиск сигналов"
+            print(f"📊 Статус: {status_msg}")
+            self.statusBar().showMessage(status_msg, 3000)
+        else:
+            status_msg = "🎯 Детектор активен - автопики заблокированы"
+            print(f"📊 Статус: {status_msg}")
+            self.statusBar().showMessage(status_msg, 3000)
             
     def _on_signal_detected(self, detection):
         """Обработчик обнаружения сигнала детектором для multi-SDR."""
@@ -406,21 +422,21 @@ class MainWindow(QtWidgets.QMainWindow):
             3000
         )
         
-    def _on_tab_changed(self, index):
-        """При смене вкладки."""
-        # Пики работают только на своей вкладке
-        if self.tabs.widget(index) == self.peaks_tab:
-            self.spectrum_tab.newRowReady.connect(self.peaks_tab.update_from_row)
-        else:
-            try:
-                self.spectrum_tab.newRowReady.disconnect(self.peaks_tab.update_from_row)
-            except:
-                pass
-                
     def _on_detector_started_manual(self):
         """Детектор запущен вручную пользователем."""
+        print("🎯 Детектор запускается - отключаю автопики")
+        
+        # Отключаем автопики при работе детектора для оптимизации
+        try:
+            self.spectrum_tab.newRowReady.disconnect(self.peaks_tab.update_from_row)
+            print("✅ Автопики отключены")
+        except:
+            print("⚠️ Ошибка при отключении автопиков")
+            pass
+            
         # Только теперь подключаем поток данных к детектору
         self.spectrum_tab.newRowReady.connect(self.detector_tab.push_data)
+        print("✅ Детектор подключен к данным")
         
         # Если multi-SDR активен, передаем параметры в библиотеку
         if self._multi_sdr_active and self._lib_source:
@@ -446,19 +462,33 @@ class MainWindow(QtWidgets.QMainWindow):
                     pass
         
         self._detector_active = True
-        self.statusBar().showMessage("🎯 Детектор запущен", 5000)
+        self.statusBar().showMessage("🎯 Детектор запущен, автопики заблокированы", 5000)
+        
+        # Обновляем статус автопиков
+        self._show_autopeaks_status()
         
     def _on_detector_stopped_manual(self):
         """Детектор остановлен пользователем."""
+        print("⚪ Детектор останавливается - включаю автопики")
+        
         # Отключаем поток данных от детектора
         try:
             self.spectrum_tab.newRowReady.disconnect(self.detector_tab.push_data)
+            print("✅ Детектор отключен от данных")
         except:
+            print("⚠️ Ошибка при отключении детектора")
             pass
             
+        # Включаем автопики обратно
+        self.spectrum_tab.newRowReady.connect(self.peaks_tab.update_from_row)
+        print("✅ Автопики включены обратно")
+            
         self._detector_active = False
-        self.statusBar().showMessage("⚪ Детектор остановлен", 5000)
+        self.statusBar().showMessage("⚪ Детектор остановлен, автопики включены", 5000)
         
+        # Обновляем статус автопиков
+        self._show_autopeaks_status()
+
     def _connect_detector_to_multisdr(self):
         """Связывает параметры детектора с multi-SDR библиотекой."""
         def update_detector_params(threshold, min_width, min_sweeps, timeout):
@@ -777,7 +807,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "R - Сброс вида<br><br>"
             "<b>Навигация:</b><br>"
             "S - Вкладка Спектр<br>"
-            "P - Вкладка Пики<br>"
+            "P - Вкладка Автопики<br>"
             "D - Вкладка Детектор<br>"
             "M - Вкладка Карта<br><br>"
             "<b>Экспорт:</b><br>"
@@ -978,7 +1008,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Определяем какое это устройство
         device_serial = self.device_manager.master.serial if self.device_manager.master else "UNKNOWN"
         
-        # Находим пики для трилатерации
+        # Находим автопики для трилатерации
         threshold = np.median(power_dbm) + 10
         peaks_mask = power_dbm > threshold
         
