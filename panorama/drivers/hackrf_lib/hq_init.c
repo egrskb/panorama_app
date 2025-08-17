@@ -89,6 +89,7 @@ static void apply_defaults_to_ctx(SdrCtx* c, const SdrParams* d) {
     c->buffer_size = 0;
 
     c->running = false;
+    pthread_mutex_init(&c->running_mutex, NULL);
     c->retune_count = 0;
     c->last_retune_ns = 0;
     c->thread_data = NULL;
@@ -195,15 +196,22 @@ void teardown_devices(SdrCtx* devs, int n) {
     printf("Tearing down %d devices\n", n);
 
     for (int i = 0; i < n; ++i) {
+        pthread_mutex_lock(&devs[i].running_mutex);
         if (devs[i].running && devs[i].dev) {
+            pthread_mutex_unlock(&devs[i].running_mutex);
             hackrf_stop_rx(devs[i].dev);
             pthread_join(devs[i].thread, NULL);
+            pthread_mutex_lock(&devs[i].running_mutex);
             devs[i].running = false;
+            pthread_mutex_unlock(&devs[i].running_mutex);
+        } else {
+            pthread_mutex_unlock(&devs[i].running_mutex);
         }
         if (devs[i].dev) {
             hackrf_close(devs[i].dev);
             devs[i].dev = NULL;
         }
+        pthread_mutex_destroy(&devs[i].running_mutex);
         free(devs[i].rx_buffer);
         devs[i].rx_buffer = NULL;
         devs[i].buffer_size = 0;

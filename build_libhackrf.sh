@@ -1,8 +1,7 @@
 #!/bin/bash
 
 # Скрипт для сборки библиотеки libhackrf_multi
-# Автор: AI Assistant
-# Версия: 1.0
+# Версия: 2.0 - Исправленная
 
 set -e  # Остановиться при ошибке
 
@@ -13,7 +12,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Функция для вывода сообщений
+# Функции для вывода
 print_status() {
     echo -e "${BLUE}[INFO]${NC} $1"
 }
@@ -47,21 +46,22 @@ print_status "Проверяем зависимости..."
 
 # Проверяем gcc
 if ! command -v gcc &> /dev/null; then
-    print_error "gcc не найден. Установите build-essential"
+    print_error "gcc не найден. Установите build-essential:"
+    print_error "  sudo apt install build-essential"
     exit 1
 fi
 
 # Проверяем libhackrf
 if ! pkg-config --exists libhackrf; then
-    print_error "libhackrf не найден. Установите hackrf development package"
-    print_error "sudo apt install hackrf-dev"
+    print_error "libhackrf не найден. Установите:"
+    print_error "  sudo apt install hackrf libhackrf-dev"
     exit 1
 fi
 
 # Проверяем fftw3
 if ! pkg-config --exists fftw3f; then
-    print_error "fftw3f не найден. Установите libfftw3-dev"
-    print_error "sudo apt install libfftw3-dev"
+    print_error "fftw3f не найден. Установите:"
+    print_error "  sudo apt install libfftw3-dev"
     exit 1
 fi
 
@@ -101,18 +101,34 @@ if [ "$NEED_REBUILD" = true ]; then
             LIB_SIZE=$(du -h "$LIB_PATH" | cut -f1)
             print_status "Размер библиотеки: $LIB_SIZE"
             
-            # Проверяем символы
-            print_status "Проверяем основные символы..."
-            if nm -D "$LIB_PATH" | grep -q "hq_open_all"; then
-                print_success "✓ hq_open_all найден"
-            else
-                print_warning "⚠ hq_open_all не найден"
-            fi
+            # Проверяем основные символы
+            print_status "Проверяем экспортированные функции..."
             
-            if nm -D "$LIB_PATH" | grep -q "hq_start"; then
-                print_success "✓ hq_start найден"
-            else
-                print_warning "⚠ hq_start не найден"
+            # Список критичных функций
+            REQUIRED_SYMBOLS=(
+                "hq_open_all"
+                "hq_close_all"
+                "hq_start"
+                "hq_stop"
+                "hq_get_master_spectrum"
+                "hq_get_watchlist_snapshot"
+                "hq_config_set_rates"
+                "hq_config_set_gains"
+                "hq_set_detector_params"
+            )
+            
+            MISSING_SYMBOLS=()
+            for symbol in "${REQUIRED_SYMBOLS[@]}"; do
+                if nm -D "$LIB_PATH" | grep -q " T $symbol"; then
+                    print_success "✓ $symbol найден"
+                else
+                    print_warning "⚠ $symbol не найден"
+                    MISSING_SYMBOLS+=($symbol)
+                fi
+            done
+            
+            if [ ${#MISSING_SYMBOLS[@]} -gt 0 ]; then
+                print_warning "Некоторые символы отсутствуют, возможны проблемы"
             fi
         fi
     else
@@ -123,21 +139,37 @@ else
     print_success "Библиотека уже актуальна, пересборка не требуется"
 fi
 
-# Проверяем, что библиотека загружается в Python
+# Тестируем загрузку библиотеки в Python
 print_status "Тестируем загрузку библиотеки в Python..."
 
 # Создаем временный тестовый скрипт
 cat > test_lib.py << 'EOF'
 #!/usr/bin/env python3
+import sys
 try:
     from cffi import FFI
     ffi = FFI()
+    
+    # Определяем минимальный интерфейс
+    ffi.cdef("""
+        int hq_open_all(int num_expected);
+        void hq_close_all(void);
+        int hq_start(void);
+        void hq_stop(void);
+    """)
+    
     lib = ffi.dlopen("./libhackrf_multi.so")
     print("✓ Библиотека успешно загружена в Python")
-    exit(0)
+    
+    # Проверяем, что функции доступны
+    assert hasattr(lib, 'hq_open_all'), "hq_open_all not found"
+    assert hasattr(lib, 'hq_start'), "hq_start not found"
+    print("✓ Основные функции доступны")
+    
+    sys.exit(0)
 except Exception as e:
     print(f"✗ Ошибка загрузки: {e}")
-    exit(1)
+    sys.exit(1)
 EOF
 
 if python3 test_lib.py; then
@@ -153,5 +185,13 @@ print_status "Возвращаемся в корень проекта..."
 cd - > /dev/null
 
 print_success "Сборка завершена!"
+echo ""
 print_status "Библиотека находится в: panorama/drivers/hackrf_lib/libhackrf_multi.so"
-print_status "Для использования в Python импортируйте: from panorama.drivers.hackrf_lib import HackRFLibSource"
+print_status "Для запуска программы используйте: ./run.sh или python3 -m panorama.main"
+echo ""
+print_status "Для работы multi-SDR режима:"
+print_status "  1. Подключите 3 HackRF устройства"
+print_status "  2. Запустите программу"
+print_status "  3. Источник → libhackrf_multi"
+print_status "  4. Источник → Настройка SDR устройств"
+print_status "  5. Источник → Multi-SDR режим"

@@ -24,7 +24,8 @@ typedef struct {
 typedef struct {
     hackrf_device* dev;
     pthread_t thread;
-    _Atomic bool running;
+    bool running;
+    pthread_mutex_t running_mutex;  // Мьютекс для синхронизации доступа к running
     
     double center_hz;
     uint32_t samp_rate;

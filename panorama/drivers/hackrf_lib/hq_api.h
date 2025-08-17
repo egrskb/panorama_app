@@ -5,6 +5,13 @@
 #include <stdbool.h>
 #include <errno.h>
 
+// Макросы для экспорта функций
+#ifdef _WIN32
+    #define HQ_EXPORT __declspec(dllexport)
+#else
+    #define HQ_EXPORT __attribute__((visibility("default")))
+#endif
+
 // Публичные структуры для FFI
 typedef struct {
     double f_center_hz;
@@ -28,36 +35,40 @@ typedef struct {
 } HqStatus;
 
 // API функции
-int  hq_open_all(int num_expected);
-void hq_close_all(void);
+HQ_EXPORT int  hq_open_all(int num_expected);
+HQ_EXPORT void hq_close_all(void);
 
-int  hq_config_set_rates(uint32_t samp_rate_hz, uint32_t bb_bw_hz);
-int  hq_config_set_gains(uint32_t lna_db, uint32_t vga_db, bool amp_on);
+HQ_EXPORT int  hq_config_set_rates(uint32_t samp_rate_hz, uint32_t bb_bw_hz);
+HQ_EXPORT int  hq_config_set_gains(uint32_t lna_db, uint32_t vga_db, bool amp_on);
 
 // DC Offset настройки
-int  hq_config_set_dc_offset(bool enable, bool auto_correct, int16_t i_offset, int16_t q_offset);
-int  hq_config_calibrate_dc_offset(int device_idx);
+HQ_EXPORT int  hq_config_set_dc_offset(bool enable, bool auto_correct, int16_t i_offset, int16_t q_offset);
+HQ_EXPORT int  hq_config_calibrate_dc_offset(int device_idx);
 
 // Настройка диапазона частот
-int  hq_config_set_freq_range(double start_hz, double stop_hz, double step_hz);
-int  hq_config_set_dwell_time(uint32_t dwell_ms);
+HQ_EXPORT int  hq_config_set_freq_range(double start_hz, double stop_hz, double step_hz);
+HQ_EXPORT int  hq_config_set_dwell_time(uint32_t dwell_ms);
 
-int  hq_start(void);
-void hq_stop(void);
+// НОВОЕ: Настройка параметров детектора
+HQ_EXPORT void hq_set_detector_params(float threshold_offset_db, int min_width_bins,
+                           int min_sweeps, float timeout_sec);
 
-int  hq_get_watchlist_snapshot(WatchItem* out, int max_items);
-int  hq_get_recent_peaks(Peak* out, int max_items);
+HQ_EXPORT int  hq_start(void);
+HQ_EXPORT void hq_stop(void);
+
+HQ_EXPORT int  hq_get_watchlist_snapshot(WatchItem* out, int max_items);
+HQ_EXPORT int  hq_get_recent_peaks(Peak* out, int max_items);
 
 // Чтение непрерывного спектра от Master SDR
-int  hq_get_master_spectrum(double* freqs_hz, float* powers_dbm, int max_points);
+HQ_EXPORT int  hq_get_master_spectrum(double* freqs_hz, float* powers_dbm, int max_points);
 
-void hq_set_grouping_tolerance_hz(double delta_hz);
-void hq_set_ema_alpha(float alpha);
+HQ_EXPORT void hq_set_grouping_tolerance_hz(double delta_hz);
+HQ_EXPORT void hq_set_ema_alpha(float alpha);
 
-int  hq_get_status(HqStatus* out);
+HQ_EXPORT int  hq_get_status(HqStatus* out);
 
 // Device enumeration
-int  hq_list_devices(char* serials[], int max_count);
-int  hq_get_device_count(void);
+HQ_EXPORT int  hq_list_devices(char* serials[], int max_count);
+HQ_EXPORT int  hq_get_device_count(void);
 
 #endif // HQ_API_H

@@ -154,6 +154,9 @@ class DetectorWidget(QtWidgets.QWidget):
     signalDetected = QtCore.pyqtSignal(object)  # Detection
     sendToMap = QtCore.pyqtSignal(object)  # Detection для отправки на карту
     
+    # Добавить сигнал для передачи параметров
+    parametersChanged = QtCore.pyqtSignal(float, int, int, float)
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         
@@ -462,12 +465,33 @@ class DetectorWidget(QtWidgets.QWidget):
         self.btn_export_log.clicked.connect(self._export_log)
         self.btn_clear_detections.clicked.connect(self._clear_detections)
         self.tbl_roi.itemSelectionChanged.connect(self._on_roi_selected)
+        
+        # Подключаем сигналы изменения параметров детектора
+        self.threshold_offset.valueChanged.connect(self._on_params_changed)
+        self.min_width.valueChanged.connect(self._on_params_changed)
+        self.min_sweeps.valueChanged.connect(self._on_params_changed)
+        self.signal_timeout.valueChanged.connect(self._on_params_changed)
 
     def _on_threshold_mode_changed(self, text):
         """Переключение режима порога."""
         is_auto = "Авто" in text
         self.threshold_offset.setEnabled(is_auto)
         self.manual_threshold.setEnabled(not is_auto)
+        
+    def _on_params_changed(self):
+        """При изменении параметров."""
+        # Эмитим сигнал с новыми параметрами
+        if "Авто" in self.threshold_mode.currentText():
+            threshold = self.threshold_offset.value()
+        else:
+            threshold = self.manual_threshold.value() + 110  # Преобразуем в offset
+            
+        self.parametersChanged.emit(
+            threshold,
+            self.min_width.value(),
+            self.min_sweeps.value(),
+            self.signal_timeout.value()
+        )
 
     def _add_roi(self, start_mhz: float, stop_mhz: float, name: str = ""):
         """Добавление ROI региона."""

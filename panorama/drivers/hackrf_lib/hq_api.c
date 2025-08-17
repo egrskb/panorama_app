@@ -16,7 +16,8 @@
 // Global state
 static SdrCtx g_devs[MAX_DEVICES];
 static int g_num_devs = 0;
-static _Atomic bool g_running = false;
+static bool g_running = false;
+static pthread_mutex_t g_running_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Queues and lists
 extern PeakQueue* g_peaks_queue;
@@ -28,7 +29,8 @@ extern float g_ema_alpha;
 
 // Background grouping thread
 static pthread_t g_grouping_thread;
-static _Atomic bool g_grouping_running = false;
+static bool g_grouping_running = false;
+static pthread_mutex_t g_grouping_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Parameters
 static SdrParams g_config = {
@@ -53,7 +55,14 @@ static void* grouping_thread_fn(void* arg) {
     
     printf("Grouping thread started\n");
     
-    while (g_grouping_running) {
+    while (true) {
+        pthread_mutex_lock(&g_grouping_mutex);
+        if (!g_grouping_running) {
+            pthread_mutex_unlock(&g_grouping_mutex);
+            break;
+        }
+        pthread_mutex_unlock(&g_grouping_mutex);
+        
         // Process peaks every 100ms
         usleep(100000);
         
@@ -92,7 +101,9 @@ int hq_open_all(int num_expected) {
         }
         
         // Start grouping thread
+        pthread_mutex_lock(&g_grouping_mutex);
         g_grouping_running = true;
+        pthread_mutex_unlock(&g_grouping_mutex);
         if (pthread_create(&g_grouping_thread, NULL, grouping_thread_fn, NULL) != 0) {
             fprintf(stderr, "Failed to create grouping thread\n");
             peak_queue_destroy(g_peaks_queue);
@@ -116,11 +127,15 @@ void hq_close_all(void) {
     
     hq_stop();
     
-    // Stop grouping thread
-    if (g_grouping_running) {
-        g_grouping_running = false;
-        pthread_join(g_grouping_thread, NULL);
-    }
+            // Stop grouping thread
+        pthread_mutex_lock(&g_grouping_mutex);
+        if (g_grouping_running) {
+            g_grouping_running = false;
+            pthread_mutex_unlock(&g_grouping_mutex);
+            pthread_join(g_grouping_thread, NULL);
+        } else {
+            pthread_mutex_unlock(&g_grouping_mutex);
+        }
     
     // Destroy peak queue
     if (g_peaks_queue) {
@@ -141,10 +156,13 @@ void hq_close_all(void) {
 }
 
 int hq_config_set_rates(uint32_t samp_rate_hz, uint32_t bb_bw_hz) {
+    pthread_mutex_lock(&g_running_mutex);
     if (g_running) {
+        pthread_mutex_unlock(&g_running_mutex);
         fprintf(stderr, "Cannot change rates while running\n");
         return -EBUSY;
     }
+    pthread_mutex_unlock(&g_running_mutex);
     
     g_config.samp_rate = samp_rate_hz;
     g_config.bb_filter_bw = bb_bw_hz;
@@ -163,14 +181,17 @@ int hq_config_set_rates(uint32_t samp_rate_hz, uint32_t bb_bw_hz) {
 }
 
 int hq_config_set_gains(uint32_t lna_db, uint32_t vga_db, bool amp_on) {
+    pthread_mutex_lock(&g_running_mutex);
     if (g_running) {
+        pthread_mutex_unlock(&g_running_mutex);
         fprintf(stderr, "Cannot change gains while running\n");
         return -EBUSY;
     }
+    pthread_mutex_unlock(&g_running_mutex);
     
-    // Clamp gains
-    lna_db = lna_db < 0 ? 0 : (lna_db > 40 ? 40 : lna_db - (lna_db % 8));
-    vga_db = vga_db < 0 ? 0 : (vga_db > 62 ? 62 : vga_db - (vga_db % 2));
+    // Clamp gains (uint32_t is always >= 0)
+    lna_db = (lna_db > 40 ? 40 : lna_db - (lna_db % 8));
+    vga_db = (vga_db > 62 ? 62 : vga_db - (vga_db % 2));
     
     g_config.lna_db = lna_db;
     g_config.vga_db = vga_db;
@@ -195,12 +216,15 @@ int hq_config_set_gains(uint32_t lna_db, uint32_t vga_db, bool amp_on) {
 }
 
 int hq_start(void) {
+    pthread_mutex_lock(&g_running_mutex);
     if (g_running) {
+        pthread_mutex_unlock(&g_running_mutex);
         fprintf(stderr, "Already running\n");
         return -EBUSY;
     }
     
     if (g_num_devs < 1) {
+        pthread_mutex_unlock(&g_running_mutex);
         fprintf(stderr, "No devices open\n");
         return -EINVAL;
     }
@@ -208,6 +232,7 @@ int hq_start(void) {
     printf("Starting multi-SDR operation with %d devices...\n", g_num_devs);
     
     g_running = true;
+    pthread_mutex_unlock(&g_running_mutex);
     
     // Start master sweep (device 0)
     if (g_num_devs >= 1) {
@@ -235,13 +260,19 @@ int hq_start(void) {
             
             // Stop already started devices
             for (int j = 0; j < i; j++) {
+                pthread_mutex_lock(&g_devs[j].running_mutex);
                 if (g_devs[j].running) {
                     g_devs[j].running = false;
+                    pthread_mutex_unlock(&g_devs[j].running_mutex);
                     pthread_join(g_devs[j].thread, NULL);
+                } else {
+                    pthread_mutex_unlock(&g_devs[j].running_mutex);
                 }
             }
             
+            pthread_mutex_lock(&g_running_mutex);
             g_running = false;
+            pthread_mutex_unlock(&g_running_mutex);
             return r;
         }
         printf("Slave %d started\n", i);
@@ -252,23 +283,30 @@ int hq_start(void) {
 }
 
 void hq_stop(void) {
+    pthread_mutex_lock(&g_running_mutex);
     if (!g_running) {
+        pthread_mutex_unlock(&g_running_mutex);
         return;
     }
     
     printf("Stopping all devices...\n");
     
     g_running = false;
+    pthread_mutex_unlock(&g_running_mutex);
     
     // Stop all devices
     for (int i = 0; i < g_num_devs; i++) {
+        pthread_mutex_lock(&g_devs[i].running_mutex);
         if (g_devs[i].running) {
             g_devs[i].running = false;
+            pthread_mutex_unlock(&g_devs[i].running_mutex);
             
             // Wait for thread to finish
             pthread_join(g_devs[i].thread, NULL);
             
             printf("Device %d stopped\n", i);
+        } else {
+            pthread_mutex_unlock(&g_devs[i].running_mutex);
         }
     }
     
@@ -280,7 +318,7 @@ int hq_get_watchlist_snapshot(WatchItem* out, int max_items) {
     
     pthread_mutex_lock(&g_watchlist_mutex);
     
-    int count = (g_watchlist_count < (size_t)max_items) ? g_watchlist_count : max_items;
+    int count = (g_watchlist_count < (size_t)max_items) ? (int)g_watchlist_count : max_items;
     if (count > 0) {
         memcpy(out, g_watchlist, count * sizeof(WatchItem));
     }
@@ -342,10 +380,18 @@ int hq_get_status(HqStatus* out) {
     memset(out, 0, sizeof(HqStatus));
     
     // Check device status
-    out->master_running = (g_num_devs > 0 && g_devs[MASTER_IDX].running) ? 1 : 0;
+    if (g_num_devs > 0) {
+        pthread_mutex_lock(&g_devs[MASTER_IDX].running_mutex);
+        out->master_running = g_devs[MASTER_IDX].running ? 1 : 0;
+        pthread_mutex_unlock(&g_devs[MASTER_IDX].running_mutex);
+    } else {
+        out->master_running = 0;
+    }
     
     for (int i = 1; i < g_num_devs && i < 3; i++) {
+        pthread_mutex_lock(&g_devs[i].running_mutex);
         out->slave_running[i-1] = g_devs[i].running ? 1 : 0;
+        pthread_mutex_unlock(&g_devs[i].running_mutex);
     }
     
     // Calculate average retune time
@@ -430,6 +476,33 @@ int hq_config_set_dwell_time(uint32_t dwell_ms) {
     g_sweep_dwell_ms = dwell_ms;
     printf("Dwell time set to %u ms\n", dwell_ms);
     return 0;
+}
+
+// Внешняя функция из hq_grouping.c
+extern void hq_set_detector_params_impl(float threshold_offset_db, int min_width_bins,
+                                        int min_sweeps, float timeout_sec);
+
+// Обертка для API (уже объявлена в hq_api.h)
+void hq_set_detector_params(float threshold_offset_db, int min_width_bins,
+                           int min_sweeps, float timeout_sec) {
+    // Валидация параметров
+    if (threshold_offset_db < 0) threshold_offset_db = 0;
+    if (threshold_offset_db > 50) threshold_offset_db = 50;
+    
+    if (min_width_bins < 1) min_width_bins = 1;
+    if (min_width_bins > 100) min_width_bins = 100;
+    
+    if (min_sweeps < 1) min_sweeps = 1;
+    if (min_sweeps > 10) min_sweeps = 10;
+    
+    if (timeout_sec < 0.1f) timeout_sec = 0.1f;
+    if (timeout_sec > 10.0f) timeout_sec = 10.0f;
+    
+    // Вызываем реальную функцию
+    hq_set_detector_params_impl(threshold_offset_db, min_width_bins, min_sweeps, timeout_sec);
+    
+    printf("API: Detector params set: threshold +%.1f dB, width %d bins, %d sweeps, %.1f sec timeout\n",
+           threshold_offset_db, min_width_bins, min_sweeps, timeout_sec);
 }
 
 // DC Offset функции

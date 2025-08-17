@@ -21,7 +21,7 @@ except Exception:
     HackRFLibSource = None
     _LIB_AVAILABLE = False
 
-from panorama.shared import write_row_csv, setup_logging, merged_defaults
+from panorama.shared import write_row_csv, merged_defaults
 
 
 APP_TITLE = "ПАНОРАМА 0.2 Pro"
@@ -41,6 +41,46 @@ def _fix_runtime_dir():
         pathlib.Path(new).mkdir(parents=True, exist_ok=True)
         os.chmod(new, 0o700)
         os.environ["XDG_RUNTIME_DIR"] = new
+
+
+class QuietLogger:
+    """Менеджер для фильтрации лишних сообщений."""
+    
+    def __init__(self, verbose=False):
+        self.verbose = verbose
+        self._last_messages = {}
+        self._suppressed_prefixes = [
+            "First few values:",
+            "hq_get_master_spectrum: returned",
+            "Spectrum update #",
+            "Master: Update #",
+            "Active signals:",
+            "Signal timeout:",
+            "Processing peaks",
+        ]
+        
+    def log(self, message, level="info", dedupe_key=None):
+        """Логирует с дедупликацией и фильтрацией."""
+        # Фильтруем лишние сообщения
+        if not self.verbose:
+            for prefix in self._suppressed_prefixes:
+                if message.startswith(prefix):
+                    return
+                    
+        # Дедупликация повторяющихся сообщений
+        if dedupe_key:
+            if dedupe_key in self._last_messages:
+                if self._last_messages[dedupe_key] == message:
+                    return
+            self._last_messages[dedupe_key] = message
+            
+        # Выводим только важные сообщения
+        if level == "error":
+            print(f"[ERROR] {message}")
+        elif level == "warning":
+            print(f"[WARN] {message}")
+        elif self.verbose or level == "important":
+            print(f"[INFO] {message}")
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -88,13 +128,13 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 self._lib_source = HackRFLibSource()
                 self._lib_available = True
-                self.log.info("libhackrf_multi успешно загружена")
+                self.log.log("libhackrf_multi успешно загружена", level="important")
             except Exception as e:
                 self._lib_available = False
-                self.log.warning(f"libhackrf_multi недоступна: {e}")
+                self.log.log(f"libhackrf_multi недоступна: {e}", level="warning")
         else:
             self._lib_available = False
-            self.log.warning("libhackrf_multi не скомпилирована")
+            self.log.log("libhackrf_multi не скомпилирована", level="warning")
 
         self._source = self._sweep_source
         self.spectrum_tab.set_source(self._source)
@@ -116,6 +156,12 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Отключаем вкладки, требующие libhackrf, если используется hackrf_sweep
         self._update_tabs_availability()
+        
+        # Инициализируем подключение к пикам
+        self._on_tab_changed(0)
+        
+        # Связываем параметры детектора с multi-SDR
+        self._connect_detector_to_multisdr()
 
         # Меню и статусбар
         self._build_menu()
@@ -314,10 +360,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setStyleSheet(dark_stylesheet)
 
     def _connect_signals(self):
-        """Подключает все сигналы между компонентами с учетом multi-SDR."""
-        # Спектр → Пики и Детектор
-        self.spectrum_tab.newRowReady.connect(self.peaks_tab.update_from_row)
-        self.spectrum_tab.newRowReady.connect(self.detector_tab.push_data)
+        """Подключает все сигналы между компонентами."""
+        # Спектр → Пики (только при активации вкладки пиков)
+        # НЕ подключаем автоматически к детектору!
+        
+        # Подключение к пикам только когда вкладка активна
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        
+        # Детектор работает только при явном запуске
+        self.detector_tab.detectionStarted.connect(self._on_detector_started_manual)
+        self.detector_tab.detectionStopped.connect(self._on_detector_stopped_manual)
         
         # Спектр → Очистка истории при изменении конфигурации
         self.spectrum_tab.configChanged.connect(self.peaks_tab.clear_history)
@@ -329,10 +381,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.detector_tab.sendToMap.connect(self._send_detection_to_map)
         self.detector_tab.rangeSelected.connect(self.spectrum_tab.add_roi_region)
         self.detector_tab.signalDetected.connect(self._on_signal_detected)
-        
-        # Блокировки при активации детектора
-        self.detector_tab.detectionStarted.connect(self._on_detector_started)
-        self.detector_tab.detectionStopped.connect(self._on_detector_stopped)
         
         # Карта → Трилатерация
         self.map_tab.trilaterationStarted.connect(self._start_trilateration)
@@ -348,9 +396,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
             
         # Логируем обнаружение
-        self.log.info(f"Signal detected: {detection.freq_mhz:.3f} MHz, "
+        self.log.log(f"Signal detected: {detection.freq_mhz:.3f} MHz, "
                      f"{detection.power_dbm:.1f} dBm, "
-                     f"BW: {detection.bandwidth_khz:.1f} kHz")
+                     f"BW: {detection.bandwidth_khz:.1f} kHz", level="important")
         
         # Для multi-SDR сигналы автоматически передаются через watchlist в libhackrf
         self.statusBar().showMessage(
@@ -358,34 +406,69 @@ class MainWindow(QtWidgets.QMainWindow):
             3000
         )
         
-    def _on_detector_started(self):
-        """При запуске детектора блокируем несовместимые вкладки."""
+    def _on_tab_changed(self, index):
+        """При смене вкладки."""
+        # Пики работают только на своей вкладке
+        if self.tabs.widget(index) == self.peaks_tab:
+            self.spectrum_tab.newRowReady.connect(self.peaks_tab.update_from_row)
+        else:
+            try:
+                self.spectrum_tab.newRowReady.disconnect(self.peaks_tab.update_from_row)
+            except:
+                pass
+                
+    def _on_detector_started_manual(self):
+        """Детектор запущен вручную пользователем."""
+        # Только теперь подключаем поток данных к детектору
+        self.spectrum_tab.newRowReady.connect(self.detector_tab.push_data)
+        
+        # Если multi-SDR активен, передаем параметры в библиотеку
+        if self._multi_sdr_active and self._lib_source:
+            threshold_offset = self.detector_tab.threshold_offset.value()
+            min_width = self.detector_tab.min_width.value()
+            min_sweeps = self.detector_tab.min_sweeps.value()
+            timeout = self.detector_tab.signal_timeout.value()
+            
+            # Передаем параметры в C библиотеку через FFI
+            if hasattr(self._lib_source, '_lib'):
+                try:
+                    # Добавить эту функцию в cdef библиотеки
+                    self._lib_source._ffi.cdef("""
+                        void hq_set_detector_params(float threshold_offset_db, 
+                                                   int min_width_bins,
+                                                   int min_sweeps, 
+                                                   float timeout_sec);
+                    """)
+                    self._lib_source._lib.hq_set_detector_params(
+                        threshold_offset, min_width, min_sweeps, timeout
+                    )
+                except:
+                    pass
+        
         self._detector_active = True
+        self.statusBar().showMessage("🎯 Детектор запущен", 5000)
         
-        # В multi-SDR режиме не блокируем карту
-        if not self._multi_sdr_active:
-            self.tabs.setTabEnabled(self.tabs.indexOf(self.peaks_tab), False)
-            self.tabs.setTabEnabled(self.tabs.indexOf(self.map_tab), False)
-        
-        # Блокируем изменение параметров в Спектре
-        self.spectrum_tab.start_mhz.setEnabled(False)
-        self.spectrum_tab.stop_mhz.setEnabled(False)
-        self.spectrum_tab.bin_khz.setEnabled(False)
-        
-        self.statusBar().showMessage("🎯 Детектор активен", 5000)
-        
-    def _on_detector_stopped(self):
-        """При остановке детектора разблокируем вкладки."""
+    def _on_detector_stopped_manual(self):
+        """Детектор остановлен пользователем."""
+        # Отключаем поток данных от детектора
+        try:
+            self.spectrum_tab.newRowReady.disconnect(self.detector_tab.push_data)
+        except:
+            pass
+            
         self._detector_active = False
-        
-        self.tabs.setTabEnabled(self.tabs.indexOf(self.peaks_tab), True)
-        self.tabs.setTabEnabled(self.tabs.indexOf(self.map_tab), True)
-        
-        self.spectrum_tab.start_mhz.setEnabled(True)
-        self.spectrum_tab.stop_mhz.setEnabled(True)
-        self.spectrum_tab.bin_khz.setEnabled(True)
-        
         self.statusBar().showMessage("⚪ Детектор остановлен", 5000)
+        
+    def _connect_detector_to_multisdr(self):
+        """Связывает параметры детектора с multi-SDR библиотекой."""
+        def update_detector_params(threshold, min_width, min_sweeps, timeout):
+            if self._multi_sdr_active and self._lib_source:
+                self._lib_source.set_detector_params(
+                    threshold, min_width, min_sweeps, timeout
+                )
+        
+        # Подключаем сигнал изменения параметров
+        self.detector_tab.parametersChanged.connect(update_detector_params)
 
     def _build_statusbar(self):
         """Создает статусбар с индикаторами."""
@@ -479,28 +562,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stop_multi_sdr()
 
     def _update_multi_sdr_status(self):
-        """Обновляет статус multi-SDR системы."""
+        """Обновляет статус multi-SDR системы без спама."""
         if not self._lib_available or not self._lib_source:
             return
         
-        status = self._lib_source.get_status()
-        if status:
-            parts = []
-            if status['master_running']:
-                parts.append("M:SWEEP")
-            if status['slave1_running']:
-                parts.append("S1:TRACK")
-            if status['slave2_running']:
-                parts.append("S2:TRACK")
-            if status['watch_items'] > 0:
-                parts.append(f"T:{status['watch_items']}")
-            
-            if parts:
-                self.lbl_multi_sdr.setText(f"MULTI: {' '.join(parts)}")
-                self.lbl_multi_sdr.setStyleSheet("padding: 0 10px; color: #66ff66;")
-            else:
-                self.lbl_multi_sdr.setText("MULTI: READY")
-                self.lbl_multi_sdr.setStyleSheet("padding: 0 10px; color: #ffff66;")
+        try:
+            status = self._lib_source.get_status()
+            if status:
+                # Обновляем UI без вывода в консоль
+                parts = []
+                if status['master_running']:
+                    parts.append("M:OK")
+                if status['slave1_running']:
+                    parts.append("S1:OK")
+                if status['slave2_running']:
+                    parts.append("S2:OK")
+                if status['watch_items'] > 0:
+                    parts.append(f"T:{status['watch_items']}")
+                
+                status_text = f"MULTI: {' '.join(parts)}" if parts else "MULTI: READY"
+                
+                # Обновляем только если изменилось
+                if self.lbl_multi_sdr.text() != status_text:
+                    self.lbl_multi_sdr.setText(status_text)
+                    if parts:
+                        self.lbl_multi_sdr.setStyleSheet("padding: 0 10px; color: #66ff66;")
+                    else:
+                        self.lbl_multi_sdr.setStyleSheet("padding: 0 10px; color: #ffff66;")
+        except:
+            pass  # Тихо игнорируем ошибки
 
     def _build_menu(self):
         menubar = self.menuBar()
@@ -624,6 +714,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # Устанавливаем количество устройств
         if self._lib_source:
             self._lib_source.set_num_devices(3)
+            
+            # Если есть worker, передаем параметры детектора
+            if hasattr(self._lib_source, '_multi_worker') and self._lib_source._multi_worker:
+                if hasattr(self.detector_tab, 'threshold_offset'):
+                    self._lib_source._multi_worker.set_detector_params(
+                        self.detector_tab.threshold_offset.value(),
+                        self.detector_tab.min_width.value()
+                    )
         
         self._multi_sdr_active = True
         self._status_timer.start()
@@ -631,14 +729,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_multi_sdr.setText("MULTI: INIT")
         self.lbl_multi_sdr.setStyleSheet("padding: 0 10px; color: #ffff66;")
         
-        # Передаем параметры детектора в библиотеку
-        if hasattr(self.detector_tab, 'threshold_offset'):
-            threshold_offset = self.detector_tab.threshold_offset.value()
-            min_width = self.detector_tab.min_width.value()
-            # TODO: добавить API в библиотеку для передачи параметров детектора
-        
-        self.statusBar().showMessage("Multi-SDR режим активирован: Master sweep, Slaves tracking", 5000)
-        self.log.info("Multi-SDR mode enabled")
+        # Тихий вывод - только важное
+        self.log.log("Multi-SDR режим активирован", level="important")
 
     def _stop_multi_sdr(self):
         """Останавливает multi-SDR режим."""
@@ -653,7 +745,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_multi_sdr.setStyleSheet("padding: 0 10px;")
         
         self.statusBar().showMessage("Multi-SDR режим деактивирован", 5000)
-        self.log.info("Multi-SDR mode disabled")
+        self.log.log("Multi-SDR mode disabled", level="important")
 
     def _build_shortcuts(self):
         """Горячие клавиши."""
@@ -764,7 +856,7 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 serials = self._lib_source.list_serials()
             except Exception as e:
-                self.log.warning(f"Не удалось получить список устройств: {e}")
+                self.log.log(f"Не удалось получить список устройств: {e}", level="warning")
         
         if not serials:
             QtWidgets.QMessageBox.warning(
@@ -995,7 +1087,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.lbl_calibration.setStyleSheet("padding: 0 10px; color: #66ff66;")
                 self.statusBar().showMessage(f"Калибровка загружена: {os.path.basename(path)}", 5000)
             
-            self.log.info(f"Загружено профилей калибровки: {len(self._calibration_profiles)}")
+            self.log.log(f"Загружено профилей калибровки: {len(self._calibration_profiles)}", level="important")
             
         except Exception as e:
             self._show_error("Калибровка", f"Ошибка загрузки: {e}")
@@ -1103,6 +1195,95 @@ class MainWindow(QtWidgets.QMainWindow):
         super().closeEvent(e)
 
 
+# Полная логика работы multi-SDR с детектором
+class MultiSDRController:
+    """Контроллер для управления multi-SDR режимом."""
+    
+    def __init__(self, lib_source, detector_widget):
+        self.lib_source = lib_source
+        self.detector = detector_widget
+        self.active = False
+        self.targets = {}  # freq -> target_info
+        
+    def start(self):
+        """Запуск multi-SDR с правильной последовательностью."""
+        if not self.lib_source or self.active:
+            return False
+            
+        # 1. Устанавливаем параметры детектора
+        self._sync_detector_params()
+        
+        # 2. Запускаем master для sweep
+        # Master автоматически начнет заполнять watchlist
+        
+        # 3. Slaves автоматически начнут отслеживать цели из watchlist
+        
+        self.active = True
+        return True
+        
+    def _sync_detector_params(self):
+        """Синхронизирует параметры детектора с C библиотекой."""
+        if not self.detector:
+            return
+            
+        # Получаем текущие параметры из UI
+        if self.detector.threshold_mode.currentText().startswith("Авто"):
+            threshold = self.detector.threshold_offset.value()
+        else:
+            # Для фиксированного порога вычисляем offset от baseline
+            threshold = self.detector.fixed_threshold.value() + 110
+            
+        min_width = self.detector.min_width.value()
+        min_sweeps = self.detector.min_sweeps.value()
+        timeout = self.detector.signal_timeout.value()
+        
+        # Передаем в библиотеку
+        if self.lib_source:
+            self.lib_source.set_detector_params(
+                threshold, min_width, min_sweeps, timeout
+            )
+            
+    def process_watchlist(self, watchlist):
+        """Обрабатывает watchlist от C библиотеки."""
+        # Обновляем список целей
+        new_targets = {}
+        
+        for item in watchlist:
+            key = f"{item.f_center_hz:.1f}"
+            
+            if key in self.targets:
+                # Обновляем существующую цель
+                target = self.targets[key]
+                target['rssi'] = item.rssi_ema
+                target['hits'] = item.hit_count
+                target['last_seen'] = time.time()
+            else:
+                # Новая цель
+                target = {
+                    'freq_hz': item.f_center_hz,
+                    'bandwidth_hz': item.bw_hz,
+                    'rssi': item.rssi_ema,
+                    'hits': item.hit_count,
+                    'first_seen': time.time(),
+                    'last_seen': time.time()
+                }
+                
+            new_targets[key] = target
+            
+        # Удаляем устаревшие цели
+        timeout = 5.0  # секунд
+        current_time = time.time()
+        
+        for key in list(self.targets.keys()):
+            if key not in new_targets:
+                if current_time - self.targets[key]['last_seen'] > timeout:
+                    del self.targets[key]
+                    
+        self.targets = new_targets
+        
+        return self.targets
+
+
 def main():
     _fix_runtime_dir()
     
@@ -1110,11 +1291,15 @@ def main():
     QtCore.QCoreApplication.setApplicationName("panorama")
     settings = QSettings(QSettings.IniFormat, QSettings.UserScope, "panorama", "panorama")
 
-    logger = setup_logging("panorama")
-    logger.info(f"ПАНОРАМА Pro запущена")
-
+    # Используем тихий логгер
+    logger = QuietLogger(verbose=False)  # verbose=True для отладки
+    
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
+    
+    # Подавляем Qt warnings если не в режиме отладки
+    if not logger.verbose:
+        QtCore.qInstallMessageHandler(lambda *args: None)
     
     win = MainWindow(logger, settings)
     win.show()

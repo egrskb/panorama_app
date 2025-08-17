@@ -116,6 +116,10 @@ class HackRFLibSource(SourceBackend):
             int  hq_config_set_freq_range(double start_hz, double stop_hz, double step_hz);
             int  hq_config_set_dwell_time(uint32_t dwell_ms);
             
+            // НОВОЕ: Настройка параметров детектора
+            void hq_set_detector_params(float threshold_offset_db, int min_width_bins,
+                                       int min_sweeps, float timeout_sec);
+            
             int  hq_start(void);
             void hq_stop(void);
             
@@ -163,6 +167,19 @@ class HackRFLibSource(SourceBackend):
         if num < 1 or num > 3:
             raise ValueError("Поддерживается от 1 до 3 устройств")
         self._num_devices = num
+        
+    def set_detector_params(self, threshold_offset: float, min_width: int, 
+                            min_sweeps: int, timeout: float):
+        """Устанавливает параметры детектора в C библиотеке."""
+        if self._multi_mode and self._lib:
+            try:
+                self._lib.hq_set_detector_params(
+                    threshold_offset, min_width, min_sweeps, timeout
+                )
+                print(f"Detector params set: +{threshold_offset:.1f}dB, "
+                      f"{min_width} bins, {min_sweeps} sweeps, {timeout:.1f}s")
+            except Exception as e:
+                print(f"Failed to set detector params: {e}")
         
     def is_multi_capable(self) -> bool:
         """Проверяет, поддерживает ли библиотека multi-SDR режим."""
@@ -405,8 +422,11 @@ class HackRFLibSource(SourceBackend):
         return None
 
 
+# Исправленная версия _MultiWorker для backend.py
+# Заменить класс _MultiWorker целиком
+
 class _MultiWorker(QtCore.QObject, threading.Thread):
-    """Worker для multi-SDR режима."""
+    """Worker для multi-SDR режима с корректной обработкой."""
     
     finished_sig = QtCore.pyqtSignal(int, str)
     
@@ -420,144 +440,121 @@ class _MultiWorker(QtCore.QObject, threading.Thread):
         self._config = config
         self._running = True
         
-        # Настраиваем диапазон для мастера
+        # Настраиваем диапазон
         self._freq_start = config.freq_start_hz
         self._freq_end = config.freq_end_hz
         self._bin_hz = config.bin_hz
         
+        # Параметры детектора (получаем из родителя если есть)
+        self._threshold_offset = 20.0  # дБ над шумом по умолчанию
+        self._min_width_bins = 3
+        
     def stop(self):
         self._running = False
         
+    def set_detector_params(self, threshold_offset: float, min_width_bins: int):
+        """Устанавливает параметры детектора."""
+        self._threshold_offset = threshold_offset
+        self._min_width_bins = min_width_bins
+        
     def run(self):
-        """Worker для multi-SDR режима с правильной обработкой sweep."""
+        """Worker для multi-SDR режима."""
         # Буферы для чтения данных
+        watchlist_buf = self._ffi.new("WatchItem[100]")
         peaks_buf = self._ffi.new("Peak[100]")
         status_buf = self._ffi.new("HqStatus*")
 
-        # Параметры для непрерывного спектра
+        # Параметры для спектра
         last_emit_time = time.time()
-        emit_interval = 0.05  # 20 Hz для плавного обновления
-
-        # Создаем сетку частот для полного диапазона
-        freq_start = self._freq_start
-        freq_end = self._freq_end
-        bin_hz = self._bin_hz
-
-        # Вычисляем количество точек
-        n_points = int((freq_end - freq_start) / bin_hz) + 1
-
+        emit_interval = 0.05  # 20 Hz
+        
+        # Вычисляем количество точек спектра
+        n_points = int((self._freq_end - self._freq_start) / self._bin_hz) + 1
+        
         # Ограничиваем для стабильности
         if n_points > 50000:
-            print(f"Limiting frequency points from {n_points} to 50000")
             n_points = 50000
-            bin_hz = (freq_end - freq_start) / (n_points - 1)
+            self._bin_hz = (self._freq_end - self._freq_start) / (n_points - 1)
 
         # Буферы для спектра
         freqs_buf = self._ffi.new("double[]", n_points)
         powers_buf = self._ffi.new("float[]", n_points)
 
-        # Инициализируем частоты
-        for i in range(n_points):
-            freqs_buf[i] = freq_start + i * bin_hz
-
-        print(
-            f"Multi-SDR worker started: {n_points} points, "
-            f"{freq_start/1e6:.1f}-{freq_end/1e6:.1f} MHz"
-        )
-
-        # Счетчик для диагностики
+        # Счетчики для отладки
         update_count = 0
         last_status_time = time.time()
+        last_watchlist_count = 0
 
         while self._running:
             try:
                 current_time = time.time()
 
-                # Читаем спектр от Master SDR
+                # 1. Читаем спектр от Master SDR
                 n_read = self._lib.hq_get_master_spectrum(freqs_buf, powers_buf, n_points)
 
-                if n_read > 0:
-                    # Копируем данные
+                if n_read > 0 and n_read <= n_points:
+                    # Копируем данные безопасно
                     freqs_array = np.frombuffer(
                         self._ffi.buffer(freqs_buf, n_read * 8),
                         dtype=np.float64,
-                    )
+                    ).copy()
+                    
                     powers_array = np.frombuffer(
                         self._ffi.buffer(powers_buf, n_read * 4),
                         dtype=np.float32,
-                    )
+                    ).copy()
 
-                    # Эмитим полный спектр
+                    # Эмитим полный спектр для UI
                     if (current_time - last_emit_time) >= emit_interval:
-                        self._parent.fullSweepReady.emit(
-                            freqs_array.copy(), powers_array.copy()
-                        )
+                        self._parent.fullSweepReady.emit(freqs_array, powers_array)
                         last_emit_time = current_time
                         update_count += 1
 
-                        # Диагностика каждые 2 секунды
-                        if current_time - last_status_time > 2.0:
-                            active_points = np.sum(powers_array > -110)
-                            print(
-                                f"Spectrum update #{update_count}: "
-                                f"{active_points}/{n_read} active points"
+                # 2. Читаем watchlist (цели для slave SDR)
+                n_watchlist = self._lib.hq_get_watchlist_snapshot(watchlist_buf, 100)
+                
+                if n_watchlist > 0 and n_watchlist != last_watchlist_count:
+                    last_watchlist_count = n_watchlist
+                    
+                    # Логируем только изменения
+                    for i in range(min(n_watchlist, 5)):  # Показываем первые 5
+                        w = watchlist_buf[i]
+                        if w.rssi_ema > -80:  # Только сильные сигналы
+                            # Создаем SweepLine для совместимости с детектором
+                            sw = SweepLine(
+                                ts=None,
+                                f_low_hz=int(w.f_center_hz - w.bw_hz/2),
+                                f_high_hz=int(w.f_center_hz + w.bw_hz/2),
+                                bin_hz=int(w.bw_hz) if w.bw_hz > 0 else 200000,
+                                power_dbm=np.array([w.rssi_ema], dtype=np.float32),
                             )
-                            last_status_time = current_time
+                            self._parent.sweepLine.emit(sw)
 
-                # Читаем последние пики для отображения целей
-                n_peaks = self._lib.hq_get_recent_peaks(peaks_buf, 100)
-
-                if n_peaks > 0:
-                    for i in range(n_peaks):
-                        peak = peaks_buf[i]
-
-                        # Создаем SweepLine для совместимости с детектором
-                        sw = SweepLine(
-                            ts=None,
-                            f_low_hz=int(peak.f_hz - 100000),
-                            f_high_hz=int(peak.f_hz + 100000),
-                            bin_hz=200000,
-                            power_dbm=np.array([peak.rssi_dbm], dtype=np.float32),
-                        )
-                        self._parent.sweepLine.emit(sw)
-
-                # Читаем статус системы
-                self._lib.hq_get_status(status_buf)
-                status = status_buf[0]
-
-                # Формируем текст статуса
-                status_parts = []
-                if status.master_running:
-                    status_parts.append("Master: SWEEP")
-                else:
-                    status_parts.append("Master: OFF")
-
-                slave_count = 0
-                if status.slave_running[0]:
-                    status_parts.append("S1: TRACK")
-                    slave_count += 1
-                if status.slave_running[1]:
-                    status_parts.append("S2: TRACK")
-                    slave_count += 1
-
-                if status.watch_items > 0:
-                    status_parts.append(f"Targets: {status.watch_items}")
-
-                self._parent.status.emit(" | ".join(status_parts))
+                # 3. Читаем статус системы
+                r = self._lib.hq_get_status(status_buf)
+                if r == 0:
+                    status = status_buf[0]
+                    
+                    # Формируем краткий статус
+                    active_slaves = sum([status.slave_running[0], status.slave_running[1]])
+                    
+                    if current_time - last_status_time > 2.0:
+                        if status.watch_items > 0:
+                            self._parent.status.emit(
+                                f"Targets: {status.watch_items}, Slaves: {active_slaves}"
+                            )
+                        last_status_time = current_time
 
                 # Небольшая задержка
                 time.sleep(0.02)  # 50 Hz polling
 
             except Exception as e:
                 if self._running:
-                    print(f"Multi-worker error: {e}")
                     import traceback
                     traceback.print_exc()
                 break
 
-        print("Multi-SDR worker stopped")
         self.finished_sig.emit(0, "Multi-worker stopped")
-
 
 
 class _SweepAssembler:

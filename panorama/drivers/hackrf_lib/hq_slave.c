@@ -157,7 +157,7 @@ static void* slave_thread_fn(void* arg) {
     }
     
     struct timespec ts;
-    double current_center = 0;
+    // double current_center = 0;  // Unused variable
     
     while (ctx->running) {
         clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -203,7 +203,7 @@ static void* slave_thread_fn(void* arg) {
                                slave_idx, new_freq/1e6, g_watchlist[target_idx].rssi_ema);
                     }
                     
-                    current_center = new_freq;
+                    // current_center = new_freq;  // Unused variable
                     ctx->retune_count++;
                 }
             } else {

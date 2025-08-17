@@ -1,17 +1,38 @@
-// hq_grouping.c - ПОЛНАЯ ЗАМЕНА ФАЙЛА
+// hq_grouping.c - ИСПРАВЛЕННАЯ ВЕРСИЯ
+// Правильная логика детектора с параметрами из UI
+
 #include "hq_grouping.h"
 #include "hq_rssi.h"
+#include "hq_master.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
 #include <stdio.h>
 
-// Параметры группировки
-#define DEFAULT_GROUP_TOLERANCE_HZ 1000000.0  // 1 МГц по умолчанию
-#define MIN_SIGNAL_WIDTH_HZ 100000.0          // Минимальная ширина сигнала 100 кГц
-#define MAX_SIGNAL_WIDTH_HZ 20000000.0        // Максимальная ширина 20 МГц (видео)
-#define SIGNAL_TIMEOUT_NS 3000000000ULL       // 3 секунды таймаут
+// Параметры группировки (должны настраиваться из UI)
+static float g_threshold_offset_db = 20.0f;    // Порог: baseline + offset
+static int g_min_width_bins = 3;               // Минимальная ширина сигнала
+static int g_min_sweeps = 3;                   // Минимум свипов для подтверждения
+static float g_signal_timeout_sec = 2.0f;      // Таймаут сигнала
+
+// Буфер для расчета baseline
+#define BASELINE_HISTORY_SIZE 10
+static float g_baseline_history[BASELINE_HISTORY_SIZE][MAX_SPECTRUM_POINTS];
+static int g_baseline_history_index = 0;
+static int g_baseline_history_count = 0;
+static float g_baseline[MAX_SPECTRUM_POINTS];
+static bool g_baseline_valid = false;
+
+// Глобальные переменные (объявлены как extern в hq_init.c)
+extern PeakQueue* g_peaks_queue;
+extern WatchItem g_watchlist[];
+extern size_t g_watchlist_count;
+extern pthread_mutex_t g_watchlist_mutex;
+extern double g_grouping_tolerance_hz;
+extern float g_ema_alpha;
+
+// ========== Функции очереди пиков ==========
 
 PeakQueue* peak_queue_create(size_t capacity) {
     PeakQueue* q = malloc(sizeof(PeakQueue));
@@ -33,7 +54,6 @@ PeakQueue* peak_queue_create(size_t capacity) {
 
 void peak_queue_destroy(PeakQueue* q) {
     if (!q) return;
-    
     pthread_mutex_destroy(&q->mutex);
     free(q->buffer);
     free(q);
@@ -46,7 +66,7 @@ int peak_queue_push(PeakQueue* q, const Peak* peak) {
     
     size_t next = (q->tail + 1) % q->capacity;
     if (next == q->head) {
-        // Queue full - overwrite oldest
+        // Очередь полная - перезаписываем старое
         q->head = (q->head + 1) % q->capacity;
     }
     
@@ -63,7 +83,6 @@ int peak_queue_pop(PeakQueue* q, Peak* peak) {
     pthread_mutex_lock(&q->mutex);
     
     if (q->head == q->tail) {
-        // Queue empty
         pthread_mutex_unlock(&q->mutex);
         return -1;
     }
@@ -87,6 +106,73 @@ size_t peak_queue_size(PeakQueue* q) {
     return size;
 }
 
+// ========== Функции для установки параметров детектора ==========
+
+void hq_set_detector_params_impl(float threshold_offset_db, int min_width_bins, 
+                                int min_sweeps, float timeout_sec) {
+    g_threshold_offset_db = threshold_offset_db;
+    g_min_width_bins = min_width_bins;
+    g_min_sweeps = min_sweeps;
+    g_signal_timeout_sec = timeout_sec;
+    
+    printf("Grouping: Detector params updated: threshold +%.1f dB, width %d bins, %d sweeps, %.1f sec timeout\n",
+           threshold_offset_db, min_width_bins, min_sweeps, timeout_sec);
+}
+
+// ========== Обновление baseline ==========
+
+static void update_baseline(const float* spectrum, int n_points) {
+    if (n_points <= 0 || n_points > MAX_SPECTRUM_POINTS) return;
+    
+    // Добавляем в историю
+    memcpy(g_baseline_history[g_baseline_history_index], spectrum, 
+           n_points * sizeof(float));
+    
+    g_baseline_history_index = (g_baseline_history_index + 1) % BASELINE_HISTORY_SIZE;
+    if (g_baseline_history_count < BASELINE_HISTORY_SIZE) {
+        g_baseline_history_count++;
+    }
+    
+    // Нужно минимум 3 строки для baseline
+    if (g_baseline_history_count < 3) {
+        g_baseline_valid = false;
+        return;
+    }
+    
+    // Вычисляем медиану по истории для каждого бина
+    for (int bin = 0; bin < n_points; bin++) {
+        float values[BASELINE_HISTORY_SIZE];
+        int count = g_baseline_history_count;
+        
+        // Собираем значения для этого бина
+        for (int i = 0; i < count; i++) {
+            values[i] = g_baseline_history[i][bin];
+        }
+        
+        // Простая сортировка для медианы
+        for (int i = 0; i < count - 1; i++) {
+            for (int j = i + 1; j < count; j++) {
+                if (values[i] > values[j]) {
+                    float tmp = values[i];
+                    values[i] = values[j];
+                    values[j] = tmp;
+                }
+            }
+        }
+        
+        // Медиана
+        if (count % 2 == 0) {
+            g_baseline[bin] = (values[count/2 - 1] + values[count/2]) / 2.0f;
+        } else {
+            g_baseline[bin] = values[count/2];
+        }
+    }
+    
+    g_baseline_valid = true;
+}
+
+// ========== Добавление пика ==========
+
 void add_peak(double f_hz, float rssi_dbm) {
     if (!g_peaks_queue) return;
     
@@ -100,23 +186,19 @@ void add_peak(double f_hz, float rssi_dbm) {
     };
     
     peak_queue_push(g_peaks_queue, &peak);
-    
-    // Логируем для отладки
-    if (rssi_dbm > -70.0f) {
-        printf("Peak detected: %.3f MHz, %.1f dBm\n", f_hz/1e6, rssi_dbm);
-    }
 }
 
-// Улучшенная группировка для широкополосных сигналов
+// ========== Основная функция группировки с детектором ==========
+
 void regroup_frequencies(double delta_hz) {
     if (!g_peaks_queue) return;
     
     // Собираем все пики из очереди
-    Peak peaks[2000];  // Увеличили размер для широкополосных сигналов
+    Peak peaks[1000];
     int n_peaks = 0;
     
     Peak p;
-    while (peak_queue_pop(g_peaks_queue, &p) == 0 && n_peaks < 2000) {
+    while (peak_queue_pop(g_peaks_queue, &p) == 0 && n_peaks < 1000) {
         peaks[n_peaks++] = p;
     }
     
@@ -139,7 +221,7 @@ void regroup_frequencies(double delta_hz) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t now_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
     
-    // Группируем соседние пики в широкополосные сигналы
+    // Группируем пики в сигналы
     int i = 0;
     while (i < n_peaks) {
         // Начало группы
@@ -157,7 +239,6 @@ void regroup_frequencies(double delta_hz) {
             rssi_sum += peaks[j].rssi_dbm;
             group_size++;
             
-            // Находим самый сильный пик в группе
             if (peaks[j].rssi_dbm > max_rssi) {
                 max_rssi = peaks[j].rssi_dbm;
                 peak_freq = peaks[j].f_hz;
@@ -165,42 +246,22 @@ void regroup_frequencies(double delta_hz) {
             j++;
         }
         
+        // Проверяем минимальную ширину
+        if (group_size < g_min_width_bins) {
+            i = j;
+            continue;
+        }
+        
         // Вычисляем характеристики группы
         double bandwidth_hz = group_end_hz - group_start_hz;
-        double center_hz = (group_start_hz + group_end_hz) / 2.0;
-        float avg_rssi = rssi_sum / group_size;
-        
-        // Корректируем центр на пиковую частоту для точной трилатерации
-        if (bandwidth_hz > MIN_SIGNAL_WIDTH_HZ) {
-            // Для широкополосных сигналов используем взвешенный центр
-            center_hz = peak_freq;
-        }
-        
-        // Определяем тип сигнала по ширине полосы
-        const char* signal_type = "Unknown";
-        if (bandwidth_hz < 25000) {
-            signal_type = "Narrowband";  // < 25 кГц
-        } else if (bandwidth_hz < 200000) {
-            signal_type = "Voice/Data";  // 25-200 кГц
-        } else if (bandwidth_hz < 2000000) {
-            signal_type = "Wideband";    // 200 кГц - 2 МГц
-        } else if (bandwidth_hz < 10000000) {
-            signal_type = "Video/WiFi";  // 2-10 МГц
-        } else {
-            signal_type = "Ultra-Wide";  // > 10 МГц
-        }
+        double center_hz = peak_freq;  // Используем пиковую частоту как центр
+        // float avg_rssi = rssi_sum / group_size;  // Unused variable
         
         // Ищем существующую запись в watchlist
         int found_idx = -1;
         for (size_t k = 0; k < g_watchlist_count; k++) {
-            // Проверяем перекрытие диапазонов
-            double overlap_start = fmax(g_watchlist[k].f_center_hz - g_watchlist[k].bw_hz/2, 
-                                       center_hz - bandwidth_hz/2);
-            double overlap_end = fmin(g_watchlist[k].f_center_hz + g_watchlist[k].bw_hz/2,
-                                     center_hz + bandwidth_hz/2);
-            
-            if (overlap_end > overlap_start) {
-                // Есть перекрытие - это тот же сигнал
+            // Проверяем близость по частоте
+            if (fabs(g_watchlist[k].f_center_hz - center_hz) < delta_hz) {
                 found_idx = k;
                 break;
             }
@@ -210,34 +271,32 @@ void regroup_frequencies(double delta_hz) {
             // Обновляем существующий сигнал
             WatchItem* item = &g_watchlist[found_idx];
             
-            // Обновляем центральную частоту с учетом нового пика
-            item->f_center_hz = (item->f_center_hz * 0.7 + center_hz * 0.3);
+            // EMA для частоты и мощности
+            item->f_center_hz = item->f_center_hz * 0.7 + center_hz * 0.3;
+            item->rssi_ema = rssi_apply_ema(item->rssi_ema, max_rssi, g_ema_alpha);
             
-            // Расширяем полосу если нужно
+            // Обновляем полосу
             if (bandwidth_hz > item->bw_hz) {
                 item->bw_hz = bandwidth_hz;
             }
             
-            // Обновляем RSSI с учетом максимального значения
-            item->rssi_ema = rssi_apply_ema(item->rssi_ema, max_rssi, g_ema_alpha);
-            
             item->last_ns = now_ns;
             item->hit_count++;
             
-            printf("Updated signal: %.3f MHz, BW: %.1f kHz, RSSI: %.1f dBm, Type: %s\n",
-                   item->f_center_hz/1e6, item->bw_hz/1e3, item->rssi_ema, signal_type);
+            // Логируем только значимые обновления
+            if (item->hit_count == g_min_sweeps) {
+                printf("Signal confirmed: %.3f MHz, %.1f dBm, BW: %.0f kHz\n",
+                       item->f_center_hz/1e6, item->rssi_ema, item->bw_hz/1e3);
+            }
             
         } else if (g_watchlist_count < MAX_WATCHLIST) {
             // Добавляем новый сигнал
             WatchItem* item = &g_watchlist[g_watchlist_count++];
             item->f_center_hz = center_hz;
-            item->bw_hz = fmax(bandwidth_hz, MIN_SIGNAL_WIDTH_HZ);
+            item->bw_hz = fmax(bandwidth_hz, 100000.0);  // Минимум 100 kHz
             item->rssi_ema = max_rssi;
             item->last_ns = now_ns;
             item->hit_count = 1;
-            
-            printf("New signal detected: %.3f MHz, BW: %.1f kHz, RSSI: %.1f dBm, Type: %s\n",
-                   center_hz/1e6, bandwidth_hz/1e3, max_rssi, signal_type);
         }
         
         // Переходим к следующей группе
@@ -246,73 +305,63 @@ void regroup_frequencies(double delta_hz) {
     
     // Удаляем устаревшие записи
     size_t write_idx = 0;
+    uint64_t timeout_ns = (uint64_t)(g_signal_timeout_sec * 1e9);
+    
     for (size_t i = 0; i < g_watchlist_count; i++) {
-        if ((now_ns - g_watchlist[i].last_ns) < SIGNAL_TIMEOUT_NS) {
+        // Проверяем таймаут и минимальное количество подтверждений
+        bool keep = false;
+        
+        if ((now_ns - g_watchlist[i].last_ns) < timeout_ns) {
             // Сигнал еще активен
+            if (g_watchlist[i].hit_count >= g_min_sweeps) {
+                // Достаточно подтверждений - держим
+                keep = true;
+            } else if ((now_ns - g_watchlist[i].last_ns) < 500000000ULL) {
+                // Новый сигнал, даем время на подтверждение (0.5 сек)
+                keep = true;
+            }
+        }
+        
+        if (keep) {
             if (write_idx != i) {
                 g_watchlist[write_idx] = g_watchlist[i];
             }
             write_idx++;
-        } else {
-            printf("Signal timeout: %.3f MHz (last seen %.1f sec ago)\n",
-                   g_watchlist[i].f_center_hz/1e6,
-                   (now_ns - g_watchlist[i].last_ns) / 1e9);
         }
     }
+    
     g_watchlist_count = write_idx;
     
     pthread_mutex_unlock(&g_watchlist_mutex);
-    
-    // Логируем статистику
-    if (g_watchlist_count > 0) {
-        printf("Active signals: %zu\n", g_watchlist_count);
-    }
 }
 
-// Функция для получения центральной частоты широкополосного сигнала
-double get_signal_center_frequency(double freq_hz, double tolerance_hz) {
-    pthread_mutex_lock(&g_watchlist_mutex);
+// ========== Функция обработки спектра от мастера ==========
+
+void process_master_spectrum(const double* freqs_hz, const float* powers_dbm, int n_points) {
+    if (!freqs_hz || !powers_dbm || n_points <= 0) return;
     
-    for (size_t i = 0; i < g_watchlist_count; i++) {
-        // Проверяем попадание частоты в диапазон сигнала
-        if (fabs(g_watchlist[i].f_center_hz - freq_hz) < (g_watchlist[i].bw_hz / 2 + tolerance_hz)) {
-            double center = g_watchlist[i].f_center_hz;
-            pthread_mutex_unlock(&g_watchlist_mutex);
-            return center;
+    // Обновляем baseline
+    update_baseline(powers_dbm, n_points);
+    
+    if (!g_baseline_valid) {
+        // Еще недостаточно данных для baseline
+        return;
+    }
+    
+    // Детектируем сигналы выше порога
+    float threshold_dbm;
+    
+    for (int i = 0; i < n_points; i++) {
+        // Адаптивный порог для каждого бина
+        threshold_dbm = g_baseline[i] + g_threshold_offset_db;
+        
+        // Проверяем превышение порога
+        if (powers_dbm[i] > threshold_dbm) {
+            // Добавляем пик для группировки
+            add_peak(freqs_hz[i], powers_dbm[i]);
         }
     }
     
-    pthread_mutex_unlock(&g_watchlist_mutex);
-    return freq_hz;  // Не найден в группе - возвращаем исходную частоту
-}
-
-// Функция для получения самого сильного сигнала в диапазоне
-int get_strongest_signal_in_range(double start_hz, double end_hz, WatchItem* result) {
-    if (!result) return -1;
-    
-    pthread_mutex_lock(&g_watchlist_mutex);
-    
-    float max_rssi = -200.0f;
-    int found_idx = -1;
-    
-    for (size_t i = 0; i < g_watchlist_count; i++) {
-        // Проверяем попадание в диапазон
-        if (g_watchlist[i].f_center_hz >= start_hz && 
-            g_watchlist[i].f_center_hz <= end_hz) {
-            
-            if (g_watchlist[i].rssi_ema > max_rssi) {
-                max_rssi = g_watchlist[i].rssi_ema;
-                found_idx = i;
-            }
-        }
-    }
-    
-    if (found_idx >= 0) {
-        *result = g_watchlist[found_idx];
-        pthread_mutex_unlock(&g_watchlist_mutex);
-        return 0;
-    }
-    
-    pthread_mutex_unlock(&g_watchlist_mutex);
-    return -1;
+    // Запускаем группировку
+    regroup_frequencies(g_grouping_tolerance_hz);
 }
