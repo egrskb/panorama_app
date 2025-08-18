@@ -142,8 +142,10 @@ static void* slave_thread_fn(void* arg) {
     data->fft_size = 4096;  // Меньше чем у master для скорости
     data->fft_in = fftwf_alloc_complex(data->fft_size);
     data->fft_out = fftwf_alloc_complex(data->fft_size);
+    pthread_mutex_lock(&g_fftw_mutex);
     data->fft_plan = fftwf_plan_dft_1d(data->fft_size, data->fft_in, data->fft_out,
                                         FFTW_FORWARD, FFTW_ESTIMATE);
+    pthread_mutex_unlock(&g_fftw_mutex);
     
     data->window = malloc(data->fft_size * sizeof(float));
     create_window(data->window, data->fft_size);
@@ -234,7 +236,9 @@ cleanup:
     // Очистка ресурсов
     if (data->fft_in) fftwf_free(data->fft_in);
     if (data->fft_out) fftwf_free(data->fft_out);
+    pthread_mutex_lock(&g_fftw_mutex);
     if (data->fft_plan) fftwf_destroy_plan(data->fft_plan);
+    pthread_mutex_unlock(&g_fftw_mutex);
     if (data->window) free(data->window);
     
     printf("Slave %d thread stopped\n", slave_idx);

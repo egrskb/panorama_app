@@ -34,11 +34,9 @@ static float  g_spectrum_powers[MAX_SPECTRUM_POINTS];
 static int    g_spectrum_points = 0;
 static _Atomic bool g_spectrum_ready = false;
 static pthread_mutex_t g_spectrum_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_once_t g_fftw_once = PTHREAD_ONCE_INIT;
-
-static void ensure_fftw_threadsafe(void) {
-    fftwf_make_planner_thread_safe();
-}
+// Protects FFTW plan creation/destruction on systems without
+// fftwf_make_planner_thread_safe (FFTW <3.3.8 or without threads lib).
+pthread_mutex_t g_fftw_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* ===================== Вспомогалочки ===================== */
 
@@ -107,7 +105,9 @@ int init_devices(SdrCtx* devs, int n, const SdrParams* defaults) {
         return -EINVAL;
     }
 
-    pthread_once(&g_fftw_once, ensure_fftw_threadsafe);
+    // FFTW's planner is not thread safe on older builds.  We guard plan
+    // creation with a mutex instead of relying on
+    // fftwf_make_planner_thread_safe(), which may be missing.
 
     int r = hackrf_init();
     if (r != HACKRF_SUCCESS) {

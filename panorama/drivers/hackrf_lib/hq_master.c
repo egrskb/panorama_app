@@ -316,7 +316,9 @@ static void* master_thread_fn(void* arg) {
     printf("Master: Window corrections: power loss = %.2f dB, ENBW = %.2f dB\n",
            d->window_power_loss_db, d->enbw_correction_db);
 
+    pthread_mutex_lock(&g_fftw_mutex);
     d->plan = fftwf_plan_dft_1d(d->N, d->in, d->out, FFTW_FORWARD, FFTW_ESTIMATE);
+    pthread_mutex_unlock(&g_fftw_mutex);
     fftwf_execute(d->plan);  // Прогрев
 
     // Предвычисления
@@ -473,7 +475,9 @@ static void* master_thread_fn(void* arg) {
 cleanup:
     printf("Master: Cleanup\n");
     
+    pthread_mutex_lock(&g_fftw_mutex);
     if (d->plan) fftwf_destroy_plan(d->plan);
+    pthread_mutex_unlock(&g_fftw_mutex);
     if (d->in)   fftwf_free(d->in);
     if (d->out)  fftwf_free(d->out);
     free(d->pwr_db);
