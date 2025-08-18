@@ -6,7 +6,7 @@ from PyQt5.QtCore import QSettings
 import numpy as np
 
 from panorama.features.spectrum import SpectrumView
-from panorama.features.peaks.unified_peaks import UnifiedPeaksWidget
+# from panorama.features.peaks.unified_peaks import UnifiedPeaksWidget  # Автопики временно отключены
 from panorama.features.detector.widget import DetectorWidget
 from panorama.features.devices.manager import DeviceManager, DeviceConfigDialog
 from panorama.features.map3d import MapView
@@ -143,7 +143,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Остальные вкладки
         self.map_tab = MapView()
-        self.peaks_tab = UnifiedPeaksWidget()
+        # self.peaks_tab = UnifiedPeaksWidget()
+        # Автопики отключены: создаём заглушку
+        self.peaks_tab = QtWidgets.QWidget()
+        _pl = QtWidgets.QVBoxLayout(self.peaks_tab)
+        _lbl = QtWidgets.QLabel("Автопики временно отключены")
+        _lbl.setAlignment(QtCore.Qt.AlignCenter)
+        _pl.addWidget(_lbl)
         self.detector_tab = DetectorWidget()
 
         # Добавляем вкладки
@@ -186,41 +192,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._status_timer.timeout.connect(self._update_multi_sdr_status)
         self._status_timer.setInterval(1000)  # 1 Hz
         
-        # Питаем автопики данными — подключаемся к сигналу виджета пиков
-        # ОЖИДАЕМ список вида [(freq_hz, dbm), ...]. Если у тебя объект с полями, просто трансформируй тут.
-        try:
-            self.peaks_tab.peaksReady.connect(self._on_peaks_ready)
-        except Exception:
-            # Если сигнала нет — можно подключить к твоему детектору либо к SpectrumView (через локальный пик-файндер)
-            pass
-
-    @QtCore.pyqtSlot(object)
-    def _on_peaks_ready(self, peaks):
-        """peaks: sequence of detections → добавляем/обновляем записи автопиков."""
-        # Передаем данные в виджет автопиков. AutoPeaksEngine ожидает кортежи
-        # вида (freq_hz, dbm, width_khz, q_factor, above_noise_db). Если
-        # дополнительные параметры отсутствуют, заполняем нулями.
-        if hasattr(self.peaks_tab, 'get_engine'):
-            engine = self.peaks_tab.get_engine()
-            flat: List[Tuple[float, float, float, float, float]] = []
-            for p in peaks:
-                try:
-                    if isinstance(p, (list, tuple)) and len(p) >= 2:
-                        f, dbm = float(p[0]), float(p[1])
-                        width = float(p[2]) if len(p) > 2 else 0.0
-                        q = float(p[3]) if len(p) > 3 else 0.0
-                        an = float(p[4]) if len(p) > 4 else 0.0
-                    else:
-                        f = float(getattr(p, "freq_hz"))
-                        dbm = float(getattr(p, "dbm"))
-                        width = float(getattr(p, "width_khz", 0.0))
-                        q = float(getattr(p, "q_factor", 0.0))
-                        an = float(getattr(p, "above_noise_db", 0.0))
-                    flat.append((f, dbm, width, q, an))
-                except Exception:
-                    continue
-            if flat:
-                engine.ingest(flat)
+        # Автопики временно отключены
+        # self.peaks_tab.peaksReady.connect(self._on_peaks_ready)
         
     def _load_emoji_font(self):
         """Загружает шрифт с поддержкой эмодзи."""
@@ -402,22 +375,13 @@ class MainWindow(QtWidgets.QMainWindow):
         """Подключает все сигналы между компонентами."""
         print("🔌 Подключаю сигналы...")
         
-        # ИСПРАВЛЕНИЕ: Используем правильный сигнал newRowReady
-        # Автопики работают автоматически всегда
-        self.spectrum_tab.newRowReady.connect(self.peaks_tab.update_from_row)
-        print("✅ Автопики подключены к данным")
-        
+        # Автопики временно отключены
+
         # Детектор работает только при явном запуске
         self.detector_tab.detectionStarted.connect(self._on_detector_started_manual)
         self.detector_tab.detectionStopped.connect(self._on_detector_stopped_manual)
         print("✅ Сигналы детектора подключены")
-        
-        # Спектр → Очистка истории автопиков при изменении конфигурации
-        self.spectrum_tab.configChanged.connect(self.peaks_tab.clear_history)
-        
-        # Автопики → Спектр (навигация)
-        self.peaks_tab.goToFreq.connect(self.spectrum_tab.set_cursor_freq)
-        
+
         # Детектор → Карта и multi-SDR
         self.detector_tab.sendToMap.connect(self._send_detection_to_map)
         self.detector_tab.rangeSelected.connect(self.spectrum_tab.add_roi_region)
@@ -431,20 +395,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._lib_available:
             self.spectrum_tab.newRowReady.connect(self._process_for_trilateration)
             
-        # Показываем статус автопиков
-        self._show_autopeaks_status()
         print("✅ Все сигналы подключены")
-
-    def _show_autopeaks_status(self):
-        """Показывает статус автопиков."""
-        if not self._detector_active:
-            status_msg = "📍 Автопики активны - автоматический поиск сигналов"
-            print(f"📊 Статус: {status_msg}")
-            self.statusBar().showMessage(status_msg, 3000)
-        else:
-            status_msg = "🎯 Детектор активен - автопики заблокированы"
-            print(f"📊 Статус: {status_msg}")
-            self.statusBar().showMessage(status_msg, 3000)
             
     def _on_signal_detected(self, detection):
         """Обработчик обнаружения сигнала детектором для multi-SDR."""
@@ -464,17 +415,9 @@ class MainWindow(QtWidgets.QMainWindow):
         
     def _on_detector_started_manual(self):
         """Детектор запущен вручную пользователем."""
-        print("🎯 Детектор запускается - отключаю автопики")
-        
-        # Отключаем автопики при работе детектора для оптимизации
-        try:
-            self.spectrum_tab.newRowReady.disconnect(self.peaks_tab.update_from_row)
-            print("✅ Автопики отключены")
-        except:
-            print("⚠️ Ошибка при отключении автопиков")
-            pass
-            
-        # Только теперь подключаем поток данных к детектору
+        print("🎯 Детектор запускается")
+
+        # Подключаем поток данных к детектору
         self.spectrum_tab.newRowReady.connect(self.detector_tab.push_data)
         print("✅ Детектор подключен к данным")
         
@@ -493,14 +436,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.log.log(f"Failed to set detector params: {e}", level="warning")
         
         self._detector_active = True
-        self.statusBar().showMessage("🎯 Детектор запущен, автопики заблокированы", 5000)
-        
-        # Обновляем статус автопиков
-        self._show_autopeaks_status()
+        self.statusBar().showMessage("🎯 Детектор запущен", 5000)
         
     def _on_detector_stopped_manual(self):
         """Детектор остановлен пользователем."""
-        print("⚪ Детектор останавливается - включаю автопики")
+        print("⚪ Детектор останавливается")
         
         # Отключаем поток данных от детектора
         try:
@@ -510,15 +450,8 @@ class MainWindow(QtWidgets.QMainWindow):
             print("⚠️ Ошибка при отключении детектора")
             pass
             
-        # Включаем автопики обратно
-        self.spectrum_tab.newRowReady.connect(self.peaks_tab.update_from_row)
-        print("✅ Автопики включены обратно")
-            
         self._detector_active = False
-        self.statusBar().showMessage("⚪ Детектор остановлен, автопики включены", 5000)
-        
-        # Обновляем статус автопиков
-        self._show_autopeaks_status()
+        self.statusBar().showMessage("⚪ Детектор остановлен", 5000)
 
     def _connect_detector_to_multisdr(self):
         """Связывает параметры детектора с multi-SDR библиотекой."""
@@ -976,7 +909,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QShortcut(QtGui.QKeySequence("-"), self, activated=lambda: self._zoom_x(1.25))
         QtWidgets.QShortcut(QtGui.QKeySequence("D"), self, activated=lambda: self.tabs.setCurrentWidget(self.detector_tab))
         QtWidgets.QShortcut(QtGui.QKeySequence("S"), self, activated=lambda: self.tabs.setCurrentWidget(self.spectrum_tab))
-        QtWidgets.QShortcut(QtGui.QKeySequence("P"), self, activated=lambda: self.tabs.setCurrentWidget(self.peaks_tab))
+        # QtWidgets.QShortcut(QtGui.QKeySequence("P"), self, activated=lambda: self.tabs.setCurrentWidget(self.peaks_tab))
         QtWidgets.QShortcut(QtGui.QKeySequence("M"), self, activated=lambda: self.tabs.setCurrentWidget(self.map_tab))
 
     def _zoom_x(self, factor: float):
