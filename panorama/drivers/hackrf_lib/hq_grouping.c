@@ -219,21 +219,27 @@ void regroup_frequencies(double delta_hz) {
     // Собираем все пики из очереди с ограничением
     Peak peaks[1000];
     int n_peaks = 0;
-    
+
     Peak p;
     int max_pops = 1000;  // Ограничиваем количество извлекаемых пиков
     int pop_count = 0;
-    
+
     while (peak_queue_pop(g_peaks_queue, &p) == 0 && n_peaks < 1000 && pop_count < max_pops) {
         peaks[n_peaks++] = p;
         pop_count++;
     }
-    
+
     if (n_peaks == 0) return;
-    
-    // Если извлекли слишком много пиков, логируем предупреждение
+
+    // Если извлекли слишком много пиков, логируем предупреждение (не чаще одного раза)
+    static int batch_warn_logged = 0;
     if (pop_count >= max_pops) {
-        printf("Grouping: Warning - too many peaks in queue, processing limited batch\n");
+        if (!batch_warn_logged) {
+            printf("Grouping: Warning - too many peaks in queue, processing limited batch\n");
+            batch_warn_logged = 1;
+        }
+    } else {
+        batch_warn_logged = 0;
     }
     
     // Сортируем по частоте (с ограничением на время сортировки)
@@ -397,9 +403,15 @@ void regroup_frequencies(double delta_hz) {
         cleanup_count++;
     }
     
-    // Если достигли лимита итераций очистки, логируем предупреждение
+    // Если достигли лимита итераций очистки, логируем предупреждение (однократно)
+    static int cleanup_warn_logged = 0;
     if (cleanup_count >= max_cleanup_iterations) {
-        printf("Grouping: Warning - cleanup limited, some items may remain\n");
+        if (!cleanup_warn_logged) {
+            printf("Grouping: Warning - cleanup limited, some items may remain\n");
+            cleanup_warn_logged = 1;
+        }
+    } else {
+        cleanup_warn_logged = 0;
     }
     
     g_watchlist_count = write_idx;

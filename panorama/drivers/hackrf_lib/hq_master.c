@@ -18,7 +18,8 @@
 #include <sys/time.h>
 #include <inttypes.h>
 
-// Runtime debug switch. Set environment variable HQ_DEBUG=1 to enable logs.
+// Runtime debug switch. Only compiled when HQ_DEBUG macro is defined.
+#ifdef HQ_DEBUG
 static int hq_debug_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -27,6 +28,7 @@ static int hq_debug_enabled(void) {
     }
     return enabled;
 }
+#endif
 #ifndef BLOCKS_PER_TRANSFER
 #define BLOCKS_PER_TRANSFER 16
 #endif
@@ -424,6 +426,7 @@ static void* master_thread_fn(void* arg) {
                 no_data_count = 0;  // Сбрасываем счетчик
                 
                 // Логируем каждые 10 обновлений (1 секунда)
+#ifdef HQ_DEBUG
                 if (update_count % 10 == 0) {
                     // Находим максимум для диагностики
                     float max_power = -200.0f;
@@ -437,14 +440,17 @@ static void* master_thread_fn(void* arg) {
                                update_count, max_power);
                     }
                 }
+#endif
             } else {
                 no_data_count++;
                 // Если долго нет данных, логируем предупреждение
+#ifdef HQ_DEBUG
                 if (no_data_count % 50 == 0) {  // Каждые 5 секунд
                     if (hq_debug_enabled()) {
                         printf("Master: Warning - no data for %d cycles\n", no_data_count);
                     }
                 }
+#endif
             }
         }
         
