@@ -568,18 +568,32 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tabs.setTabEnabled(3, False)  # Карта
             self.tabs.setTabToolTip(3, "Требуется libhackrf для трилатерации")
             
-            # Добавляем предупреждение в детектор
-            if hasattr(self.detector_tab, 'btn_send_to_map'):
-                self.detector_tab.btn_send_to_map.setEnabled(False)
-                self.detector_tab.btn_send_to_map.setToolTip("Требуется libhackrf для работы с картой")
-        else:
-            # При libhackrf все доступно
-            self.tabs.setTabEnabled(3, True)
-            self.tabs.setTabToolTip(3, "")
+    def _update_multi_sdr_features(self):
+        """Обновляет доступность функций, требующих multi-SDR."""
+        if self._multi_sdr_active:
+            # Включаем функции multi-SDR
+            self.tabs.setTabEnabled(3, True)  # Карта
+            self.tabs.setTabToolTip(3, "Карта с трилатерацией")
             
-            if hasattr(self.detector_tab, 'btn_send_to_map'):
-                self.detector_tab.btn_send_to_map.setEnabled(True)
-                self.detector_tab.btn_send_to_map.setToolTip("")
+            # Включаем трилатерацию
+            if hasattr(self.map_tab, 'enable_trilateration'):
+                self.map_tab.enable_trilateration(True)
+                
+            # Обновляем статус
+            self.lbl_trilateration.setText("TRI: ВКЛ")
+            self.lbl_trilateration.setStyleSheet("padding: 0 10px; color: #4CAF50;")
+        else:
+            # Отключаем функции multi-SDR
+            self.tabs.setTabEnabled(3, False)  # Карта
+            self.tabs.setTabToolTip(3, "Требуется Multi-SDR режим")
+            
+            # Отключаем трилатерацию
+            if hasattr(self.map_tab, 'enable_trilateration'):
+                self.map_tab.enable_trilateration(False)
+                
+            # Обновляем статус
+            self.lbl_trilateration.setText("TRI: ВЫКЛ")
+            self.lbl_trilateration.setStyleSheet("padding: 0 10px;")
 
     def _wire_source(self, src):
         """Подключает обработчики к источнику."""
@@ -770,6 +784,9 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self.act_multi_sdr.setChecked(False)
             return
+            
+        # Устанавливаем количество устройств в backend
+        self._lib_source.set_num_devices(3)
         
         # Получаем список реальных устройств
         try:
@@ -895,6 +912,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_multi_sdr.setText("MULTI: INIT")
             self.lbl_multi_sdr.setStyleSheet("padding: 0 10px; color: #ffff66;")
             
+            # Обновляем доступность функций multi-SDR
+            self._update_multi_sdr_features()
+            
             self.log.log(f"Multi-SDR режим активирован с {len(available_serials)} устройствами", level="important")
             self.statusBar().showMessage("Multi-SDR режим активирован", 3000)
             
@@ -938,6 +958,9 @@ class MainWindow(QtWidgets.QMainWindow):
         
         self.lbl_multi_sdr.setText("MULTI: OFF")
         self.lbl_multi_sdr.setStyleSheet("padding: 0 10px;")
+        
+        # Обновляем доступность функций multi-SDR
+        self._update_multi_sdr_features()
         
         self.statusBar().showMessage("Multi-SDR режим деактивирован", 3000)
         self.log.log("Multi-SDR режим деактивирован", level="important")

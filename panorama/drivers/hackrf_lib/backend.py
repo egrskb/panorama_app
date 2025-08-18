@@ -80,6 +80,11 @@ class HackRFLibSource(SourceBackend):
         self._multi_worker: Optional[_MultiWorker] = None
         self._running = False
         
+    def set_num_devices(self, num: int):
+        """Устанавливает количество устройств для multi-SDR режима."""
+        self._num_devices = max(1, num)
+        print(f"Backend: установлено {self._num_devices} устройств")
+        
     def _setup_multi_interface(self):
         """Настройка интерфейса для multi-SDR версии."""
         self._ffi.cdef(r"""
@@ -284,10 +289,12 @@ class HackRFLibSource(SourceBackend):
             self.status.emit("Уже запущено")
             return
         
-        # MultiWorker запускается ТОЛЬКО в multi-mode
-        if self._multi_mode:
+        # Проверяем, действительно ли нужен multi-mode
+        # Даже если библиотека multi, можем работать в single-mode
+        if self._multi_mode and self._num_devices > 1:
             self._start_multi(config)
         else:
+            # Принудительно используем single-mode
             self._start_single(config)
             
     def _start_multi(self, config: SweepConfig):
@@ -357,8 +364,8 @@ class HackRFLibSource(SourceBackend):
         self.status.emit("Инициализация single-SDR...")
         self._assembler.configure(config)
         
-        # В single-mode НЕ запускаем MultiWorker
-        self._worker = _Worker(self, self._ffi, self._lib, config, self._serial_suffix, self._assembler)
+        # В single-mode используем SingleWorker для базового спектра
+        self._worker = _SingleWorker(self, self._ffi, self._lib, config)
         self._worker.finished_sig.connect(self._on_worker_finished)
         self._worker.start()
         self.started.emit()
@@ -368,41 +375,58 @@ class HackRFLibSource(SourceBackend):
         if not self.is_running():
             return
         
+        print("Backend: stop() called")
         self.status.emit("Остановка...")
         
         if self._multi_mode:
             # Останавливаем библиотеку
             try:
+                print("Backend: stopping multi-mode library...")
                 self._lib.hq_stop()
             except Exception as e:
                 print(f"Error stopping library: {e}")
             
             # Останавливаем worker
             if self._multi_worker:
-                self._multi_worker.stop()
-                self._multi_worker.join(timeout=2.0)
-                self._multi_worker = None
-            
-            # ИСПРАВЛЕНИЕ: Закрываем все устройства при остановке
-            try:
-                self._lib.hq_close_all()
-            except Exception as e:
-                print(f"Error closing devices: {e}")
+                try:
+                    print("Backend: stopping multi-worker...")
+                    self._multi_worker.stop()
+                    self._multi_worker.join(timeout=2.0)
+                    self._multi_worker = None
+                except Exception as e:
+                    print(f"Error stopping multi-worker: {e}")
         else:
             # Single mode
             try:
+                print("Backend: stopping single-mode library...")
                 self._lib.hq_stop()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Error stopping single-mode library: {e}")
             
             if self._worker:
-                self._worker.ask_stop()
-                self._worker.join(timeout=3.0)
-                self._worker = None
+                try:
+                    print("Backend: stopping single-worker...")
+                    self._worker.stop()
+                    self._worker.join(timeout=3.0)
+                    self._worker = None
+                except Exception as e:
+                    print(f"Error stopping single-worker: {e}")
+        
+        # Закрываем устройства
+        try:
+            if self._multi_mode:
+                print("Backend: closing all devices...")
+                self._lib.hq_close_all()
+            else:
+                print("Backend: closing single device...")
+                self._lib.hq_close_all()  # Используем hq_close_all даже для одного устройства
+        except Exception as e:
+            print(f"Error closing devices: {e}")
         
         # Сбрасываем флаг запуска
         self._running = False
         
+        print("Backend: stop() completed")
         self.finished.emit(0)
         self.status.emit("Остановлено")
 
@@ -442,6 +466,153 @@ class HackRFLibSource(SourceBackend):
 
 # Исправленная версия _MultiWorker для backend.py
 # Заменить класс _MultiWorker целиком
+
+class _SingleWorker(QtCore.QObject, threading.Thread):
+    """Worker для single-SDR режима - ТОЛЬКО базовый спектр."""
+    
+    finished_sig = QtCore.pyqtSignal(int, str)
+
+    def __init__(self, parent: HackRFLibSource, ffi, lib, config: SweepConfig):
+        QtCore.QObject.__init__(self)
+        threading.Thread.__init__(self, daemon=True)
+        
+        self._parent = parent
+        self._ffi = ffi
+        self._lib = lib
+        self._config = config
+        self._running = True
+        
+        # Настраиваем диапазон
+        self._freq_start = config.freq_start_hz
+        self._freq_end = config.freq_end_hz
+        self._bin_hz = config.bin_hz
+        
+        # Счетчики для отладки
+        self._spectrum_updates = 0
+        
+        # Создаем assembler для сборки полного спектра
+        self._assembler = _SweepAssembler()
+        self._assembler.configure(config)
+        
+        # В multi-device API нет callback'ов, будем читать данные через hq_get_master_spectrum
+        self._stop_ev = threading.Event()
+        
+    def stop(self):
+        """Останавливает SingleWorker."""
+        print("SingleWorker: stop() called")
+        self._running = False
+        self._stop_ev.set()
+        
+        # Ждем завершения потока
+        if self.is_alive():
+            print("SingleWorker: waiting for thread to finish...")
+            self.join(timeout=2.0)  # Ждем максимум 2 секунды
+            if self.is_alive():
+                print("SingleWorker: thread did not finish, forcing...")
+            else:
+                print("SingleWorker: thread finished gracefully")
+        
+    def run(self):
+        """Worker для single-SDR режима - ТОЛЬКО базовый спектр."""
+        print("SingleWorker: Started (spectrum only)")
+        
+        try:
+            # Используем multi-device API даже для одного устройства
+            r = self._lib.hq_open_all(1)  # Открываем 1 устройство
+            if r != 0:
+                print(f"SingleWorker: Failed to open device ({r})")
+                self.finished_sig.emit(1, f"Failed to open device ({r})")
+                return
+
+            # Конфигурируем с multi-device API
+            cfg = self._config
+            self._lib.hq_config_set_rates(12000000, 8000000)  # 12 MSPS, 8 MHz BB filter
+            self._lib.hq_config_set_gains(cfg.lna_db, cfg.vga_db, cfg.amp_on)
+            
+            # Ограничиваем диапазон частот
+            start_hz = max(cfg.freq_start_hz, 1000000)     # Минимум 1 МГц
+            stop_hz = min(cfg.freq_end_hz, 6000000000)      # Максимум 6 ГГц
+            step_hz = max(cfg.bin_hz, 100000)               # Минимум 100 кГц шаг
+            
+            print(f"SingleWorker: Configuring frequency range: {start_hz/1e6:.1f} - {stop_hz/1e6:.1f} MHz, step {step_hz/1e6:.3f} MHz")
+            
+            self._lib.hq_config_set_freq_range(float(start_hz), float(stop_hz), float(step_hz))
+            self._lib.hq_config_set_dwell_time(2)  # 2 ms dwell time
+
+            # Запускаем
+            r = self._lib.hq_start()
+            if r != 0:
+                print(f"SingleWorker: Start failed ({r})")
+                self._lib.hq_close_all()
+                self.finished_sig.emit(3, f"Start failed ({r})")
+                return
+
+            print(f"SingleWorker: Configured for {int((cfg.freq_end_hz - cfg.freq_start_hz) / cfg.bin_hz)} points, {cfg.freq_start_hz/1e6:.1f}-{cfg.freq_end_hz/1e6:.1f} MHz")
+            
+            # Основной цикл - читаем данные через hq_get_master_spectrum
+            while self._running and not self._stop_ev.is_set():
+                try:
+                    # Читаем спектр от master SDR
+                    max_points = 10000  # Ограничиваем количество точек
+                    freqs_buf = self._ffi.new("double[]", max_points)
+                    powers_buf = self._ffi.new("float[]", max_points)
+                    
+                    r = self._lib.hq_get_master_spectrum(freqs_buf, powers_buf, max_points)
+                    if r > 0:
+                        # Копируем данные
+                        freqs = np.frombuffer(self._ffi.buffer(freqs_buf, r * 8), dtype=np.float64, count=r).copy()
+                        power = np.frombuffer(self._ffi.buffer(powers_buf, r * 4), dtype=np.float32, count=r).copy()
+                        
+                        # Проверяем валидность
+                        if not (np.all(np.isnan(power)) or np.all(power == 0)):
+                            # Отправляем сегмент
+                            bin_hz = int(self._config.bin_hz)
+                            sw = SweepLine(
+                                ts=None,
+                                f_low_hz=int(freqs[0]),
+                                f_high_hz=int(freqs[-1]),
+                                bin_hz=bin_hz,
+                                power_dbm=power
+                            )
+                            
+                            # Отладочная информация
+                            if self._spectrum_updates % 10 == 0:
+                                print(f"SingleWorker: emitting fullSweepReady: {len(power)} points, {freqs[0]/1e6:.1f}-{freqs[-1]/1e6:.1f} MHz")
+                            
+                            # Эмитим fullSweepReady для автопиков (вместо sweepLine)
+                            self._parent.fullSweepReady.emit(freqs, power)
+                            
+                            # Собираем полный проход через assembler
+                            result = self._assembler.add_segment(freqs, power, int(freqs[0]))
+                            if result is not None:
+                                full_freqs, full_power = result
+                                if self._spectrum_updates % 10 == 0:
+                                    print(f"SingleWorker: assembler result: {len(full_power)} points")
+                            
+                            # Обновляем счетчик
+                            self._spectrum_updates += 1
+                            if self._spectrum_updates % 10 == 0:
+                                print(f"SingleWorker: {self._spectrum_updates} spectrum updates, data range: {freqs[0]/1e6:.1f}-{freqs[-1]/1e6:.1f} MHz, power: {power.min():.1f} to {power.max():.1f} dBm")
+                    
+                    # Небольшая задержка между чтениями
+                    time.sleep(0.05)  # Увеличиваем частоту до 20 Hz
+                    
+                except Exception as e:
+                    print(f"SingleWorker data reading error: {e}")
+                    time.sleep(0.1)
+                    
+        except Exception as e:
+            print(f"SingleWorker exception: {e}")
+            self.finished_sig.emit(4, str(e))
+        finally:
+            try:
+                self._lib.hq_stop()
+                self._lib.hq_close_all()
+            except:
+                pass
+            print(f"SingleWorker: Stopped after {self._spectrum_updates} spectrum updates")
+            self.finished_sig.emit(0, "Stopped")
+
 
 class _MultiWorker(QtCore.QObject, threading.Thread):
     """Worker для multi-SDR режима с правильной обработкой широкополосных сигналов."""
