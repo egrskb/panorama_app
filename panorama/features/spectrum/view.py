@@ -896,11 +896,16 @@ class SpectrumView(QtWidgets.QWidget):
     # ---------- настройки ----------
     def restore_settings(self, settings, defaults: dict):
         d = (defaults or {}).get("spectrum", {})
+        # Поддерживаем оба формата дефолтов: *_mhz и freq_*_hz
+        start_default_mhz = float(d.get("start_mhz", (float(d.get("freq_start_hz", 50_000_000)) / 1e6)))
+        stop_default_mhz  = float(d.get("stop_mhz",  (float(d.get("freq_end_hz",   6_000_000_000)) / 1e6)))
+        bin_default_khz   = float(d.get("bin_khz",   (float(d.get("bin_hz",        200_000)) / 1e3)))
+
         settings.beginGroup("spectrum")
         try:
-            self.start_mhz.setValue(float(settings.value("start_mhz", d.get("start_mhz", 2400.0))))
-            self.stop_mhz.setValue(float(settings.value("stop_mhz", d.get("stop_mhz", 2483.5))))
-            self.bin_khz.setValue(float(settings.value("bin_khz", d.get("bin_khz", 200.0))))
+            self.start_mhz.setValue(float(settings.value("start_mhz", start_default_mhz)))
+            self.stop_mhz.setValue(float(settings.value("stop_mhz",  stop_default_mhz)))
+            self.bin_khz.setValue(float(settings.value("bin_khz",   bin_default_khz)))
             self.lna_db.setValue(int(settings.value("lna_db", d.get("lna_db", 24))))
             self.vga_db.setValue(int(settings.value("vga_db", d.get("vga_db", 20))))
             self.amp_on.setChecked(str(settings.value("amp_on", d.get("amp_on", False))).lower() in ("1","true","yes"))
