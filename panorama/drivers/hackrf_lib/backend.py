@@ -303,7 +303,7 @@ class HackRFLibSource(SourceBackend):
 
     def is_running(self) -> bool:
         """Check if the worker thread is active."""
-        return self._running and self._worker is not None and self._worker.isRunning()
+        return self._running and self._worker is not None and self._worker.is_alive()
 
     def start(self, config: SweepConfig) -> None:
         """Start data acquisition with the given sweep configuration.
@@ -344,13 +344,10 @@ class HackRFLibSource(SourceBackend):
         print("⏹️ Остановка SDR...")
         self.status.emit("Остановка...")
         if self._worker:
-            try:
-                self._worker.stop()
-                # Wait for thread to exit gracefully
-                if not self._worker.wait(2000):  # 2 seconds
-                    print("Worker did not stop in time; forcing close")
-            finally:
-                self._worker = None
+            self._worker.stop()
+            # Wait for thread to exit gracefully
+            self._worker.join(timeout=2.0)
+            self._worker = None
         self._running = False
         self.finished.emit(0)
         self.status.emit("Остановлено")
@@ -388,16 +385,18 @@ class HackRFLibSource(SourceBackend):
         return None
 
 
-class _BaseWorker(QtCore.QThread):
+class _BaseWorker(QtCore.QObject, threading.Thread):
     """Base class for worker threads handling HackRF data acquisition.
 
-    Implemented as a QThread to ensure robust signal delivery across threads
-    and graceful shutdown coordinated with the Qt event loop.
+    Subclasses should implement the `run()` method to perform device
+    initialization, configuration, data reading and cleanup.  This base
+    class provides the common signal and stopping mechanism.
     """
     finished_sig = QtCore.pyqtSignal(int, str)
 
-    def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
-        super().__init__(parent)
+    def __init__(self) -> None:
+        QtCore.QObject.__init__(self)
+        threading.Thread.__init__(self, daemon=True)
         self._running = True
         self._stop_ev = threading.Event()
 
@@ -405,7 +404,6 @@ class _BaseWorker(QtCore.QThread):
         """Request the worker to stop."""
         self._running = False
         self._stop_ev.set()
-        self.requestInterruption()
 
 
 class _SingleWorker(_BaseWorker):
@@ -421,7 +419,7 @@ class _SingleWorker(_BaseWorker):
 
     def __init__(self, parent: HackRFLibSource, ffi: FFI, lib: Any, config: SweepConfig,
                  assembler: _SweepAssembler) -> None:
-        super().__init__(parent)
+        super().__init__()
         self._parent = parent
         self._ffi = ffi
         self._lib = lib
@@ -429,11 +427,7 @@ class _SingleWorker(_BaseWorker):
         self._assembler = assembler
         # counters for logging
         self._spectrum_updates = 0
-        self._segment_emit_decim = 5
-        self._segment_emit_count = 0
-        # Throttle full sweep emissions to avoid UI overload
-        self._emit_interval_s = 0.25  # max ~4 Hz
-        self._last_emit_ts = 0.0
+
 
     def run(self) -> None:
         code = 0
@@ -485,8 +479,8 @@ class _SingleWorker(_BaseWorker):
             freqs_buf = self._ffi.new("double[]", max_points)
             powers_buf = self._ffi.new("float[]", max_points)
             last_log_time = time.time()
-            self._last_emit_ts = time.time()
-            while self._running and not self._stop_ev.is_set() and not self.isInterruptionRequested():
+
+            while self._running and not self._stop_ev.is_set():
                 # Read spectrum; blocks until at least one segment is available
                 n = self._lib.hq_get_master_spectrum(freqs_buf, powers_buf, max_points)
                 if n > 0:
@@ -494,8 +488,8 @@ class _SingleWorker(_BaseWorker):
                     power = np.frombuffer(self._ffi.buffer(powers_buf, n * 4), dtype=np.float32, count=n).copy()
                     # Discard NaNs or zeroed outputs
                     if not (np.all(np.isnan(power)) or np.all(power == 0)):
-                        # Do not emit raw segments as full sweeps; only emit
-                        # assembled full sweeps below to avoid overloading the UI.
+                        # Emit the raw segment as a full sweep update for quick UI refresh
+                        self._parent.fullSweepReady.emit(freqs, power)
                         self._spectrum_updates += 1
                         # Assemble into a full sweep
                         result = self._assembler.add_segment(freqs, power, int(freqs[0]))
@@ -546,7 +540,7 @@ class _MultiWorker(_BaseWorker):
 
     def __init__(self, parent: HackRFLibSource, ffi: FFI, lib: Any, config: SweepConfig,
                  num_devices: int, assembler: _SweepAssembler) -> None:
-        super().__init__(parent)
+        super().__init__()
         self._parent = parent
         self._ffi = ffi
         self._lib = lib
@@ -556,11 +550,7 @@ class _MultiWorker(_BaseWorker):
         # Logging counters
         self._spectrum_updates = 0
         self._watchlist_updates = 0
-        self._segment_emit_decim = 5
-        self._segment_emit_count = 0
-        # Throttle full sweep emissions to avoid UI overload
-        self._emit_interval_s = 0.25  # max ~4 Hz
-        self._last_emit_ts = 0.0
+
 
     def run(self) -> None:
         code = 0
@@ -616,15 +606,14 @@ class _MultiWorker(_BaseWorker):
             last_log_time = time.time()
             self._last_emit_ts = time.time()
             last_watch_time = 0.0
-            while self._running and not self._stop_ev.is_set() and not self.isInterruptionRequested():
+            while self._running and not self._stop_ev.is_set():
                 # 1. Master spectrum
                 n = self._lib.hq_get_master_spectrum(freqs_buf, powers_buf, max_points)
                 if n > 0:
                     freqs = np.frombuffer(self._ffi.buffer(freqs_buf, n * 8), dtype=np.float64, count=n).copy()
                     power = np.frombuffer(self._ffi.buffer(powers_buf, n * 4), dtype=np.float32, count=n).copy()
                     if not np.all(np.isnan(power)):
-                        # Do not emit raw segments as full sweeps; only emit
-                        # assembled full sweeps below to avoid overloading the UI.
+                        self._parent.fullSweepReady.emit(freqs, power)
                         self._spectrum_updates += 1
                         # Assemble full sweep
                         result = self._assembler.add_segment(freqs, power, int(freqs[0]))
