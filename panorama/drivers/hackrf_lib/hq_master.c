@@ -18,6 +18,15 @@
 #include <sys/time.h>
 #include <inttypes.h>
 
+// Runtime debug switch. Set environment variable HQ_DEBUG=1 to enable logs.
+static int hq_debug_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* env = getenv("HQ_DEBUG");
+        enabled = (env && *env) ? 1 : 0;
+    }
+    return enabled;
+}
 #ifndef BLOCKS_PER_TRANSFER
 #define BLOCKS_PER_TRANSFER 16
 #endif
@@ -423,18 +432,18 @@ static void* master_thread_fn(void* arg) {
                             max_power = d->powers[i];
                         }
                     }
-#ifdef HQ_DEBUG
-                    printf("Master: Update #%d, max power: %.1f dBm\n",
-                           update_count, max_power);
-#endif
+                    if (hq_debug_enabled()) {
+                        printf("Master: Update #%d, max power: %.1f dBm\n",
+                               update_count, max_power);
+                    }
                 }
             } else {
                 no_data_count++;
                 // Если долго нет данных, логируем предупреждение
                 if (no_data_count % 50 == 0) {  // Каждые 5 секунд
-#ifdef HQ_DEBUG
-                    printf("Master: Warning - no data for %d cycles\n", no_data_count);
-#endif
+                    if (hq_debug_enabled()) {
+                        printf("Master: Warning - no data for %d cycles\n", no_data_count);
+                    }
                 }
             }
         }
