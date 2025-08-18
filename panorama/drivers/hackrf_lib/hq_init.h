@@ -61,4 +61,7 @@ int calibrate_dc_offset(hackrf_device* dev, int16_t* i_offset, int16_t* q_offset
 void hq_update_spectrum(double* freqs, float* powers, int n_points);
 int hq_get_spectrum(double* freqs, float* powers, int max_points);
 
+// Глобальный мьютекс для потокобезопасного планировщика FFTW
+extern pthread_mutex_t g_fftw_planner_mutex;
+
 #endif // HQ_INIT_H

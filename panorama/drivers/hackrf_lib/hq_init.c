@@ -14,6 +14,7 @@
 #include <stdarg.h>
 #include <math.h>
 #include <errno.h>
+#include <fftw3.h>
 
 /* ===================== Глобалы ===================== */
 
@@ -33,6 +34,10 @@ static float  g_spectrum_powers[MAX_SPECTRUM_POINTS];
 static int    g_spectrum_points = 0;
 static _Atomic bool g_spectrum_ready = false;
 static pthread_mutex_t g_spectrum_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// FFTW planner is not thread-safe by default for plan creation/destruction.
+// Use a global mutex to serialize all fftwf_plan_* and fftwf_destroy_plan calls.
+pthread_mutex_t g_fftw_planner_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* ===================== Вспомогалочки ===================== */
 
