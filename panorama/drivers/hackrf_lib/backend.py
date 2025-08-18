@@ -431,6 +431,9 @@ class _SingleWorker(_BaseWorker):
         self._spectrum_updates = 0
         self._segment_emit_decim = 5
         self._segment_emit_count = 0
+        # Throttle full sweep emissions to avoid UI overload
+        self._emit_interval_s = 0.25  # max ~4 Hz
+        self._last_emit_ts = 0.0
 
     def run(self) -> None:
         code = 0
@@ -482,6 +485,7 @@ class _SingleWorker(_BaseWorker):
             freqs_buf = self._ffi.new("double[]", max_points)
             powers_buf = self._ffi.new("float[]", max_points)
             last_log_time = time.time()
+            self._last_emit_ts = time.time()
             while self._running and not self._stop_ev.is_set() and not self.isInterruptionRequested():
                 # Read spectrum; blocks until at least one segment is available
                 n = self._lib.hq_get_master_spectrum(freqs_buf, powers_buf, max_points)
@@ -490,16 +494,17 @@ class _SingleWorker(_BaseWorker):
                     power = np.frombuffer(self._ffi.buffer(powers_buf, n * 4), dtype=np.float32, count=n).copy()
                     # Discard NaNs or zeroed outputs
                     if not (np.all(np.isnan(power)) or np.all(power == 0)):
-                        # Throttle raw segment emissions to reduce UI load
-                        self._segment_emit_count += 1
-                        if (self._segment_emit_count % self._segment_emit_decim) == 0:
-                            self._parent.fullSweepReady.emit(freqs, power)
+                        # Do not emit raw segments as full sweeps; only emit
+                        # assembled full sweeps below to avoid overloading the UI.
                         self._spectrum_updates += 1
                         # Assemble into a full sweep
                         result = self._assembler.add_segment(freqs, power, int(freqs[0]))
                         if result is not None:
-                            full_freqs, full_power = result
-                            self._parent.fullSweepReady.emit(full_freqs, full_power)
+                            now = time.time()
+                            if now - self._last_emit_ts >= self._emit_interval_s:
+                                full_freqs, full_power = result
+                                self._parent.fullSweepReady.emit(full_freqs, full_power)
+                                self._last_emit_ts = now
                         # Periodic logging
                         if time.time() - last_log_time > 5.0:
                             print(
@@ -509,7 +514,7 @@ class _SingleWorker(_BaseWorker):
                             last_log_time = time.time()
                 # Small delay to limit CPU usage
                 # Use small sleep to reduce CPU without impacting latency
-                time.sleep(0.02)
+                time.sleep(0.04)
         except Exception as e:
             code, msg = 99, str(e)
         finally:
@@ -553,6 +558,9 @@ class _MultiWorker(_BaseWorker):
         self._watchlist_updates = 0
         self._segment_emit_decim = 5
         self._segment_emit_count = 0
+        # Throttle full sweep emissions to avoid UI overload
+        self._emit_interval_s = 0.25  # max ~4 Hz
+        self._last_emit_ts = 0.0
 
     def run(self) -> None:
         code = 0
@@ -606,6 +614,7 @@ class _MultiWorker(_BaseWorker):
             peaks_buf = self._ffi.new("Peak[100]")
             watch_buf = self._ffi.new("WatchItem[100]")
             last_log_time = time.time()
+            self._last_emit_ts = time.time()
             last_watch_time = 0.0
             while self._running and not self._stop_ev.is_set() and not self.isInterruptionRequested():
                 # 1. Master spectrum
@@ -614,16 +623,17 @@ class _MultiWorker(_BaseWorker):
                     freqs = np.frombuffer(self._ffi.buffer(freqs_buf, n * 8), dtype=np.float64, count=n).copy()
                     power = np.frombuffer(self._ffi.buffer(powers_buf, n * 4), dtype=np.float32, count=n).copy()
                     if not np.all(np.isnan(power)):
-                        # Throttle raw segment emissions to reduce UI load
-                        self._segment_emit_count += 1
-                        if (self._segment_emit_count % self._segment_emit_decim) == 0:
-                            self._parent.fullSweepReady.emit(freqs, power)
+                        # Do not emit raw segments as full sweeps; only emit
+                        # assembled full sweeps below to avoid overloading the UI.
                         self._spectrum_updates += 1
                         # Assemble full sweep
                         result = self._assembler.add_segment(freqs, power, int(freqs[0]))
                         if result is not None:
-                            full_freqs, full_power = result
-                            self._parent.fullSweepReady.emit(full_freqs, full_power)
+                            now = time.time()
+                            if now - self._last_emit_ts >= self._emit_interval_s:
+                                full_freqs, full_power = result
+                                self._parent.fullSweepReady.emit(full_freqs, full_power)
+                                self._last_emit_ts = now
                 # 2. Check peaks every ~100 ms to decide if watchlist should be queried
                 if time.time() - last_watch_time > 0.1:
                     last_watch_time = time.time()
@@ -666,7 +676,7 @@ class _MultiWorker(_BaseWorker):
                         )
                     last_log_time = time.time()
                 # Avoid busy loop
-                time.sleep(0.02)
+                time.sleep(0.04)
         except Exception as e:
             code, msg = 99, str(e)
         finally:

@@ -38,6 +38,10 @@
 #define TUNE_STEP_HZ 20000000u
 #define OFFSET_HZ     7500000u
 
+#ifndef MAX_SPECTRUM_POINTS
+#define MAX_SPECTRUM_POINTS 50000
+#endif
+
 // Внешние функции
 extern void hq_on_peak_detected(SdrCtx* ctx, double f_hz, float dbm);
 
@@ -185,8 +189,6 @@ static int master_rx_cb(hackrf_transfer* t) {
                 total_correction
             );
         }
-
-        // const double bw = d->bin_w;  // Unused variable
 
         // Секция A: [frequency, frequency + Fs/4)
         {
@@ -418,8 +420,8 @@ static void* master_thread_fn(void* arg) {
                 update_count++;
                 no_data_count = 0;  // Сбрасываем счетчик
                 
-                // Логируем каждые 10 обновлений (1 секунда)
-                if (update_count % 10 == 0) {
+                // Логируем каждые 20 обновлений (~2 секунды)
+                if (update_count % 20 == 0) {
                     // Находим максимум для диагностики
                     float max_power = -200.0f;
                     for (size_t i = 0; i < d->n_points; i++) {
