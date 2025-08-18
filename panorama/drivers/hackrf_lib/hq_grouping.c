@@ -198,7 +198,24 @@ void add_peak(double f_hz, float rssi_dbm) {
 
 void regroup_frequencies(double delta_hz) {
     if (!g_peaks_queue) return;
-    
+
+    // Prevent runaway growth of the peak queue
+    static int overflow_logged = 0;
+    size_t qsize = peak_queue_size(g_peaks_queue);
+    if (qsize > 3000) {
+        size_t drop = qsize - 3000;
+        Peak dump;
+        for (size_t i = 0; i < drop; i++) {
+            if (peak_queue_pop(g_peaks_queue, &dump) != 0) break;
+        }
+        if (!overflow_logged) {
+            printf("Grouping: Warning - dropping %zu stale peaks\n", drop);
+            overflow_logged = 1;
+        }
+    } else {
+        overflow_logged = 0;
+    }
+
     // Собираем все пики из очереди с ограничением
     Peak peaks[1000];
     int n_peaks = 0;
@@ -388,6 +405,16 @@ void regroup_frequencies(double delta_hz) {
     g_watchlist_count = write_idx;
     
     pthread_mutex_unlock(&g_watchlist_mutex);
+
+    // Trim leftover peaks if queue is still bloated
+    size_t remaining = peak_queue_size(g_peaks_queue);
+    if (remaining > 3000) {
+        size_t drop = remaining - 3000;
+        Peak dump;
+        for (size_t i = 0; i < drop; i++) {
+            if (peak_queue_pop(g_peaks_queue, &dump) != 0) break;
+        }
+    }
 }
 
 // ========== Функция обработки спектра от мастера ==========

@@ -423,14 +423,18 @@ static void* master_thread_fn(void* arg) {
                             max_power = d->powers[i];
                         }
                     }
-                    printf("Master: Update #%d, max power: %.1f dBm\n", 
+#ifdef HQ_DEBUG
+                    printf("Master: Update #%d, max power: %.1f dBm\n",
                            update_count, max_power);
+#endif
                 }
             } else {
                 no_data_count++;
                 // Если долго нет данных, логируем предупреждение
                 if (no_data_count % 50 == 0) {  // Каждые 5 секунд
+#ifdef HQ_DEBUG
                     printf("Master: Warning - no data for %d cycles\n", no_data_count);
+#endif
                 }
             }
         }

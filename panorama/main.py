@@ -476,22 +476,13 @@ class MainWindow(QtWidgets.QMainWindow):
             min_width = self.detector_tab.min_width.value()
             min_sweeps = self.detector_tab.min_sweeps.value()
             timeout = self.detector_tab.signal_timeout.value()
-            
-            # Передаем параметры в C библиотеку через FFI
-            if hasattr(self._lib_source, '_lib'):
-                try:
-                    # Добавить эту функцию в cdef библиотеки
-                    self._lib_source._ffi.cdef("""
-                        void hq_set_detector_params(float threshold_offset_db, 
-                                                   int min_width_bins,
-                                                   int min_sweeps, 
-                                                   float timeout_sec);
-                    """)
-                    self._lib_source._lib.hq_set_detector_params(
-                        threshold_offset, min_width, min_sweeps, timeout
-                    )
-                except:
-                    pass
+
+            try:
+                self._lib_source.set_detector_params(
+                    threshold_offset, min_width, min_sweeps, timeout
+                )
+            except Exception as e:
+                self.log.log(f"Failed to set detector params: {e}", level="warning")
         
         self._detector_active = True
         self.statusBar().showMessage("🎯 Детектор запущен, автопики заблокированы", 5000)
@@ -567,6 +558,9 @@ class MainWindow(QtWidgets.QMainWindow):
             # При hackrf_sweep отключаем карту и предупреждаем в детекторе
             self.tabs.setTabEnabled(3, False)  # Карта
             self.tabs.setTabToolTip(3, "Требуется libhackrf для трилатерации")
+        else:
+            self.tabs.setTabEnabled(3, True)
+            self.tabs.setTabToolTip(3, "")
             
     def _update_multi_sdr_features(self):
         """Обновляет доступность функций, требующих multi-SDR."""

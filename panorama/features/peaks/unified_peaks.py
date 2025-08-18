@@ -123,9 +123,11 @@ class AutoPeaksTableModel(QAbstractTableModel):
         super().__init__(parent)
         self.engine = engine
         self.engine.changed.connect(self._on_changed)
+        # Track current row count for efficient updates
+        self._row_count = self.engine.size()
 
     def rowCount(self, parent=QModelIndex()):
-        return self.engine.size()
+        return self._row_count
 
     def columnCount(self, parent=QModelIndex()):
         return len(self.COLS)
@@ -163,10 +165,30 @@ class AutoPeaksTableModel(QAbstractTableModel):
         return None
 
     def _on_changed(self, rows: List[int]):
+        new_size = self.engine.size()
+        old_count = self._row_count
+
+        if not rows and new_size == 0:
+            self.beginResetModel()
+            self._row_count = 0
+            self.endResetModel()
+            return
+
+        if new_size < old_count:
+            self.beginResetModel()
+            self._row_count = new_size
+            self.endResetModel()
+            old_count = new_size
+        elif new_size > old_count:
+            self.beginInsertRows(QModelIndex(), old_count, new_size - 1)
+            self._row_count = new_size
+            self.endInsertRows()
+
         for r in rows:
-            tl = self.index(r, 0)
-            br = self.index(r, self.columnCount()-1)
-            self.dataChanged.emit(tl, br, [QtCore.Qt.DisplayRole, QtCore.Qt.UserRole])
+            if r < old_count:
+                tl = self.index(r, 0)
+                br = self.index(r, self.columnCount()-1)
+                self.dataChanged.emit(tl, br, [QtCore.Qt.DisplayRole, QtCore.Qt.UserRole])
 
 
 class AutoPeaksFilterProxy(QtCore.QSortFilterProxyModel):
