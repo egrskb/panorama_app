@@ -176,6 +176,12 @@ static void update_baseline(const float* spectrum, int n_points) {
 void add_peak(double f_hz, float rssi_dbm) {
     if (!g_peaks_queue) return;
     
+    // Проверяем размер очереди перед добавлением
+    size_t queue_size = peak_queue_size(g_peaks_queue);
+    if (queue_size > 3000) {  // Если очередь почти полная, пропускаем
+        return;
+    }
+    
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     
@@ -193,20 +199,29 @@ void add_peak(double f_hz, float rssi_dbm) {
 void regroup_frequencies(double delta_hz) {
     if (!g_peaks_queue) return;
     
-    // Собираем все пики из очереди
+    // Собираем все пики из очереди с ограничением
     Peak peaks[1000];
     int n_peaks = 0;
     
     Peak p;
-    while (peak_queue_pop(g_peaks_queue, &p) == 0 && n_peaks < 1000) {
+    int max_pops = 1000;  // Ограничиваем количество извлекаемых пиков
+    int pop_count = 0;
+    
+    while (peak_queue_pop(g_peaks_queue, &p) == 0 && n_peaks < 1000 && pop_count < max_pops) {
         peaks[n_peaks++] = p;
+        pop_count++;
     }
     
     if (n_peaks == 0) return;
     
-    // Сортируем по частоте
-    for (int i = 0; i < n_peaks - 1; i++) {
-        for (int j = 0; j < n_peaks - i - 1; j++) {
+    // Если извлекли слишком много пиков, логируем предупреждение
+    if (pop_count >= max_pops) {
+        printf("Grouping: Warning - too many peaks in queue, processing limited batch\n");
+    }
+    
+    // Сортируем по частоте (с ограничением на время сортировки)
+    for (int i = 0; i < n_peaks - 1 && i < 100; i++) {  // Ограничиваем сортировку
+        for (int j = 0; j < n_peaks - i - 1 && j < 100; j++) {
             if (peaks[j].f_hz > peaks[j+1].f_hz) {
                 Peak tmp = peaks[j];
                 peaks[j] = peaks[j+1];
@@ -223,7 +238,10 @@ void regroup_frequencies(double delta_hz) {
     
     // ИСПРАВЛЕНИЕ: Группируем пики в широкополосные сигналы
     int i = 0;
-    while (i < n_peaks) {
+    int max_groups = 100;  // Ограничиваем количество групп
+    int group_count = 0;
+    
+    while (i < n_peaks && group_count < max_groups) {
         // Начало группы
         double group_start_hz = peaks[i].f_hz;
         double group_end_hz = peaks[i].f_hz;
@@ -234,7 +252,9 @@ void regroup_frequencies(double delta_hz) {
         
         // ВАЖНО: Расширяем группу, собирая все близкие пики
         int j = i + 1;
-        while (j < n_peaks) {
+        int max_group_size = 50;  // Ограничиваем размер группы
+        
+        while (j < n_peaks && group_size < max_group_size) {
             // Проверяем, входит ли следующий пик в группу
             double gap = peaks[j].f_hz - group_end_hz;
             
@@ -266,7 +286,8 @@ void regroup_frequencies(double delta_hz) {
         // Вычисляем центр группы (взвешенный по мощности)
         double weighted_center = 0;
         double weight_sum = 0;
-        for (int k = i; k < j; k++) {
+        int max_weight_calc = 20;  // Ограничиваем вычисления весов
+        for (int k = i; k < j && (k - i) < max_weight_calc; k++) {
             double weight = pow(10, peaks[k].rssi_dbm / 10.0);
             weighted_center += peaks[k].f_hz * weight;
             weight_sum += weight;
@@ -275,7 +296,8 @@ void regroup_frequencies(double delta_hz) {
         
         // Ищем существующую запись в watchlist
         int found_idx = -1;
-        for (size_t k = 0; k < g_watchlist_count; k++) {
+        size_t max_watchlist_search = 50;  // Ограничиваем поиск в watchlist
+        for (size_t k = 0; k < g_watchlist_count && k < max_watchlist_search; k++) {
             // Проверяем перекрытие диапазонов
             double existing_start = g_watchlist[k].f_center_hz - g_watchlist[k].bw_hz / 2;
             double existing_end = g_watchlist[k].f_center_hz + g_watchlist[k].bw_hz / 2;
@@ -329,13 +351,21 @@ void regroup_frequencies(double delta_hz) {
         
         // Переходим к следующей группе
         i = j;
+        group_count++;
+    }
+    
+    // Если достигли лимита групп, логируем предупреждение
+    if (group_count >= max_groups) {
+        printf("Grouping: Warning - too many groups, processing limited\n");
     }
     
     // Удаляем устаревшие записи
     size_t write_idx = 0;
     uint64_t timeout_ns = (uint64_t)(g_signal_timeout_sec * 1e9);
+    int max_cleanup_iterations = 100;  // Ограничиваем количество итераций очистки
+    int cleanup_count = 0;
     
-    for (size_t i = 0; i < g_watchlist_count; i++) {
+    for (size_t i = 0; i < g_watchlist_count && cleanup_count < max_cleanup_iterations; i++) {
         if ((now_ns - g_watchlist[i].last_ns) < timeout_ns) {
             if (write_idx != i) {
                 g_watchlist[write_idx] = g_watchlist[i];
@@ -347,6 +377,12 @@ void regroup_frequencies(double delta_hz) {
                 printf("Lost wideband signal: %.3f MHz\n", g_watchlist[i].f_center_hz/1e6);
             }
         }
+        cleanup_count++;
+    }
+    
+    // Если достигли лимита итераций очистки, логируем предупреждение
+    if (cleanup_count >= max_cleanup_iterations) {
+        printf("Grouping: Warning - cleanup limited, some items may remain\n");
     }
     
     g_watchlist_count = write_idx;

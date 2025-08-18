@@ -383,36 +383,67 @@ static void* master_thread_fn(void* arg) {
     gettimeofday(&t_prev, NULL);
     
     int update_count = 0;
+    int no_data_count = 0;  // Счетчик циклов без данных
 
     while (ctx->running && !d->stop_requested && hackrf_is_streaming(ctx->dev) == HACKRF_TRUE) {
         usleep(100000); // 100 ms
+        
+        // Дополнительная проверка состояния устройства
+        if (hackrf_is_streaming(ctx->dev) != HACKRF_TRUE) {
+            printf("Master: Device stopped streaming, breaking loop\n");
+            break;
+        }
         
         gettimeofday(&t_now, NULL);
         double dt = (t_now.tv_sec - t_prev.tv_sec) + 1e-6 * (t_now.tv_usec - t_prev.tv_usec);
         
         if (dt >= 0.10) { // Каждые 100 ms
-            // Обновляем глобальный спектр
-            hq_update_spectrum(d->freqs, d->powers, (int)d->n_points);
-            t_prev = t_now;
-            update_count++;
-            
-            // Логируем каждые 10 обновлений (1 секунда)
-            if (update_count % 10 == 0) {
-                // Находим максимум для диагностики
-                float max_power = -200.0f;
-                for (size_t i = 0; i < d->n_points; i++) {
-                    if (d->powers[i] > max_power) {
-                        max_power = d->powers[i];
-                    }
+            // Проверяем, есть ли данные для обновления
+            bool has_data = false;
+            for (size_t i = 0; i < d->n_points; i++) {
+                if (d->counts[i] > 0) {
+                    has_data = true;
+                    break;
                 }
-                printf("Master: Update #%d, max power: %.1f dBm\n", 
-                       update_count, max_power);
+            }
+            
+            if (has_data) {
+                // Обновляем глобальный спектр
+                hq_update_spectrum(d->freqs, d->powers, (int)d->n_points);
+                t_prev = t_now;
+                update_count++;
+                no_data_count = 0;  // Сбрасываем счетчик
+                
+                // Логируем каждые 10 обновлений (1 секунда)
+                if (update_count % 10 == 0) {
+                    // Находим максимум для диагностики
+                    float max_power = -200.0f;
+                    for (size_t i = 0; i < d->n_points; i++) {
+                        if (d->powers[i] > max_power) {
+                            max_power = d->powers[i];
+                        }
+                    }
+                    printf("Master: Update #%d, max power: %.1f dBm\n", 
+                           update_count, max_power);
+                }
+            } else {
+                no_data_count++;
+                // Если долго нет данных, логируем предупреждение
+                if (no_data_count % 50 == 0) {  // Каждые 5 секунд
+                    printf("Master: Warning - no data for %d cycles\n", no_data_count);
+                }
             }
         }
         
         // Проверяем флаг остановки
         if (!ctx->running) {
             d->stop_requested = true;
+            break;
+        }
+        
+        // Защита от зависания - если слишком долго нет данных, выходим
+        if (no_data_count > 200) {  // 20 секунд без данных
+            printf("Master: Timeout - no data for too long, stopping\n");
             break;
         }
     }

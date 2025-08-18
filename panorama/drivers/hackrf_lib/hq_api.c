@@ -12,6 +12,8 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <sys/time.h>  // Для gettimeofday
 
 // Global state
 static SdrCtx g_devs[MAX_DEVICES];
@@ -66,8 +68,30 @@ static void* grouping_thread_fn(void* arg) {
         // Process peaks every 100ms
         usleep(100000);
         
-        // Regroup frequencies
-        regroup_frequencies(g_grouping_tolerance_hz);
+        // Regroup frequencies with timeout protection
+        struct timeval start_time, end_time;
+        gettimeofday(&start_time, NULL);
+        
+        // Устанавливаем таймаут для группировки
+        pthread_mutex_lock(&g_grouping_mutex);
+        if (g_grouping_running) {
+            pthread_mutex_unlock(&g_grouping_mutex);
+            
+            // Вызываем группировку
+            regroup_frequencies(g_grouping_tolerance_hz);
+            
+            // Проверяем время выполнения
+            gettimeofday(&end_time, NULL);
+            double execution_time = (end_time.tv_sec - start_time.tv_sec) + 
+                                  1e-6 * (end_time.tv_usec - start_time.tv_usec);
+            
+            // Если группировка заняла слишком много времени, логируем предупреждение
+            if (execution_time > 0.05) {  // Больше 50ms
+                printf("Grouping: Warning - slow execution: %.2f ms\n", execution_time * 1000);
+            }
+        } else {
+            pthread_mutex_unlock(&g_grouping_mutex);
+        }
     }
     
     printf("Grouping thread stopped\n");

@@ -1,9 +1,47 @@
-# panorama/drivers/hackrf_lib/backend.py
+"""
+Refactored HackRF backend with improved multi‑device support, peak detection
+and full sweep assembly.  This implementation merges the useful pieces of the
+original and proposed versions: it supports both single‑SDR and multi‑SDR
+modes, exposes tunable detector parameters, and reuses the sweep assembler
+to rebuild complete sweeps for downstream consumers (e.g. autopic tables).
+
+Key improvements and behaviours:
+
+* Unified entrypoint: the backend automatically uses multi‑SDR when more
+  than one device is requested.  A single worker thread handles data
+  acquisition to minimise contention inside the C library (FFTW is not
+  thread‑safe across multiple Python threads).
+* Safe library loading: the CFFI interface is declared once and then the
+  library is loaded from a set of candidate names.  If loading fails an
+  explicit RuntimeError is raised.
+* Device enumeration: `list_serials()` returns the list of attached HackRF
+  device serials without triggering unnecessary heavy initialisation of
+  the hackrf driver.  Multi‑SDR enumeration is followed by `hq_close_all()`
+  to ensure devices do not start streaming inadvertently.
+* Tunable detector: `set_detector_params()` accepts threshold, minimum
+  width, minimum sweeps and timeout and forwards these into the C library.
+* Sweep assembly: both single and multi workers use `_SweepAssembler` to
+  combine partial spectrum segments into a full sweep.  The assembled
+  sweep is emitted via `fullSweepReady` to allow the UI to update peak
+  tables and waterfalls.  Autopic tables rely on these assembled sweeps.
+* Peak handling and watchlist: in multi‑SDR mode the worker fetches
+  recent peaks and only queries the watchlist when peaks are present.
+  This prevents flooding the queue with stale entries and reduces CPU
+  overhead.  Wideband signals are forwarded as `SweepLine` instances via
+  `sweepLine.emit`.
+
+This file replaces previous iterations of `backend.py`.
+"""
+
 from __future__ import annotations
-import os, threading, time
+
+import os
+import threading
+import time
 from typing import Optional, List, Tuple, Dict, Any
-from PyQt5 import QtCore
+
 import numpy as np
+from PyQt5 import QtCore
 from cffi import FFI
 
 from panorama.drivers.base import SourceBackend, SweepConfig
@@ -11,84 +49,78 @@ from panorama.shared.parsing import SweepLine
 
 
 def _find_library() -> List[str]:
-    """Ищем библиотеку в разных местах."""
+    """Return a list of candidate library names for dlopen.
+
+    The search order is:
+    1. In the same directory as this file.
+    2. In the project root (two levels up).
+    3. Plain names (to search system paths).
+    """
     here = os.path.abspath(os.path.dirname(__file__))
-    
-    # Новые имена для multi-SDR версии
     names = ["libhackrf_multi.so", "libhackrf_multi.dylib", "hackrf_multi.dll"]
-    
-    # Старые имена для обратной совместимости
-    old_names = ["libhackrf_qsa.so", "libhackrf_qsa.dylib", "hackrf_qsa.dll"]
-    
-    candidates = []
-    
-    # Сначала ищем рядом с этим файлом
-    for n in names + old_names:
+    old = ["libhackrf_qsa.so", "libhackrf_qsa.dylib", "hackrf_qsa.dll"]
+    candidates: List[str] = []
+    for n in names + old:
         candidates.append(os.path.join(here, n))
-    
-    # Потом в корне проекта
     root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
-    for n in names + old_names:
+    for n in names + old:
         candidates.append(os.path.join(root, n))
-    
-    # И наконец просто имена для dlopen
-    candidates.extend(names + old_names)
-    
+    candidates.extend(names + old)
     return candidates
 
 
 class HackRFLibSource(SourceBackend):
-    """Источник через CFFI с поддержкой multi-SDR режима."""
-    
-    def __init__(self, lib_path: Optional[str] = None, serial_suffix: Optional[str] = None, parent=None):
-        super().__init__(parent)
-        
-        self._ffi = FFI()
-        
-        # Определяем интерфейс в зависимости от найденной библиотеки
-        self._multi_mode = False
-        self._lib = None
-        
-        # Пробуем загрузить библиотеку
-        for p in ([lib_path] if lib_path else _find_library()):
-            if not p:
-                continue
-            try:
-                # Проверяем тип библиотеки по имени
-                if 'multi' in p.lower():
-                    self._setup_multi_interface()
-                    self._multi_mode = True
-                else:
-                    self._setup_single_interface()
-                    self._multi_mode = False
-                
-                self._lib = self._ffi.dlopen(p)
-                print(f"Loaded library: {p} (multi-mode: {self._multi_mode})")
-                break
-            except Exception as e:
-                continue
-        
-        if self._lib is None:
-            raise RuntimeError(f"Не удалось загрузить библиотеку HackRF")
+    """HackRF backend using CFFI with optional multi‑SDR support.
 
-        self._serial_suffix = serial_suffix
-        self._worker: Optional[_Worker] = None
+    Depending on the number of requested devices (`set_num_devices`), the
+    backend operates either in single‑SDR or multi‑SDR mode.  A single worker
+    thread is used to avoid concurrent calls into the C library which relies
+    on FFTW.  Detector parameters can be tuned at runtime via
+    `set_detector_params`.  Full sweeps are assembled and emitted to the
+    frontend via the `fullSweepReady` signal.
+    """
+
+    def __init__(self, lib_path: Optional[str] = None, parent=None) -> None:
+        super().__init__(parent)
+        self._ffi = FFI()
+        # Define the C interface; these definitions apply to both single and
+        # multi‑SDR modes.  Functions unused in single mode are simply never
+        # invoked.
+        self._setup_cdefs()
+        self._lib = self._load_library(lib_path)
+        # Worker thread (single or multi).
+        self._worker: Optional[_BaseWorker] = None
+        # Sweep assembler shared across workers.
         self._assembler = _SweepAssembler()
-        
-        # Multi-SDR параметры
+        # Number of devices requested.  Default to one (single mode).
         self._num_devices = 1
-        self._multi_worker: Optional[_MultiWorker] = None
+        # Detector parameters (threshold offset in dB, minimum width bins,
+        # minimum sweeps, timeout in seconds).
+        self._detector_params: Dict[str, float | int] = {
+            'threshold_offset': 20.0,
+            'min_width': 3,
+            'min_sweeps': 3,
+            'timeout': 2.0,
+        }
+        # Running flag used to track whether a worker is active.
         self._running = False
-        
-    def set_num_devices(self, num: int):
-        """Устанавливает количество устройств для multi-SDR режима."""
-        self._num_devices = max(1, num)
-        print(f"Backend: установлено {self._num_devices} устройств")
-        
-    def _setup_multi_interface(self):
-        """Настройка интерфейса для multi-SDR версии."""
-        self._ffi.cdef(r"""
-            // Структуры данных для multi-SDR
+
+    # ------------------------------------------------------------------
+    # CFFI binding helpers
+
+    def _setup_cdefs(self) -> None:
+        """Define the C API signatures used by this backend.
+
+        When multiple instances of this backend are created within the same
+        process, CFFI may warn about duplicate declarations.  To avoid
+        warnings, we explicitly allow overriding existing declarations.
+        """
+        # The `override=True` argument prevents warnings about duplicate
+        # declarations when the backend is instantiated multiple times.
+        self._ffi.cdef(
+            r"""
+            typedef unsigned int uint32_t;
+            typedef unsigned long long uint64_t;
             typedef struct {
                 double f_center_hz;
                 double bw_hz;
@@ -96,918 +128,661 @@ class HackRFLibSource(SourceBackend):
                 uint64_t last_ns;
                 int hit_count;
             } WatchItem;
-            
             typedef struct {
                 double f_hz;
                 float rssi_dbm;
                 uint64_t last_ns;
             } Peak;
-            
             typedef struct {
                 int master_running;
                 int slave_running[2];
                 double retune_ms_avg;
                 int watch_items;
             } HqStatus;
-            
-            // Multi-SDR API
             int  hq_open_all(int num_expected);
             void hq_close_all(void);
-            
             int  hq_config_set_rates(uint32_t samp_rate_hz, uint32_t bb_bw_hz);
             int  hq_config_set_gains(uint32_t lna_db, uint32_t vga_db, bool amp_on);
-            
-            // Настройка диапазона частот
             int  hq_config_set_freq_range(double start_hz, double stop_hz, double step_hz);
             int  hq_config_set_dwell_time(uint32_t dwell_ms);
-            
-            // НОВОЕ: Настройка параметров детектора
             void hq_set_detector_params(float threshold_offset_db, int min_width_bins,
                                        int min_sweeps, float timeout_sec);
-            
             int  hq_start(void);
             void hq_stop(void);
-            
             int  hq_get_watchlist_snapshot(WatchItem* out, int max_items);
             int  hq_get_recent_peaks(Peak* out, int max_items);
-            
-            // Чтение непрерывного спектра от Master SDR
             int  hq_get_master_spectrum(double* freqs_hz, float* powers_dbm, int max_points);
-            
             void hq_set_grouping_tolerance_hz(double delta_hz);
             void hq_set_ema_alpha(float alpha);
-            
             int  hq_get_status(HqStatus* out);
-            
-            // Device enumeration
             int  hq_list_devices(char* serials[], int max_count);
             int  hq_get_device_count(void);
-        """)
-        
-    def _setup_single_interface(self):
-        """Настройка интерфейса для single-SDR версии (обратная совместимость)."""
-        self._ffi.cdef(r"""
-            typedef void (*hq_segment_cb)(const double*, const float*, int, double, uint64_t, uint64_t, void*);
-            const char* hq_last_error(void);
+            // Legacy single‑SDR API declarations removed to avoid conflicting
+            // definitions of hq_start()/hq_stop() that accept callback
+            // parameters.  The multi‑SDR API uses hq_start(void) and
+            // hq_stop(void) instead.
+        """,
+            override=True
+        )
 
-            int  hq_open(const char* serial_suffix);
-            int  hq_configure(double f_start_mhz, double f_stop_mhz,
-                              double requested_bin_hz, int lna_db, int vga_db, int amp_enable);
-            int  hq_start(hq_segment_cb cb, void* user);
-            int  hq_stop(void);
-            void hq_close(void);
+    def _load_library(self, lib_path: Optional[str]) -> Any:
+        """Attempt to load the HackRF library from a list of candidate paths."""
+        paths = [lib_path] if lib_path else _find_library()
+        for p in paths:
+            if not p:
+                continue
+            try:
+                lib = self._ffi.dlopen(p)
+                print(f"Loaded library: {p}")
+                return lib
+            except Exception:
+                continue
+        raise RuntimeError("Не удалось загрузить библиотеку HackRF")
 
-            int  hq_device_count(void);
-            int  hq_get_device_serial(int idx, char* buf, int buf_len);
+    # ------------------------------------------------------------------
+    # Public API methods
 
-            int  hq_load_calibration(const char* csv_path);
-            void hq_enable_calibration(int enable);
-            int  hq_calibration_loaded(void);
-        """)
+    def set_num_devices(self, num: int) -> None:
+        """Specify the number of devices to use (1 for single, >1 for multi).
 
-    # ---------- Общие методы ----------
-    
-    def set_num_devices(self, num: int):
-        """Устанавливает количество устройств для multi-SDR режима."""
+        When changing the number of devices while the backend is running, the
+        current worker will be stopped and restarted.  The number of devices
+        greater than 1 triggers multi‑SDR mode.  In multi mode, the library
+        will attempt to use exactly `num` devices; if fewer are available,
+        `start()` will emit an error.
+        """
         if num < 1 or num > 3:
-            raise ValueError("Поддерживается от 1 до 3 устройств")
+            raise ValueError("Number of devices must be between 1 and 3")
+        # Restart if running with a different configuration
+        restart = self._running and (self._num_devices != num)
         self._num_devices = num
-        
-    def set_detector_params(self, threshold_offset: float, min_width: int, 
-                            min_sweeps: int, timeout: float):
-        """Устанавливает параметры детектора в C библиотеке."""
-        if self._multi_mode and self._lib:
+        if restart:
+            self.stop()
+            # small delay to allow devices to settle
+            time.sleep(0.1)
+        mode = "Multi-SDR" if self._num_devices > 1 else "Single-SDR"
+        print(f"📡 Режим: {mode} ({self._num_devices} устройств)")
+
+    def set_detector_params(self, threshold_offset: float, min_width: int,
+                            min_sweeps: int, timeout: float) -> None:
+        """Update detector parameters for peak grouping.
+
+        These values are forwarded to the C library whenever the worker is
+        running.  They can safely be changed on the fly.
+        """
+        self._detector_params = {
+            'threshold_offset': threshold_offset,
+            'min_width': min_width,
+            'min_sweeps': min_sweeps,
+            'timeout': timeout,
+        }
+        # Apply immediately if running
+        if self._running and self._lib:
             try:
                 self._lib.hq_set_detector_params(
-                    threshold_offset, min_width, min_sweeps, timeout
+                    float(threshold_offset), int(min_width), int(min_sweeps), float(timeout)
                 )
-                print(f"Detector params set: +{threshold_offset:.1f}dB, "
-                      f"{min_width} bins, {min_sweeps} sweeps, {timeout:.1f}s")
+                print(
+                    f"Detector params updated: +{threshold_offset:.1f} dB, width {min_width} bins, "
+                    f"{min_sweeps} sweeps, timeout {timeout:.1f}s"
+                )
             except Exception as e:
                 print(f"Failed to set detector params: {e}")
-        
-    def is_multi_capable(self) -> bool:
-        """Проверяет, поддерживает ли библиотека multi-SDR режим."""
-        return self._multi_mode
-        
+
     def list_serials(self) -> List[str]:
-        """Список серийников устройств."""
-        if self._multi_mode:
-            # Multi-mode - используем новые функции
-            out: List[str] = []
-            try:
-                count = self._lib.hq_get_device_count()
-                if count > 0:
-                    # Создаем массив указателей на строки
-                    serials = self._ffi.new("char*[]", count)
-                    actual_count = self._lib.hq_list_devices(serials, count)
-                    
-                    for i in range(actual_count):
-                        if serials[i] != self._ffi.NULL:
-                            s = self._ffi.string(serials[i]).decode(errors="ignore")
-                            if s and s != "0000000000000000":
-                                out.append(s)
-                            # Освобождаем память
-                            try:
-                                import ctypes
-                                ctypes.CDLL("libc.so.6").free(serials[i])
-                            except Exception:
-                                pass  # Игнорируем ошибки освобождения памяти
-            except Exception as e:
-                print(f"Error listing devices in multi-mode: {e}")
+        """Return a list of detected HackRF serial numbers.
+
+        Device enumeration is attempted via the multi‑SDR API.  If that fails
+        (e.g. multi‑SDR library not loaded), the single‑SDR API is used as a
+        fallback.  As some operating systems require explicit initialisation
+        of the HackRF driver before devices are visible, this method will
+        try to initialise the driver via libhackrf before querying the list.
+        The driver is shut down immediately afterwards to avoid resource
+        leakage.
+        """
+        out: List[str] = []
+        if self._lib is None:
             return out
-        else:
-            # Single mode - используем старый метод
-            out: List[str] = []
+        # Optionally initialise the HackRF driver to populate device list
+        hackrf = None
+        try:
+            import ctypes
+            for name in ("libhackrf.so.0", "libhackrf.dll", "libhackrf.dylib"):
+                try:
+                    hackrf = ctypes.CDLL(name)
+                    break
+                except Exception:
+                    continue
+            if hackrf is not None and hasattr(hackrf, "hackrf_init"):
+                try:
+                    if hackrf.hackrf_init() != 0:
+                        hackrf = None
+                except Exception:
+                    hackrf = None
+        except Exception:
+            hackrf = None
+        # Try multi‑SDR API first.  Some versions of the multi‑SDR library
+        # implicitly open devices when listing them, so we explicitly close
+        # all devices after enumeration to avoid automatic streaming.
+        try:
+            count = self._lib.hq_get_device_count()
+            if count > 0:
+                serials = self._ffi.new("char*[]", count)
+                for i in range(count):
+                    serials[i] = self._ffi.new("char[]", 128)
+                actual = self._lib.hq_list_devices(serials, count)
+                for i in range(actual):
+                    if serials[i] != self._ffi.NULL:
+                        s = self._ffi.string(serials[i]).decode(errors="ignore")
+                        if s and s != "0000000000000000":
+                            out.append(s)
+                # Close any devices that were implicitly opened during enumeration
+                try:
+                    self._lib.hq_close_all()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Fall back to single‑SDR API if no devices found via multi‑SDR
+        if not out:
             try:
                 n = int(self._lib.hq_device_count())
                 for i in range(n):
-                    b = self._ffi.new("char[128]")
-                    if self._lib.hq_get_device_serial(i, b, 127) == 0:
-                        s = self._ffi.string(b).decode(errors="ignore")
+                    buf = self._ffi.new("char[128]")
+                    if self._lib.hq_get_device_serial(i, buf, 127) == 0:
+                        s = self._ffi.string(buf).decode(errors="ignore")
                         if s and s != "0000000000000000":
                             out.append(s)
-            except Exception as e:
-                print(f"Error listing devices: {e}")
-            return out
-
-    def set_serial_suffix(self, serial: Optional[str]):
-        """Задать суффикс серийника (только для single mode)."""
-        self._serial_suffix = serial or None
-
-    def load_calibration(self, csv_path: str) -> bool:
-        """Загружает калибровку (только для single mode)."""
-        if not self._multi_mode:
-            try:
-                c = self._ffi.new("char[]", csv_path.encode("utf-8"))
-                ok = (self._lib.hq_load_calibration(c) == 0)
-                if ok:
-                    self._lib.hq_enable_calibration(1)
-                return bool(ok)
-            except Exception:
-                return False
-        return False
-
-    def set_calibration_enabled(self, enable: bool):
-        """Включить/выключить калибровку (только для single mode)."""
-        if not self._multi_mode:
-            try:
-                self._lib.hq_enable_calibration(1 if enable else 0)
             except Exception:
                 pass
+        # Shut down HackRF driver if we initialised it
+        try:
+            if hackrf is not None and hasattr(hackrf, "hackrf_exit"):
+                hackrf.hackrf_exit()
+        except Exception:
+            pass
+        return out
 
-    def calibration_loaded(self) -> bool:
-        """Проверка загруженной калибровки (только для single mode)."""
-        if not self._multi_mode:
-            try:
-                return bool(self._lib.hq_calibration_loaded())
-            except Exception:
-                pass
-        return False
-
-    def last_error(self) -> str:
-        """Получить последнее сообщение об ошибке (только для single mode)."""
-        if not self._multi_mode:
-            try:
-                c = self._lib.hq_last_error()
-                if c != self._ffi.NULL:
-                    return self._ffi.string(c).decode(errors="ignore")
-            except Exception:
-                pass
-        return ""
-
-    # ---------- API SourceBackend ----------
-    
     def is_running(self) -> bool:
-        if self._multi_mode:
-            return self._running and self._multi_worker is not None and self._multi_worker.is_alive()
-        else:
-            return self._worker is not None and self._worker.is_alive()
+        """Check if the worker thread is active."""
+        return self._running and self._worker is not None and self._worker.is_alive()
 
-    def start(self, config: SweepConfig):
+    def start(self, config: SweepConfig) -> None:
+        """Start data acquisition with the given sweep configuration.
+
+        If the backend is already running, `start()` returns immediately with
+        a status message.  The worker type is chosen based on the number of
+        requested devices: one device for single mode, multiple devices for
+        multi mode.  Device availability is checked before starting; if
+        insufficient hardware is present, an error signal is emitted.
+        """
         if self.is_running():
             self.status.emit("Уже запущено")
             return
-        
-        # Проверяем, действительно ли нужен multi-mode
-        # Даже если библиотека multi, можем работать в single-mode
-        if self._multi_mode and self._num_devices > 1:
-            self._start_multi(config)
-        else:
-            # Принудительно используем single-mode
-            self._start_single(config)
-            
-    def _start_multi(self, config: SweepConfig):
-        """Запуск в multi-SDR режиме."""
-        self.status.emit(f"Инициализация multi-SDR ({self._num_devices} устройств)...")
-        
-        # ИСПРАВЛЕНИЕ: Проверяем количество реальных устройств
-        actual_count = self._lib.hq_get_device_count()
-        if actual_count < self._num_devices:
-            self.error.emit(f"Требуется {self._num_devices} устройств, найдено только {actual_count}")
+        available = self.list_serials()
+        required = self._num_devices if self._num_devices > 1 else 1
+        print(f"🚀 Запуск в режиме: {'Multi-SDR' if required > 1 else 'Single-SDR'}")
+        print(f"📡 Найдено устройств: {len(available)}")
+        if len(available) < required:
+            self.error.emit(f"Требуется {required} устройств, найдено {len(available)}")
             return
-            
-        # MultiWorker запускается ТОЛЬКО если устройств больше 1
-        if self._num_devices <= 1:
-            self.status.emit("Single-SDR режим - MultiWorker не нужен")
-            return
-        
-        # Открываем устройства
-        r = self._lib.hq_open_all(self._num_devices)
-        if r != 0:
-            error_msg = {
-                -16: "Устройства заняты другим процессом",
-                -19: "Нет доступа к устройствам (проверьте права)",
-                -2: "Устройства не найдены",
-            }.get(r, f"Не удалось открыть {self._num_devices} устройств (код: {r})")
-            self.error.emit(error_msg)
-            return
-        
-        # Конфигурируем с правильными параметрами
-        self._lib.hq_config_set_rates(12000000, 8000000)  # 12 MSPS, 8 MHz BB filter
-        self._lib.hq_config_set_gains(config.lna_db, config.vga_db, config.amp_on)
-        
-        # ИСПРАВЛЕНИЕ: Ограничиваем диапазон частот
-        start_hz = max(config.freq_start_hz, 1000000)     # Минимум 1 МГц
-        stop_hz = min(config.freq_end_hz, 6000000000)      # Максимум 6 ГГц
-        step_hz = max(config.bin_hz, 100000)               # Минимум 100 кГц шаг
-        
-        print(f"Configuring frequency range: {start_hz/1e6:.1f} - {stop_hz/1e6:.1f} MHz, step {step_hz/1e6:.3f} MHz")
-        
-        self._lib.hq_config_set_freq_range(float(start_hz), float(stop_hz), float(step_hz))
-        self._lib.hq_config_set_dwell_time(2)  # 2 ms dwell time
-        
-        # Настраиваем параметры группировки
-        self._lib.hq_set_grouping_tolerance_hz(250000.0)  # 250 kHz
-        self._lib.hq_set_ema_alpha(0.25)
-        
-        # Запускаем
-        r = self._lib.hq_start()
-        if r != 0:
-            self.error.emit(f"Не удалось запустить multi-SDR (код: {r})")
-            self._lib.hq_close_all()
-            return
-        
-        # Запускаем worker для чтения данных
-        self._multi_worker = _MultiWorker(self, self._ffi, self._lib, config)
-        self._multi_worker.finished_sig.connect(self._on_multi_worker_finished)
-        self._multi_worker.start()
-        
-        self.started.emit()
-        self.status.emit(f"Multi-SDR запущен ({self._num_devices} устройств)")
-        
-        # Устанавливаем флаг запуска
-        self._running = True
-        
-    def _start_single(self, config: SweepConfig):
-        """Запуск в single-SDR режиме (обратная совместимость)."""
-        self.status.emit("Инициализация single-SDR...")
+        # Configure the assembler for the requested sweep
         self._assembler.configure(config)
-        
-        # В single-mode используем SingleWorker для базового спектра
-        self._worker = _SingleWorker(self, self._ffi, self._lib, config)
+        # Select and start the worker
+        if required > 1:
+            self._worker = _MultiWorker(self, self._ffi, self._lib, config, required, self._assembler)
+        else:
+            self._worker = _SingleWorker(self, self._ffi, self._lib, config, self._assembler)
         self._worker.finished_sig.connect(self._on_worker_finished)
         self._worker.start()
+        self._running = True
         self.started.emit()
+        self.status.emit(f"Запущен {'Multi' if required > 1 else 'Single'}-SDR")
 
-    def stop(self):
-        """Исправленный метод stop()."""
+    def stop(self) -> None:
+        """Stop the current worker and release devices."""
         if not self.is_running():
             return
-        
-        print("Backend: stop() called")
+        print("⏹️ Остановка SDR...")
         self.status.emit("Остановка...")
-        
-        if self._multi_mode:
-            # Останавливаем библиотеку
-            try:
-                print("Backend: stopping multi-mode library...")
-                self._lib.hq_stop()
-            except Exception as e:
-                print(f"Error stopping library: {e}")
-            
-            # Останавливаем worker
-            if self._multi_worker:
-                try:
-                    print("Backend: stopping multi-worker...")
-                    self._multi_worker.stop()
-                    self._multi_worker.join(timeout=2.0)
-                    self._multi_worker = None
-                except Exception as e:
-                    print(f"Error stopping multi-worker: {e}")
-        else:
-            # Single mode
-            try:
-                print("Backend: stopping single-mode library...")
-                self._lib.hq_stop()
-            except Exception as e:
-                print(f"Error stopping single-mode library: {e}")
-            
-            if self._worker:
-                try:
-                    print("Backend: stopping single-worker...")
-                    self._worker.stop()
-                    self._worker.join(timeout=3.0)
-                    self._worker = None
-                except Exception as e:
-                    print(f"Error stopping single-worker: {e}")
-        
-        # Закрываем устройства
-        try:
-            if self._multi_mode:
-                print("Backend: closing all devices...")
-                self._lib.hq_close_all()
-            else:
-                print("Backend: closing single device...")
-                self._lib.hq_close_all()  # Используем hq_close_all даже для одного устройства
-        except Exception as e:
-            print(f"Error closing devices: {e}")
-        
-        # Сбрасываем флаг запуска
+        if self._worker:
+            self._worker.stop()
+            # Wait for thread to exit gracefully
+            self._worker.join(timeout=2.0)
+            self._worker = None
         self._running = False
-        
-        print("Backend: stop() completed")
         self.finished.emit(0)
         self.status.emit("Остановлено")
 
-    def _on_worker_finished(self, code: int, msg: str):
-        """Обработчик завершения single-mode worker."""
+    def _on_worker_finished(self, code: int, msg: str) -> None:
+        """Handle worker completion.  Reset running state and emit signals."""
         if code != 0:
-            self.error.emit(msg or f"libhackrf завершился с кодом {code}")
+            self.error.emit(msg or f"Завершился с кодом {code}")
         self._worker = None
-        self.finished.emit(code)
-        
-    def _on_multi_worker_finished(self, code: int, msg: str):
-        """Обработчик завершения multi-mode worker."""
-        if code != 0:
-            self.error.emit(msg or f"Multi-SDR завершился с кодом {code}")
-        self._multi_worker = None
         self._running = False
         self.finished.emit(code)
-        
+
     def get_status(self) -> Optional[Dict[str, Any]]:
-        """Получить статус multi-SDR системы."""
-        if self._multi_mode and self.is_running():
-            try:
-                status = self._ffi.new("HqStatus*")
-                r = self._lib.hq_get_status(status)
-                if r == 0:
-                    return {
-                        'master_running': bool(status.master_running),
-                        'slave1_running': bool(status.slave_running[0]),
-                        'slave2_running': bool(status.slave_running[1]),
-                        'retune_ms': status.retune_ms_avg,
-                        'watch_items': status.watch_items
-                    }
-            except Exception as e:
-                print(f"Error getting status: {e}")
+        """Query the current status from the C library (multi mode only).
+
+        Returns a dict with keys `master_running`, `slave1_running`,
+        `slave2_running`, `retune_ms` and `watch_items` if the backend is
+        active in multi mode; otherwise returns None.
+        """
+        if not self.is_running() or self._num_devices <= 1:
+            return None
+        try:
+            status = self._ffi.new("HqStatus*")
+            if self._lib.hq_get_status(status) == 0:
+                s = status[0]
+                return {
+                    'master_running': bool(s.master_running),
+                    'slave1_running': bool(s.slave_running[0]),
+                    'slave2_running': bool(s.slave_running[1]),
+                    'retune_ms': s.retune_ms_avg,
+                    'watch_items': s.watch_items,
+                }
+        except Exception:
+            pass
         return None
 
 
-# Исправленная версия _MultiWorker для backend.py
-# Заменить класс _MultiWorker целиком
+class _BaseWorker(QtCore.QObject, threading.Thread):
+    """Base class for worker threads handling HackRF data acquisition.
 
-class _SingleWorker(QtCore.QObject, threading.Thread):
-    """Worker для single-SDR режима - ТОЛЬКО базовый спектр."""
-    
+    Subclasses should implement the `run()` method to perform device
+    initialization, configuration, data reading and cleanup.  This base
+    class provides the common signal and stopping mechanism.
+    """
     finished_sig = QtCore.pyqtSignal(int, str)
 
-    def __init__(self, parent: HackRFLibSource, ffi, lib, config: SweepConfig):
+    def __init__(self) -> None:
         QtCore.QObject.__init__(self)
         threading.Thread.__init__(self, daemon=True)
-        
-        self._parent = parent
-        self._ffi = ffi
-        self._lib = lib
-        self._config = config
         self._running = True
-        
-        # Настраиваем диапазон
-        self._freq_start = config.freq_start_hz
-        self._freq_end = config.freq_end_hz
-        self._bin_hz = config.bin_hz
-        
-        # Счетчики для отладки
-        self._spectrum_updates = 0
-        
-        # Создаем assembler для сборки полного спектра
-        self._assembler = _SweepAssembler()
-        self._assembler.configure(config)
-        
-        # В multi-device API нет callback'ов, будем читать данные через hq_get_master_spectrum
         self._stop_ev = threading.Event()
-        
-    def stop(self):
-        """Останавливает SingleWorker."""
-        print("SingleWorker: stop() called")
+
+    def stop(self) -> None:
+        """Request the worker to stop."""
         self._running = False
         self._stop_ev.set()
-        
-        # Ждем завершения потока
-        if self.is_alive():
-            print("SingleWorker: waiting for thread to finish...")
-            self.join(timeout=2.0)  # Ждем максимум 2 секунды
-            if self.is_alive():
-                print("SingleWorker: thread did not finish, forcing...")
-            else:
-                print("SingleWorker: thread finished gracefully")
-        
-    def run(self):
-        """Worker для single-SDR режима - ТОЛЬКО базовый спектр."""
-        print("SingleWorker: Started (spectrum only)")
-        
-        try:
-            # Используем multi-device API даже для одного устройства
-            r = self._lib.hq_open_all(1)  # Открываем 1 устройство
-            if r != 0:
-                print(f"SingleWorker: Failed to open device ({r})")
-                self.finished_sig.emit(1, f"Failed to open device ({r})")
-                return
-
-            # Конфигурируем с multi-device API
-            cfg = self._config
-            self._lib.hq_config_set_rates(12000000, 8000000)  # 12 MSPS, 8 MHz BB filter
-            self._lib.hq_config_set_gains(cfg.lna_db, cfg.vga_db, cfg.amp_on)
-            
-            # Ограничиваем диапазон частот
-            start_hz = max(cfg.freq_start_hz, 1000000)     # Минимум 1 МГц
-            stop_hz = min(cfg.freq_end_hz, 6000000000)      # Максимум 6 ГГц
-            step_hz = max(cfg.bin_hz, 100000)               # Минимум 100 кГц шаг
-            
-            print(f"SingleWorker: Configuring frequency range: {start_hz/1e6:.1f} - {stop_hz/1e6:.1f} MHz, step {step_hz/1e6:.3f} MHz")
-            
-            self._lib.hq_config_set_freq_range(float(start_hz), float(stop_hz), float(step_hz))
-            self._lib.hq_config_set_dwell_time(2)  # 2 ms dwell time
-
-            # Запускаем
-            r = self._lib.hq_start()
-            if r != 0:
-                print(f"SingleWorker: Start failed ({r})")
-                self._lib.hq_close_all()
-                self.finished_sig.emit(3, f"Start failed ({r})")
-                return
-
-            print(f"SingleWorker: Configured for {int((cfg.freq_end_hz - cfg.freq_start_hz) / cfg.bin_hz)} points, {cfg.freq_start_hz/1e6:.1f}-{cfg.freq_end_hz/1e6:.1f} MHz")
-            
-            # Основной цикл - читаем данные через hq_get_master_spectrum
-            while self._running and not self._stop_ev.is_set():
-                try:
-                    # Читаем спектр от master SDR
-                    max_points = 10000  # Ограничиваем количество точек
-                    freqs_buf = self._ffi.new("double[]", max_points)
-                    powers_buf = self._ffi.new("float[]", max_points)
-                    
-                    r = self._lib.hq_get_master_spectrum(freqs_buf, powers_buf, max_points)
-                    if r > 0:
-                        # Копируем данные
-                        freqs = np.frombuffer(self._ffi.buffer(freqs_buf, r * 8), dtype=np.float64, count=r).copy()
-                        power = np.frombuffer(self._ffi.buffer(powers_buf, r * 4), dtype=np.float32, count=r).copy()
-                        
-                        # Проверяем валидность
-                        if not (np.all(np.isnan(power)) or np.all(power == 0)):
-                            # Отправляем сегмент
-                            bin_hz = int(self._config.bin_hz)
-                            sw = SweepLine(
-                                ts=None,
-                                f_low_hz=int(freqs[0]),
-                                f_high_hz=int(freqs[-1]),
-                                bin_hz=bin_hz,
-                                power_dbm=power
-                            )
-                            
-                            # Отладочная информация
-                            if self._spectrum_updates % 10 == 0:
-                                print(f"SingleWorker: emitting fullSweepReady: {len(power)} points, {freqs[0]/1e6:.1f}-{freqs[-1]/1e6:.1f} MHz")
-                            
-                            # Эмитим fullSweepReady для автопиков (вместо sweepLine)
-                            self._parent.fullSweepReady.emit(freqs, power)
-                            
-                            # Собираем полный проход через assembler
-                            result = self._assembler.add_segment(freqs, power, int(freqs[0]))
-                            if result is not None:
-                                full_freqs, full_power = result
-                                if self._spectrum_updates % 10 == 0:
-                                    print(f"SingleWorker: assembler result: {len(full_power)} points")
-                            
-                            # Обновляем счетчик
-                            self._spectrum_updates += 1
-                            if self._spectrum_updates % 10 == 0:
-                                print(f"SingleWorker: {self._spectrum_updates} spectrum updates, data range: {freqs[0]/1e6:.1f}-{freqs[-1]/1e6:.1f} MHz, power: {power.min():.1f} to {power.max():.1f} dBm")
-                    
-                    # Небольшая задержка между чтениями
-                    time.sleep(0.05)  # Увеличиваем частоту до 20 Hz
-                    
-                except Exception as e:
-                    print(f"SingleWorker data reading error: {e}")
-                    time.sleep(0.1)
-                    
-        except Exception as e:
-            print(f"SingleWorker exception: {e}")
-            self.finished_sig.emit(4, str(e))
-        finally:
-            try:
-                self._lib.hq_stop()
-                self._lib.hq_close_all()
-            except:
-                pass
-            print(f"SingleWorker: Stopped after {self._spectrum_updates} spectrum updates")
-            self.finished_sig.emit(0, "Stopped")
 
 
-class _MultiWorker(QtCore.QObject, threading.Thread):
-    """Worker для multi-SDR режима с правильной обработкой широкополосных сигналов."""
-    
-    finished_sig = QtCore.pyqtSignal(int, str)
-    
-    def __init__(self, parent: HackRFLibSource, ffi, lib, config: SweepConfig):
-        QtCore.QObject.__init__(self)
-        threading.Thread.__init__(self, daemon=True)
-        
+class _SingleWorker(_BaseWorker):
+    """Worker for single-SDR mode using the multi-SDR API.
+
+    This worker opens exactly one device with `hq_open_all(1)`, configures
+    sampling parameters, frequency range and dwell time, applies detector
+    settings and then continuously reads the master spectrum via
+    `hq_get_master_spectrum`.  Partial sweeps are assembled into full
+    sweeps using `_SweepAssembler`.  Each assembled sweep is emitted via
+    `fullSweepReady`.
+    """
+
+    def __init__(self, parent: HackRFLibSource, ffi: FFI, lib: Any, config: SweepConfig,
+                 assembler: _SweepAssembler) -> None:
+        super().__init__()
         self._parent = parent
         self._ffi = ffi
         self._lib = lib
         self._config = config
-        self._running = True
-        
-        # Настраиваем диапазон
-        self._freq_start = config.freq_start_hz
-        self._freq_end = config.freq_end_hz
-        self._bin_hz = config.bin_hz
-        
-        # Параметры детектора
-        self._threshold_offset = 20.0  # дБ над шумом по умолчанию
-        self._min_width_bins = 3
-        
-        # Счетчики для отладки
+        self._assembler = assembler
+        # counters for logging
+        self._spectrum_updates = 0
+
+    def run(self) -> None:
+        code = 0
+        msg = ""
+        try:
+            # Open a single device via multi-SDR API
+            if self._lib.hq_open_all(1) != 0:
+                self.finished_sig.emit(1, "Не удалось открыть 1 устройство")
+                return
+            cfg = self._config
+            # Configure sample rate and baseband filter (fixed 12 MSPS / 8 MHz)
+            self._lib.hq_config_set_rates(12000000, 8000000)
+            # Configure gains
+            self._lib.hq_config_set_gains(cfg.lna_db, cfg.vga_db, cfg.amp_on)
+            # Frequency bounds and bin size (clamped to sensible values)
+            start_hz = max(cfg.freq_start_hz, 1_000_000)
+            stop_hz = min(cfg.freq_end_hz, 6_000_000_000)
+            step_hz = max(cfg.bin_hz, 100_000)
+            self._lib.hq_config_set_freq_range(float(start_hz), float(stop_hz), float(step_hz))
+            # Dwell time in milliseconds (small value for quick sweeps)
+            self._lib.hq_config_set_dwell_time(2)
+            # Apply detector params
+            p = self._parent._detector_params
+            self._lib.hq_set_detector_params(
+                float(p['threshold_offset']), int(p['min_width']), int(p['min_sweeps']), float(p['timeout'])
+            )
+            # Grouping tolerance and EMA for smoothing
+            self._lib.hq_set_grouping_tolerance_hz(250_000.0)
+            self._lib.hq_set_ema_alpha(0.25)
+            # Start acquisition.  Try no‑arg form first; fall back to legacy signature.
+            try:
+                r = self._lib.hq_start()
+            except TypeError:
+                r = self._lib.hq_start(self._ffi.NULL, self._ffi.NULL)
+            if r != 0:
+                self._lib.hq_close_all()
+                self.finished_sig.emit(3, "Не удалось запустить устройство")
+                return
+            print(
+                f"✅ SingleWorker: Running {int((stop_hz - start_hz) / step_hz)} points, "
+                f"range {start_hz/1e6:.1f}-{stop_hz/1e6:.1f} MHz"
+            )
+            # Determine how many points to request from hq_get_master_spectrum.
+            # Ideally we request the full sweep in one call, but limit to
+            # 50,000 points to avoid excessive memory usage.  The number of
+            # points is (stop_hz - start_hz) / step_hz + 1.
+            n_bins = int((stop_hz - start_hz) / step_hz) + 1
+            max_points = min(n_bins, 50_000)
+            freqs_buf = self._ffi.new("double[]", max_points)
+            powers_buf = self._ffi.new("float[]", max_points)
+            last_log_time = time.time()
+            while self._running and not self._stop_ev.is_set():
+                # Read spectrum; blocks until at least one segment is available
+                n = self._lib.hq_get_master_spectrum(freqs_buf, powers_buf, max_points)
+                if n > 0:
+                    freqs = np.frombuffer(self._ffi.buffer(freqs_buf, n * 8), dtype=np.float64, count=n).copy()
+                    power = np.frombuffer(self._ffi.buffer(powers_buf, n * 4), dtype=np.float32, count=n).copy()
+                    # Discard NaNs or zeroed outputs
+                    if not (np.all(np.isnan(power)) or np.all(power == 0)):
+                        # Emit the raw segment as a full sweep update for quick UI refresh
+                        self._parent.fullSweepReady.emit(freqs, power)
+                        self._spectrum_updates += 1
+                        # Assemble into a full sweep
+                        result = self._assembler.add_segment(freqs, power, int(freqs[0]))
+                        if result is not None:
+                            full_freqs, full_power = result
+                            self._parent.fullSweepReady.emit(full_freqs, full_power)
+                        # Periodic logging
+                        if time.time() - last_log_time > 5.0:
+                            print(
+                                f"SingleWorker: {self._spectrum_updates} updates, "
+                                f"range {freqs[0]/1e6:.1f}-{freqs[-1]/1e6:.1f} MHz"
+                            )
+                            last_log_time = time.time()
+                # Small delay to limit CPU usage
+                time.sleep(0.02)
+        except Exception as e:
+            code, msg = 99, str(e)
+        finally:
+            # Cleanup
+            try:
+                # Stop acquisition; support both no‑arg and two‑arg forms
+                try:
+                    self._lib.hq_stop()
+                except TypeError:
+                    self._lib.hq_stop(self._ffi.NULL, self._ffi.NULL)
+                self._lib.hq_close_all()
+            except Exception:
+                pass
+            print(f"SingleWorker stopped after {self._spectrum_updates} spectrum updates")
+            self.finished_sig.emit(code, msg)
+
+
+class _MultiWorker(_BaseWorker):
+    """Worker for multi-SDR mode.
+
+    This worker opens multiple devices (typically 3), configures them and
+    continuously reads the master spectrum.  Partial sweeps are assembled
+    using `_SweepAssembler`.  Recent peaks are polled via
+    `hq_get_recent_peaks` and only when peaks are present is the watchlist
+    snapshot fetched.  Wideband targets from the watchlist are forwarded as
+    `SweepLine` objects via `sweepLine.emit`.  This throttling prevents
+    overload of the watchlist and peak queues.
+    """
+
+    def __init__(self, parent: HackRFLibSource, ffi: FFI, lib: Any, config: SweepConfig,
+                 num_devices: int, assembler: _SweepAssembler) -> None:
+        super().__init__()
+        self._parent = parent
+        self._ffi = ffi
+        self._lib = lib
+        self._config = config
+        self._num_devices = num_devices
+        self._assembler = assembler
+        # Logging counters
         self._spectrum_updates = 0
         self._watchlist_updates = 0
-        
-    def stop(self):
-        self._running = False
-        
-    def set_detector_params(self, threshold_offset: float, min_width_bins: int):
-        """Устанавливает параметры детектора."""
-        self._threshold_offset = threshold_offset
-        self._min_width_bins = min_width_bins
-        
-    def run(self):
-        """Worker для multi-SDR режима с улучшенной обработкой."""
-        print("MultiWorker: Started")
-        
-        # Буферы для чтения данных
-        watchlist_buf = self._ffi.new("WatchItem[100]")
-        peaks_buf = self._ffi.new("Peak[100]")
-        status_buf = self._ffi.new("HqStatus*")
 
-        # Параметры для спектра
-        last_emit_time = time.time()
-        emit_interval = 0.05  # 20 Hz для плавности
-        
-        # Вычисляем количество точек спектра
-        n_points = int((self._freq_end - self._freq_start) / self._bin_hz) + 1
-        
-        # Ограничиваем для стабильности
-        if n_points > 50000:
-            n_points = 50000
-            self._bin_hz = (self._freq_end - self._freq_start) / (n_points - 1)
-            print(f"MultiWorker: Limited to {n_points} points")
-
-        # Буферы для спектра
-        freqs_buf = self._ffi.new("double[]", n_points)
-        powers_buf = self._ffi.new("float[]", n_points)
-
-        # Счетчики для отладки
-        last_status_time = time.time()
-        last_watchlist_count = 0
-        error_count = 0
-        max_errors = 10
-
-        print(f"MultiWorker: Configured for {n_points} points, {self._freq_start/1e6:.1f}-{self._freq_end/1e6:.1f} MHz")
-
-        while self._running:
+    def run(self) -> None:
+        code = 0
+        msg = ""
+        try:
+            # Open the requested number of devices
+            if self._lib.hq_open_all(int(self._num_devices)) != 0:
+                self.finished_sig.emit(1, f"Не удалось открыть {self._num_devices} устройств")
+                return
+            cfg = self._config
+            # Configure sample rate and baseband filter
+            self._lib.hq_config_set_rates(12_000_000, 8_000_000)
+            # Configure gains
+            self._lib.hq_config_set_gains(cfg.lna_db, cfg.vga_db, cfg.amp_on)
+            # Frequency bounds
+            start_hz = max(cfg.freq_start_hz, 1_000_000)
+            stop_hz = min(cfg.freq_end_hz, 6_000_000_000)
+            step_hz = max(cfg.bin_hz, 100_000)
+            self._lib.hq_config_set_freq_range(float(start_hz), float(stop_hz), float(step_hz))
+            # Dwell time (ms)
+            self._lib.hq_config_set_dwell_time(2)
+            # Peak grouping tolerance: widen for video signals (5 MHz)
+            self._lib.hq_set_grouping_tolerance_hz(5_000_000.0)
+            # EMA smoothing factor
+            self._lib.hq_set_ema_alpha(0.25)
+            # Detector parameters
+            p = self._parent._detector_params
+            self._lib.hq_set_detector_params(
+                float(p['threshold_offset']), int(p['min_width']), int(p['min_sweeps']), float(p['timeout'])
+            )
+            # Start acquisition.  Try no‑arg form first; fall back to legacy signature.
             try:
-                current_time = time.time()
-
-                # 1. Читаем спектр от Master SDR
-                n_read = self._lib.hq_get_master_spectrum(freqs_buf, powers_buf, n_points)
-
-                if n_read > 0 and n_read <= n_points:
-                    # Копируем данные безопасно
-                    freqs_array = np.frombuffer(
-                        self._ffi.buffer(freqs_buf, n_read * 8),
-                        dtype=np.float64,
-                    ).copy()
-                    
-                    powers_array = np.frombuffer(
-                        self._ffi.buffer(powers_buf, n_read * 4),
-                        dtype=np.float32,
-                    ).copy()
-
-                    # Проверяем валидность данных
-                    if not np.all(np.isnan(powers_array)) and np.max(powers_array) > -150:
-                        # Эмитим полный спектр для UI
-                        if (current_time - last_emit_time) >= emit_interval:
-                            self._parent.fullSweepReady.emit(freqs_array, powers_array)
-                            last_emit_time = current_time
-                            self._spectrum_updates += 1
-                            
-                            # Периодический лог (каждые 100 обновлений)
-                            if self._spectrum_updates % 100 == 0:
-                                max_power = np.max(powers_array)
-                                print(f"MultiWorker: {self._spectrum_updates} updates, max power: {max_power:.1f} dBm")
-
-                # 2. Читаем watchlist (цели для slave SDR)
-                n_watchlist = self._lib.hq_get_watchlist_snapshot(watchlist_buf, 100)
-                
-                if n_watchlist > 0 and n_watchlist != last_watchlist_count:
-                    last_watchlist_count = n_watchlist
-                    self._watchlist_updates += 1
-                    
-                    # Обрабатываем широкополосные сигналы
-                    wideband_signals = []
-                    for i in range(n_watchlist):
-                        w = watchlist_buf[i]
-                        
-                        # Фильтруем по мощности и ширине
-                        if w.rssi_ema > -100 and w.bw_hz > 100000:  # > 100 кГц
-                            wideband_signals.append({
-                                'freq': w.f_center_hz / 1e6,
-                                'bw': w.bw_hz / 1e6,
-                                'rssi': w.rssi_ema
-                            })
-                            
-                            # Создаем SweepLine для совместимости с детектором
-                            if w.rssi_ema > -80:  # Сильные сигналы
-                                sw = SweepLine(
-                                    ts=None,
-                                    f_low_hz=int(w.f_center_hz - w.bw_hz/2),
-                                    f_high_hz=int(w.f_center_hz + w.bw_hz/2),
-                                    bin_hz=int(w.bw_hz/10) if w.bw_hz > 0 else 200000,
-                                    power_dbm=np.array([w.rssi_ema], dtype=np.float32),
-                                )
-                                self._parent.sweepLine.emit(sw)
-                    
-                    # Логируем широкополосные сигналы
-                    if wideband_signals and self._watchlist_updates % 10 == 0:
-                        print(f"MultiWorker: {len(wideband_signals)} wideband signals detected")
-                        for sig in wideband_signals[:3]:  # Первые 3
-                            print(f"  {sig['freq']:.1f} MHz, BW: {sig['bw']:.2f} MHz, RSSI: {sig['rssi']:.1f} dBm")
-
-                # 3. Читаем статус системы
-                r = self._lib.hq_get_status(status_buf)
-                if r == 0:
-                    status = status_buf[0]
-                    
-                    # Периодический статус (каждые 2 секунды)
-                    if current_time - last_status_time > 2.0:
-                        active_slaves = sum([status.slave_running[0], status.slave_running[1]])
-                        
-                        if status.watch_items > 0 or active_slaves > 0:
-                            self._parent.status.emit(
-                                f"Targets: {status.watch_items}, Slaves: {active_slaves}, "
-                                f"Retune: {status.retune_ms_avg:.1f}ms"
-                            )
-                        last_status_time = current_time
-
-                # Небольшая задержка для снижения нагрузки
-                time.sleep(0.02)  # 50 Hz polling
-                
-                # Сброс счетчика ошибок при успешной итерации
-                error_count = 0
-
-            except Exception as e:
-                error_count += 1
-                if error_count <= 3:  # Логируем только первые 3 ошибки
-                    print(f"MultiWorker error #{error_count}: {e}")
-                    import traceback
-                    traceback.print_exc()
-                
-                if error_count >= max_errors:
-                    print(f"MultiWorker: Too many errors ({max_errors}), stopping")
-                    break
-                
-                time.sleep(0.1)  # Пауза при ошибке
-
-        print(f"MultiWorker: Stopped after {self._spectrum_updates} spectrum updates, "
-              f"{self._watchlist_updates} watchlist updates")
-        self.finished_sig.emit(0, "Multi-worker stopped")
+                r = self._lib.hq_start()
+            except TypeError:
+                r = self._lib.hq_start(self._ffi.NULL, self._ffi.NULL)
+            if r != 0:
+                self._lib.hq_close_all()
+                self.finished_sig.emit(3, "Не удалось запустить multi‑SDR")
+                return
+            print(
+                f"✅ MultiWorker: {self._num_devices} devices running. "
+                f"Master sweep {start_hz/1e6:.1f}-{stop_hz/1e6:.1f} MHz"
+            )
+            # Buffers for spectrum and peaks.  Determine the number of points
+            # for the master sweep based on the configured range and bin
+            # size.  Cap at 50,000 points to limit memory usage.
+            n_bins = int((stop_hz - start_hz) / step_hz) + 1
+            max_points = min(n_bins, 50_000)
+            freqs_buf = self._ffi.new("double[]", max_points)
+            powers_buf = self._ffi.new("float[]", max_points)
+            peaks_buf = self._ffi.new("Peak[100]")
+            watch_buf = self._ffi.new("WatchItem[100]")
+            last_log_time = time.time()
+            last_watch_time = 0.0
+            while self._running and not self._stop_ev.is_set():
+                # 1. Master spectrum
+                n = self._lib.hq_get_master_spectrum(freqs_buf, powers_buf, max_points)
+                if n > 0:
+                    freqs = np.frombuffer(self._ffi.buffer(freqs_buf, n * 8), dtype=np.float64, count=n).copy()
+                    power = np.frombuffer(self._ffi.buffer(powers_buf, n * 4), dtype=np.float32, count=n).copy()
+                    if not np.all(np.isnan(power)):
+                        self._parent.fullSweepReady.emit(freqs, power)
+                        self._spectrum_updates += 1
+                        # Assemble full sweep
+                        result = self._assembler.add_segment(freqs, power, int(freqs[0]))
+                        if result is not None:
+                            full_freqs, full_power = result
+                            self._parent.fullSweepReady.emit(full_freqs, full_power)
+                # 2. Check peaks every ~100 ms to decide if watchlist should be queried
+                if time.time() - last_watch_time > 0.1:
+                    last_watch_time = time.time()
+                    # Poll only a limited number of recent peaks to avoid
+                    # overfilling the internal queue.  Using a small max
+                    # improves responsiveness when many peaks are present.
+                    n_peaks = self._lib.hq_get_recent_peaks(peaks_buf, 10)
+                    if n_peaks > 0:
+                        # Only query watchlist when peaks are present
+                        # Retrieve only a limited number of watchlist items
+                        # to prevent queue overrun; excess items will be
+                        # processed in subsequent iterations.
+                        n_watch = self._lib.hq_get_watchlist_snapshot(watch_buf, 50)
+                        if n_watch > 0:
+                            self._watchlist_updates += 1
+                            for i in range(n_watch):
+                                w = watch_buf[i]
+                                # Wideband if bandwidth > 1 MHz and signal strength above noise
+                                if w.bw_hz > 1_000_000 and w.rssi_ema > -100:
+                                    sw = SweepLine(
+                                        ts=None,
+                                        f_low_hz=int(w.f_center_hz - w.bw_hz / 2),
+                                        f_high_hz=int(w.f_center_hz + w.bw_hz / 2),
+                                        bin_hz=int(w.bw_hz / 10) if w.bw_hz > 0 else 200_000,
+                                        power_dbm=np.array([w.rssi_ema], dtype=np.float32),
+                                    )
+                                    # Emit wideband signal for slave targeting and autopicks
+                                    self._parent.sweepLine.emit(sw)
+                # 3. Periodic status logging
+                if time.time() - last_log_time > 5.0:
+                    # Query status for active slaves and watch items
+                    status = self._ffi.new("HqStatus*")
+                    if self._lib.hq_get_status(status) == 0:
+                        s = status[0]
+                        active = s.slave_running[0] + s.slave_running[1]
+                        print(
+                            f"MultiWorker: {self._spectrum_updates} spectrum updates, "
+                            f"{self._watchlist_updates} watchlist updates, "
+                            f"Slaves active: {active}, Targets: {s.watch_items}"
+                        )
+                    last_log_time = time.time()
+                # Avoid busy loop
+                time.sleep(0.02)
+        except Exception as e:
+            code, msg = 99, str(e)
+        finally:
+            try:
+                # Stop acquisition; support both no‑arg and two‑arg forms
+                try:
+                    self._lib.hq_stop()
+                except TypeError:
+                    self._lib.hq_stop(self._ffi.NULL, self._ffi.NULL)
+                self._lib.hq_close_all()
+            except Exception:
+                pass
+            print(
+                f"MultiWorker stopped. Spectrum updates: {self._spectrum_updates}, "
+                f"watchlist updates: {self._watchlist_updates}"
+            )
+            self.finished_sig.emit(code, msg)
 
 
 class _SweepAssembler:
-    """Собирает полный проход из сегментов (для single-mode)."""
-    
-    def __init__(self):
+    """Collects partial spectrum segments and reconstructs full sweeps.
+
+    The HackRF API returns small spectrum segments as the master sweeps the
+    configured frequency range.  To present a continuous sweep to the UI and
+    to drive the autopicks logic, segments must be aligned on a uniform
+    frequency grid and combined.  This class handles the accumulation and
+    interpolation of these segments.  When coverage exceeds 80 %, the
+    completed sweep is returned and internal state is reset.
+    """
+
+    def __init__(self) -> None:
+        # Frequency grid parameters
         self.f0_hz = 0
         self.f1_hz = 0
         self.bin_hz = 0
-        self.grid = None
+        self.grid: Optional[np.ndarray] = None
         self.n_bins = 0
-        self.sum = None
-        self.cnt = None
-        self.seen = None
-        self.prev_low = None
-        
-    def configure(self, cfg: SweepConfig):
+        # Accumulators
+        self.sum: Optional[np.ndarray] = None
+        self.cnt: Optional[np.ndarray] = None
+        self.seen: Optional[np.ndarray] = None
+        self.prev_low: Optional[int] = None
+
+    def configure(self, cfg: SweepConfig) -> None:
+        """Initialise the grid from the sweep configuration."""
         self.f0_hz = cfg.freq_start_hz
         self.f1_hz = cfg.freq_end_hz
         self.bin_hz = cfg.bin_hz
-        
-        # Создаем сетку частот
         self.grid = np.arange(
             self.f0_hz + self.bin_hz * 0.5,
             self.f1_hz + self.bin_hz * 0.5,
             self.bin_hz,
-            dtype=np.float64
+            dtype=np.float64,
         )
         self.n_bins = len(self.grid)
         self.reset()
-    
-    def reset(self):
+
+    def reset(self) -> None:
+        """Reset accumulators for a new sweep."""
         if self.n_bins == 0:
             return
-        self.sum = np.zeros(self.n_bins, np.float64)
-        self.cnt = np.zeros(self.n_bins, np.int32)
-        self.seen = np.zeros(self.n_bins, bool)
+        self.sum = np.zeros(self.n_bins, dtype=np.float64)
+        self.cnt = np.zeros(self.n_bins, dtype=np.int32)
+        self.seen = np.zeros(self.n_bins, dtype=bool)
         self.prev_low = None
-    
-    def add_segment(self, f_hz: np.ndarray, p_dbm: np.ndarray, hz_low: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """Добавляет сегмент и возвращает полный проход если готов."""
+
+    def add_segment(self, f_hz: np.ndarray, p_dbm: np.ndarray, hz_low: int
+                    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Add a partial segment and return a full sweep when ready.
+
+        Segments are aligned on the internal grid via nearest-neighbour
+        mapping.  When coverage reaches at least 80 % of the grid or when
+        a wraparound (frequency decreasing) is detected, the accumulated
+        sweep is finalised, interpolated and returned.  After returning
+        a sweep the assembler resets its accumulators.
+        """
         if self.grid is None or self.n_bins == 0:
             return None
-        
-        # Детекция обмотки
+        # Detect wraparound (the sweep restarted from the beginning)
         if self.prev_low is not None and hz_low < self.prev_low - 10e6:
             result = self._finalize()
             self.reset()
             self.prev_low = hz_low
             self._add_to_grid(f_hz, p_dbm)
             return result
-        
+        # Add segment to grid
         self.prev_low = hz_low
         self._add_to_grid(f_hz, p_dbm)
-        
-        # Проверяем покрытие
-        coverage = float(self.seen.sum()) / float(self.n_bins) if self.n_bins else 0
-        if coverage >= 0.95:
+        coverage = float(self.seen.sum()) / float(self.n_bins) if self.n_bins else 0.0
+        # Finalise more eagerly: once we have covered at least 80 % of the grid,
+        # produce a sweep.  The remaining gaps will be interpolated.  This
+        # improves responsiveness for large sweeps (e.g. 50–6000 MHz) where
+        # complete coverage may take many segments.
+        if coverage >= 0.80:
             result = self._finalize()
             self.reset()
             return result
-        
         return None
-    
-    def _add_to_grid(self, f_hz: np.ndarray, p_dbm: np.ndarray):
-        """Раскладывает сегмент в сетку."""
+
+    def _add_to_grid(self, f_hz: np.ndarray, p_dbm: np.ndarray) -> None:
+        """Map a segment onto the frequency grid and accumulate power."""
         idx = np.rint((f_hz - self.grid[0]) / self.bin_hz).astype(np.int32)
         mask = (idx >= 0) & (idx < self.n_bins)
         if not np.any(mask):
             return
-        
         idx = idx[mask]
         p = p_dbm[mask].astype(np.float64)
-        
         np.add.at(self.sum, idx, p)
         np.add.at(self.cnt, idx, 1)
         self.seen[idx] = True
-    
+
     def _finalize(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """Финализирует текущий проход."""
+        """Finalise the current sweep and return interpolated data."""
         if self.n_bins == 0:
             return None
-        
         coverage = float(self.seen.sum()) / float(self.n_bins)
         if coverage < 0.5:
             return None
-        
-        p = np.full(self.n_bins, np.nan, np.float32)
+        # Average power for bins with data
+        p = np.full(self.n_bins, np.nan, dtype=np.float32)
         valid = self.cnt > 0
         p[valid] = (self.sum[valid] / self.cnt[valid]).astype(np.float32)
-        
-        # Интерполируем пропуски
+        # Interpolate missing bins
         if np.isnan(p).any():
             vmask = ~np.isnan(p)
             if vmask.any():
                 p = np.interp(np.arange(self.n_bins), np.flatnonzero(vmask), p[vmask]).astype(np.float32)
             p[np.isnan(p)] = -120.0
-        
         return self.grid.copy(), p
-
-
-class _Worker(QtCore.QObject, threading.Thread):
-    """Worker для single-SDR режима (обратная совместимость)."""
-    
-    finished_sig = QtCore.pyqtSignal(int, str)
-
-    def __init__(self, parent_obj: HackRFLibSource, ffi, lib, cfg: SweepConfig, 
-                 serial_suffix: Optional[str], assembler: _SweepAssembler):
-        QtCore.QObject.__init__(self)
-        threading.Thread.__init__(self, daemon=True)
-        
-        self._parent = parent_obj
-        self._ffi = ffi
-        self._lib = lib
-        self._cfg = cfg
-        self._serial = serial_suffix
-        self._assembler = assembler
-        self._stop_ev = threading.Event()
-
-        @self._ffi.callback("void(const double*, const float*, int, double, uint64_t, uint64_t, void*)")
-        def _cb(freqs_ptr, pwr_ptr, n_bins, fft_bin_width_hz, f_low_hz, f_high_hz, user):
-            if self._stop_ev.is_set():
-                return
-            
-            try:
-                n = int(n_bins)
-                if n <= 0:
-                    return
-                
-                # Копируем данные
-                freqs = np.frombuffer(self._ffi.buffer(freqs_ptr, n * 8), dtype=np.float64, count=n).copy()
-                power = np.frombuffer(self._ffi.buffer(pwr_ptr, n * 4), dtype=np.float32, count=n).copy()
-                
-                # Проверяем валидность
-                if np.all(np.isnan(power)) or np.all(power == 0):
-                    return
-                
-                # Отправляем сегмент
-                bin_hz = int(round(float(fft_bin_width_hz))) or int(self._cfg.bin_hz)
-                sw = SweepLine(
-                    ts=None,
-                    f_low_hz=int(f_low_hz),
-                    f_high_hz=int(f_high_hz),
-                    bin_hz=bin_hz,
-                    power_dbm=power
-                )
-                self._parent.sweepLine.emit(sw)
-                
-                # Собираем полный проход
-                result = self._assembler.add_segment(freqs, power, int(f_low_hz))
-                if result is not None:
-                    full_freqs, full_power = result
-                    self._parent.fullSweepReady.emit(full_freqs, full_power)
-                    
-            except Exception as e:
-                self._parent.status.emit(f"Callback error: {e}")
-
-        self._cb = _cb
-
-    def run(self):
-        code = 0
-        msg = ""
-        
-        try:
-            # Открываем устройство
-            c_ser = self._ffi.NULL if not self._serial else self._ffi.new("char[]", self._serial.encode("utf-8"))
-            r = self._lib.hq_open(c_ser)
-            if r != 0:
-                msg = self._last_err(f"hq_open() failed ({r})")
-                self.finished_sig.emit(1, msg)
-                return
-
-            # Конфигурируем
-            cfg = self._cfg
-            r = self._lib.hq_configure(
-                float(cfg.freq_start_hz) / 1e6,
-                float(cfg.freq_end_hz) / 1e6,
-                float(cfg.bin_hz),
-                int(cfg.lna_db),
-                int(cfg.vga_db),
-                int(1 if cfg.amp_on else 0)
-            )
-            if r != 0:
-                msg = self._last_err(f"hq_configure() failed ({r})")
-                self._lib.hq_close()
-                self.finished_sig.emit(2, msg)
-                return
-
-            # Запускаем
-            r = self._lib.hq_start(self._cb, self._ffi.NULL)
-            if r != 0:
-                msg = self._last_err(f"hq_start() failed ({r})")
-                self._lib.hq_close()
-                self.finished_sig.emit(3, msg)
-                return
-
-            # Ждем остановки
-            while not self._stop_ev.wait(0.05):
-                pass
-
-            self._lib.hq_stop()
-            self._lib.hq_close()
-
-        except Exception as e:
-            code, msg = 99, f"Worker exception: {e}"
-        finally:
-            self.finished_sig.emit(code, msg)
-
-    def ask_stop(self):
-        self._stop_ev.set()
-
-    def _last_err(self, prefix: str) -> str:
-        try:
-            c = self._lib.hq_last_error()
-            if c != self._ffi.NULL:
-                s = self._ffi.string(c).decode(errors="ignore")
-                return f"{prefix}: {s}" if prefix else s
-        except Exception:
-            pass
-        return prefix or ""
