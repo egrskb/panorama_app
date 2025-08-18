@@ -104,6 +104,8 @@ class HackRFLibSource(SourceBackend):
         }
         # Running flag used to track whether a worker is active.
         self._running = False
+        # Cache for device enumeration to avoid repeated heavy queries
+        self._serials_cache: Tuple[List[str], float] = ([], 0.0)
 
     # ------------------------------------------------------------------
     # CFFI binding helpers
@@ -240,6 +242,11 @@ class HackRFLibSource(SourceBackend):
         The driver is shut down immediately afterwards to avoid resource
         leakage.
         """
+        # Serve from cache if fresh
+        now = time.time()
+        cached, ts = self._serials_cache
+        if cached and (now - ts) < 2.0:
+            return list(cached)
         out: List[str] = []
         if self._lib is None:
             return out
@@ -283,29 +290,20 @@ class HackRFLibSource(SourceBackend):
                     pass
         except Exception:
             pass
-        # Fall back to single‑SDR API if no devices found via multi‑SDR
-        if not out:
-            try:
-                n = int(self._lib.hq_device_count())
-                for i in range(n):
-                    buf = self._ffi.new("char[128]")
-                    if self._lib.hq_get_device_serial(i, buf, 127) == 0:
-                        s = self._ffi.string(buf).decode(errors="ignore")
-                        if s and s != "0000000000000000":
-                            out.append(s)
-            except Exception:
-                pass
+        # Note: avoid calling legacy single-SDR APIs which are not declared in cdef
         # Shut down HackRF driver if we initialised it
         try:
             if hackrf is not None and hasattr(hackrf, "hackrf_exit"):
                 hackrf.hackrf_exit()
         except Exception:
             pass
-        return out
+        # Update cache
+        self._serials_cache = (list(out), now)
+        return list(out)
 
     def is_running(self) -> bool:
         """Check if the worker thread is active."""
-        return self._running and self._worker is not None and self._worker.is_alive()
+        return self._running and self._worker is not None and self._worker.isRunning()
 
     def start(self, config: SweepConfig) -> None:
         """Start data acquisition with the given sweep configuration.
@@ -346,10 +344,13 @@ class HackRFLibSource(SourceBackend):
         print("⏹️ Остановка SDR...")
         self.status.emit("Остановка...")
         if self._worker:
-            self._worker.stop()
-            # Wait for thread to exit gracefully
-            self._worker.join(timeout=2.0)
-            self._worker = None
+            try:
+                self._worker.stop()
+                # Wait for thread to exit gracefully
+                if not self._worker.wait(2000):  # 2 seconds
+                    print("Worker did not stop in time; forcing close")
+            finally:
+                self._worker = None
         self._running = False
         self.finished.emit(0)
         self.status.emit("Остановлено")
@@ -387,18 +388,16 @@ class HackRFLibSource(SourceBackend):
         return None
 
 
-class _BaseWorker(QtCore.QObject, threading.Thread):
+class _BaseWorker(QtCore.QThread):
     """Base class for worker threads handling HackRF data acquisition.
 
-    Subclasses should implement the `run()` method to perform device
-    initialization, configuration, data reading and cleanup.  This base
-    class provides the common signal and stopping mechanism.
+    Implemented as a QThread to ensure robust signal delivery across threads
+    and graceful shutdown coordinated with the Qt event loop.
     """
     finished_sig = QtCore.pyqtSignal(int, str)
 
-    def __init__(self) -> None:
-        QtCore.QObject.__init__(self)
-        threading.Thread.__init__(self, daemon=True)
+    def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
+        super().__init__(parent)
         self._running = True
         self._stop_ev = threading.Event()
 
@@ -406,6 +405,7 @@ class _BaseWorker(QtCore.QObject, threading.Thread):
         """Request the worker to stop."""
         self._running = False
         self._stop_ev.set()
+        self.requestInterruption()
 
 
 class _SingleWorker(_BaseWorker):
@@ -421,7 +421,7 @@ class _SingleWorker(_BaseWorker):
 
     def __init__(self, parent: HackRFLibSource, ffi: FFI, lib: Any, config: SweepConfig,
                  assembler: _SweepAssembler) -> None:
-        super().__init__()
+        super().__init__(parent)
         self._parent = parent
         self._ffi = ffi
         self._lib = lib
@@ -480,7 +480,7 @@ class _SingleWorker(_BaseWorker):
             freqs_buf = self._ffi.new("double[]", max_points)
             powers_buf = self._ffi.new("float[]", max_points)
             last_log_time = time.time()
-            while self._running and not self._stop_ev.is_set():
+            while self._running and not self._stop_ev.is_set() and not self.isInterruptionRequested():
                 # Read spectrum; blocks until at least one segment is available
                 n = self._lib.hq_get_master_spectrum(freqs_buf, powers_buf, max_points)
                 if n > 0:
@@ -504,6 +504,7 @@ class _SingleWorker(_BaseWorker):
                             )
                             last_log_time = time.time()
                 # Small delay to limit CPU usage
+                # Use small sleep to reduce CPU without impacting latency
                 time.sleep(0.02)
         except Exception as e:
             code, msg = 99, str(e)
@@ -536,7 +537,7 @@ class _MultiWorker(_BaseWorker):
 
     def __init__(self, parent: HackRFLibSource, ffi: FFI, lib: Any, config: SweepConfig,
                  num_devices: int, assembler: _SweepAssembler) -> None:
-        super().__init__()
+        super().__init__(parent)
         self._parent = parent
         self._ffi = ffi
         self._lib = lib
@@ -600,7 +601,7 @@ class _MultiWorker(_BaseWorker):
             watch_buf = self._ffi.new("WatchItem[100]")
             last_log_time = time.time()
             last_watch_time = 0.0
-            while self._running and not self._stop_ev.is_set():
+            while self._running and not self._stop_ev.is_set() and not self.isInterruptionRequested():
                 # 1. Master spectrum
                 n = self._lib.hq_get_master_spectrum(freqs_buf, powers_buf, max_points)
                 if n > 0:
