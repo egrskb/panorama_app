@@ -429,6 +429,8 @@ class _SingleWorker(_BaseWorker):
         self._assembler = assembler
         # counters for logging
         self._spectrum_updates = 0
+        self._segment_emit_decim = 5
+        self._segment_emit_count = 0
 
     def run(self) -> None:
         code = 0
@@ -488,8 +490,10 @@ class _SingleWorker(_BaseWorker):
                     power = np.frombuffer(self._ffi.buffer(powers_buf, n * 4), dtype=np.float32, count=n).copy()
                     # Discard NaNs or zeroed outputs
                     if not (np.all(np.isnan(power)) or np.all(power == 0)):
-                        # Emit the raw segment as a full sweep update for quick UI refresh
-                        self._parent.fullSweepReady.emit(freqs, power)
+                        # Throttle raw segment emissions to reduce UI load
+                        self._segment_emit_count += 1
+                        if (self._segment_emit_count % self._segment_emit_decim) == 0:
+                            self._parent.fullSweepReady.emit(freqs, power)
                         self._spectrum_updates += 1
                         # Assemble into a full sweep
                         result = self._assembler.add_segment(freqs, power, int(freqs[0]))
@@ -547,6 +551,8 @@ class _MultiWorker(_BaseWorker):
         # Logging counters
         self._spectrum_updates = 0
         self._watchlist_updates = 0
+        self._segment_emit_decim = 5
+        self._segment_emit_count = 0
 
     def run(self) -> None:
         code = 0
@@ -608,7 +614,10 @@ class _MultiWorker(_BaseWorker):
                     freqs = np.frombuffer(self._ffi.buffer(freqs_buf, n * 8), dtype=np.float64, count=n).copy()
                     power = np.frombuffer(self._ffi.buffer(powers_buf, n * 4), dtype=np.float32, count=n).copy()
                     if not np.all(np.isnan(power)):
-                        self._parent.fullSweepReady.emit(freqs, power)
+                        # Throttle raw segment emissions to reduce UI load
+                        self._segment_emit_count += 1
+                        if (self._segment_emit_count % self._segment_emit_decim) == 0:
+                            self._parent.fullSweepReady.emit(freqs, power)
                         self._spectrum_updates += 1
                         # Assemble full sweep
                         result = self._assembler.add_segment(freqs, power, int(freqs[0]))

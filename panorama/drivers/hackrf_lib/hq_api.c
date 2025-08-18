@@ -375,10 +375,14 @@ int hq_get_master_spectrum(double* freqs_hz, float* powers_dbm, int max_points) 
     extern int hq_get_spectrum(double* freqs, float* powers, int max_points);
     int result = hq_get_spectrum(freqs_hz, powers_dbm, max_points);
     
-    printf("hq_get_master_spectrum: returned %d points\n", result);
-    if (result > 0) {
-        printf("First few values: freq[0]=%.1f MHz, power[0]=%.1f dBm\n", 
-               freqs_hz[0]/1e6, powers_dbm[0]);
+    static int log_counter = 0;
+    log_counter++;
+    if ((log_counter % 50) == 0) {
+        printf("hq_get_master_spectrum: returned %d points\n", result);
+        if (result > 0) {
+            printf("First few values: freq[0]=%.1f MHz, power[0]=%.1f dBm\n", 
+                   freqs_hz[0]/1e6, powers_dbm[0]);
+        }
     }
     
     return result;

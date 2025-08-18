@@ -213,7 +213,8 @@ static int master_rx_cb(hackrf_transfer* t) {
                     (*cnt)++;
 
                     // Детекция пиков для watchlist
-                    if (dbm > -80.0f) {  // Порог детекции
+                    // Decimate peak insertion to reduce queue pressure
+                    if ((i % d->peak_decim) == 0 && dbm > -80.0f) {
                         add_peak(f_hz, dbm);
                     }
                 }
@@ -242,7 +243,7 @@ static int master_rx_cb(hackrf_transfer* t) {
                     }
                     (*cnt)++;
 
-                    if (dbm > -80.0f) {
+                    if ((i % d->peak_decim) == 0 && dbm > -80.0f) {
                         add_peak(f_hz, dbm);
                     }
                 }
