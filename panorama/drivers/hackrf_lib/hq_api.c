@@ -15,6 +15,17 @@
 #include <errno.h>
 #include <sys/time.h>  // Для gettimeofday
 
+#ifdef HQ_DEBUG
+static int hq_debug_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* env = getenv("HQ_DEBUG");
+        enabled = (env && *env) ? 1 : 0;
+    }
+    return enabled;
+}
+#endif
+
 // Global state
 static SdrCtx g_devs[MAX_DEVICES];
 static int g_num_devs = 0;
@@ -370,17 +381,21 @@ int hq_get_master_spectrum(double* freqs_hz, float* powers_dbm, int max_points) 
         printf("hq_get_master_spectrum: Invalid parameters\n");
         return -1;
     }
-    
+
     // Используем функцию из hq_init.c
     extern int hq_get_spectrum(double* freqs, float* powers, int max_points);
     int result = hq_get_spectrum(freqs_hz, powers_dbm, max_points);
-    
-    printf("hq_get_master_spectrum: returned %d points\n", result);
-    if (result > 0) {
-        printf("First few values: freq[0]=%.1f MHz, power[0]=%.1f dBm\n", 
-               freqs_hz[0]/1e6, powers_dbm[0]);
+
+#ifdef HQ_DEBUG
+    if (hq_debug_enabled()) {
+        printf("hq_get_master_spectrum: returned %d points\n", result);
+        if (result > 0) {
+            printf("First few values: freq[0]=%.1f MHz, power[0]=%.1f dBm\n",
+                   freqs_hz[0]/1e6, powers_dbm[0]);
+        }
     }
-    
+#endif
+
     return result;
 }
 

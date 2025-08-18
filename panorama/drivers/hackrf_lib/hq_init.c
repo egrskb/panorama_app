@@ -14,6 +14,7 @@
 #include <stdarg.h>
 #include <math.h>
 #include <errno.h>
+#include <fftw3.h>
 
 /* ===================== Глобалы ===================== */
 
@@ -33,6 +34,11 @@ static float  g_spectrum_powers[MAX_SPECTRUM_POINTS];
 static int    g_spectrum_points = 0;
 static _Atomic bool g_spectrum_ready = false;
 static pthread_mutex_t g_spectrum_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t g_fftw_once = PTHREAD_ONCE_INIT;
+
+static void ensure_fftw_threadsafe(void) {
+    fftwf_make_planner_thread_safe();
+}
 
 /* ===================== Вспомогалочки ===================== */
 
@@ -100,6 +106,8 @@ int init_devices(SdrCtx* devs, int n, const SdrParams* defaults) {
         fprintf(stderr, "Invalid parameters: devs=%p, n=%d\n", devs, n);
         return -EINVAL;
     }
+
+    pthread_once(&g_fftw_once, ensure_fftw_threadsafe);
 
     int r = hackrf_init();
     if (r != HACKRF_SUCCESS) {
@@ -218,6 +226,7 @@ void teardown_devices(SdrCtx* devs, int n) {
     }
 
     hackrf_exit();
+    fftwf_cleanup();
 }
 
 /* ===================== Непрерывный спектр мастера ===================== */

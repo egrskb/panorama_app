@@ -196,19 +196,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(object)
     def _on_peaks_ready(self, peaks):
-        """peaks: List[Tuple[freq_hz, dbm]] — добавляем/обновляем записи автопиков."""
-        # Передаем данные в виджет автопиков
+        """peaks: sequence of detections → добавляем/обновляем записи автопиков."""
+        # Передаем данные в виджет автопиков. AutoPeaksEngine ожидает кортежи
+        # вида (freq_hz, dbm, width_khz, q_factor, above_noise_db). Если
+        # дополнительные параметры отсутствуют, заполняем нулями.
         if hasattr(self.peaks_tab, 'get_engine'):
             engine = self.peaks_tab.get_engine()
-            flat: List[Tuple[float, float]] = []
+            flat: List[Tuple[float, float, float, float, float]] = []
             for p in peaks:
                 try:
-                    # поддержка форматов (f, dbm) или объектов с полями
                     if isinstance(p, (list, tuple)) and len(p) >= 2:
                         f, dbm = float(p[0]), float(p[1])
+                        width = float(p[2]) if len(p) > 2 else 0.0
+                        q = float(p[3]) if len(p) > 3 else 0.0
+                        an = float(p[4]) if len(p) > 4 else 0.0
                     else:
-                        f, dbm = float(getattr(p, "freq_hz")), float(getattr(p, "dbm"))
-                    flat.append((f, dbm))
+                        f = float(getattr(p, "freq_hz"))
+                        dbm = float(getattr(p, "dbm"))
+                        width = float(getattr(p, "width_khz", 0.0))
+                        q = float(getattr(p, "q_factor", 0.0))
+                        an = float(getattr(p, "above_noise_db", 0.0))
+                    flat.append((f, dbm, width, q, an))
                 except Exception:
                     continue
             if flat:
