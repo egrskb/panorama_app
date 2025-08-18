@@ -38,6 +38,10 @@
 #define TUNE_STEP_HZ 20000000u
 #define OFFSET_HZ     7500000u
 
+#ifndef MAX_SPECTRUM_POINTS
+#define MAX_SPECTRUM_POINTS 50000
+#endif
+
 // Внешние функции
 extern void hq_on_peak_detected(SdrCtx* ctx, double f_hz, float dbm);
 
@@ -186,8 +190,6 @@ static int master_rx_cb(hackrf_transfer* t) {
             );
         }
 
-        // const double bw = d->bin_w;  // Unused variable
-
         // Секция A: [frequency, frequency + Fs/4)
         {
             uint64_t hz_low = frequency;
@@ -306,7 +308,10 @@ static void* master_thread_fn(void* arg) {
     printf("Master: Window corrections: power loss = %.2f dB, ENBW = %.2f dB\n",
            d->window_power_loss_db, d->enbw_correction_db);
 
+    // Создание плана FFTW не потокобезопасно — защищаем глобальным мьютексом
+    pthread_mutex_lock(&g_fftw_planner_mutex);
     d->plan = fftwf_plan_dft_1d(d->N, d->in, d->out, FFTW_FORWARD, FFTW_ESTIMATE);
+    pthread_mutex_unlock(&g_fftw_planner_mutex);
     fftwf_execute(d->plan);  // Прогрев
 
     // Предвычисления
@@ -415,8 +420,8 @@ static void* master_thread_fn(void* arg) {
                 update_count++;
                 no_data_count = 0;  // Сбрасываем счетчик
                 
-                // Логируем каждые 10 обновлений (1 секунда)
-                if (update_count % 10 == 0) {
+                // Логируем каждые 20 обновлений (~2 секунды)
+                if (update_count % 20 == 0) {
                     // Находим максимум для диагностики
                     float max_power = -200.0f;
                     for (size_t i = 0; i < d->n_points; i++) {
@@ -455,7 +460,11 @@ static void* master_thread_fn(void* arg) {
 cleanup:
     printf("Master: Cleanup\n");
     
-    if (d->plan) fftwf_destroy_plan(d->plan);
+    if (d->plan) {
+        pthread_mutex_lock(&g_fftw_planner_mutex);
+        fftwf_destroy_plan(d->plan);
+        pthread_mutex_unlock(&g_fftw_planner_mutex);
+    }
     if (d->in)   fftwf_free(d->in);
     if (d->out)  fftwf_free(d->out);
     free(d->pwr_db);

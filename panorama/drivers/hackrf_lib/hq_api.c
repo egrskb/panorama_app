@@ -151,15 +151,15 @@ void hq_close_all(void) {
     
     hq_stop();
     
-            // Stop grouping thread
-        pthread_mutex_lock(&g_grouping_mutex);
-        if (g_grouping_running) {
-            g_grouping_running = false;
-            pthread_mutex_unlock(&g_grouping_mutex);
-            pthread_join(g_grouping_thread, NULL);
-        } else {
-            pthread_mutex_unlock(&g_grouping_mutex);
-        }
+    // Stop grouping thread
+    pthread_mutex_lock(&g_grouping_mutex);
+    if (g_grouping_running) {
+        g_grouping_running = false;
+        pthread_mutex_unlock(&g_grouping_mutex);
+        pthread_join(g_grouping_thread, NULL);
+    } else {
+        pthread_mutex_unlock(&g_grouping_mutex);
+    }
     
     // Destroy peak queue
     if (g_peaks_queue) {
@@ -340,7 +340,10 @@ void hq_stop(void) {
 int hq_get_watchlist_snapshot(WatchItem* out, int max_items) {
     if (!out || max_items <= 0) return 0;
     
-    pthread_mutex_lock(&g_watchlist_mutex);
+    // Avoid blocking if the grouping thread is updating the watchlist
+    if (pthread_mutex_trylock(&g_watchlist_mutex) != 0) {
+        return 0;  // Busy, try again later
+    }
     
     int count = (g_watchlist_count < (size_t)max_items) ? (int)g_watchlist_count : max_items;
     if (count > 0) {
@@ -437,10 +440,13 @@ int hq_get_status(HqStatus* out) {
         out->retune_ms_avg = (double)(total_retune_ns / retune_count) / 1e6;
     }
     
-    // Get watchlist count
-    pthread_mutex_lock(&g_watchlist_mutex);
-    out->watch_items = g_watchlist_count;
-    pthread_mutex_unlock(&g_watchlist_mutex);
+    // Get watchlist count without blocking UI threads
+    if (pthread_mutex_trylock(&g_watchlist_mutex) == 0) {
+        out->watch_items = g_watchlist_count;
+        pthread_mutex_unlock(&g_watchlist_mutex);
+    } else {
+        // Leave as-is (zero) if busy
+    }
     
     return 0;
 }

@@ -428,6 +428,7 @@ class _SingleWorker(_BaseWorker):
         # counters for logging
         self._spectrum_updates = 0
 
+
     def run(self) -> None:
         code = 0
         msg = ""
@@ -478,6 +479,7 @@ class _SingleWorker(_BaseWorker):
             freqs_buf = self._ffi.new("double[]", max_points)
             powers_buf = self._ffi.new("float[]", max_points)
             last_log_time = time.time()
+
             while self._running and not self._stop_ev.is_set():
                 # Read spectrum; blocks until at least one segment is available
                 n = self._lib.hq_get_master_spectrum(freqs_buf, powers_buf, max_points)
@@ -492,8 +494,11 @@ class _SingleWorker(_BaseWorker):
                         # Assemble into a full sweep
                         result = self._assembler.add_segment(freqs, power, int(freqs[0]))
                         if result is not None:
-                            full_freqs, full_power = result
-                            self._parent.fullSweepReady.emit(full_freqs, full_power)
+                            now = time.time()
+                            if now - self._last_emit_ts >= self._emit_interval_s:
+                                full_freqs, full_power = result
+                                self._parent.fullSweepReady.emit(full_freqs, full_power)
+                                self._last_emit_ts = now
                         # Periodic logging
                         if time.time() - last_log_time > 5.0:
                             print(
@@ -503,7 +508,7 @@ class _SingleWorker(_BaseWorker):
                             last_log_time = time.time()
                 # Small delay to limit CPU usage
                 # Use small sleep to reduce CPU without impacting latency
-                time.sleep(0.02)
+                time.sleep(0.04)
         except Exception as e:
             code, msg = 99, str(e)
         finally:
@@ -545,6 +550,7 @@ class _MultiWorker(_BaseWorker):
         # Logging counters
         self._spectrum_updates = 0
         self._watchlist_updates = 0
+
 
     def run(self) -> None:
         code = 0
@@ -598,6 +604,7 @@ class _MultiWorker(_BaseWorker):
             peaks_buf = self._ffi.new("Peak[100]")
             watch_buf = self._ffi.new("WatchItem[100]")
             last_log_time = time.time()
+            self._last_emit_ts = time.time()
             last_watch_time = 0.0
             while self._running and not self._stop_ev.is_set():
                 # 1. Master spectrum
@@ -611,8 +618,11 @@ class _MultiWorker(_BaseWorker):
                         # Assemble full sweep
                         result = self._assembler.add_segment(freqs, power, int(freqs[0]))
                         if result is not None:
-                            full_freqs, full_power = result
-                            self._parent.fullSweepReady.emit(full_freqs, full_power)
+                            now = time.time()
+                            if now - self._last_emit_ts >= self._emit_interval_s:
+                                full_freqs, full_power = result
+                                self._parent.fullSweepReady.emit(full_freqs, full_power)
+                                self._last_emit_ts = now
                 # 2. Check peaks every ~100 ms to decide if watchlist should be queried
                 if time.time() - last_watch_time > 0.1:
                     last_watch_time = time.time()
@@ -655,7 +665,7 @@ class _MultiWorker(_BaseWorker):
                         )
                     last_log_time = time.time()
                 # Avoid busy loop
-                time.sleep(0.02)
+                time.sleep(0.04)
         except Exception as e:
             code, msg = 99, str(e)
         finally:
