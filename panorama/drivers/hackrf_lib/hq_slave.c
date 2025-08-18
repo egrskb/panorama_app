@@ -98,9 +98,11 @@ static int slave_rx_callback(hackrf_transfer* transfer) {
         clock_gettime(CLOCK_MONOTONIC, &ts);
         uint64_t now_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
         
+        bool enqueue = false;
+
         // Обновляем в watchlist
         pthread_mutex_lock(&g_watchlist_mutex);
-        
+
         for (size_t i = 0; i < g_watchlist_count; i++) {
             if (fabs(g_watchlist[i].f_center_hz - peak_freq) < data->bandwidth_hz) {
                 // Обновляем RSSI с EMA
@@ -109,21 +111,23 @@ static int slave_rx_callback(hackrf_transfer* transfer) {
                 );
                 g_watchlist[i].last_ns = now_ns;
                 g_watchlist[i].hit_count++;
-                
-                // Добавляем в очередь пиков для трилатерации
-                Peak peak = {
-                    .f_hz = peak_freq,
-                    .rssi_dbm = max_power,
-                    .last_ns = now_ns
-                };
-                peak_queue_push(g_peaks_queue, &peak);
+                enqueue = true;
                 break;
             }
         }
-        
+
         pthread_mutex_unlock(&g_watchlist_mutex);
+
+        if (enqueue) {
+            Peak peak = {
+                .f_hz = peak_freq,
+                .rssi_dbm = max_power,
+                .last_ns = now_ns
+            };
+            peak_queue_push(g_peaks_queue, &peak);
+        }
     }
-    
+
     return 0;
 }
 
