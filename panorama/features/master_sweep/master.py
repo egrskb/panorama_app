@@ -176,7 +176,7 @@ class MasterSweepController(QObject):
         self.step_hz = 200e3      # Шаг sweep
         self.avg_count = 1        # Количество усреднений
         
-        # Таймер для обновления детекции пиков
+        # Таймер для обновления детекции пиков — Master только обнаруживает и публикует пики
         self.peak_detection_timer = QTimer()
         self.peak_detection_timer.timeout.connect(self._update_peak_detection)
         self.peak_detection_timer.start(500)  # Каждые 500 мс

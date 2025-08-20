@@ -138,6 +138,13 @@ class SlaveSDR(QObject):
             
             # Настраиваем SDR на центральную частоту
             self.sdr.setFrequency(SOAPY_SDR_RX, 0, center_hz)
+            # Обеспечим полосу окна не больше доступной
+            if span_hz > self.bandwidth:
+                self.bandwidth = min(self.sample_rate * 0.8, span_hz)
+                try:
+                    self.sdr.setBandwidth(SOAPY_SDR_RX, 0, self.bandwidth)
+                except Exception:
+                    pass
             
             # Вычисляем количество сэмплов
             n_samples = int(self.sample_rate * dwell_ms / 1000)
@@ -145,7 +152,7 @@ class SlaveSDR(QObject):
             # Читаем IQ данные
             iq_data = self._read_iq_samples(n_samples)
             
-            # Вычисляем PSD и RSSI
+            # Вычисляем PSD и RSSI (среднеквадратичный в диапазоне)
             measurement = self._calculate_rssi(iq_data, center_hz, span_hz, n_samples)
             
             # Сбрасываем состояние
@@ -384,6 +391,16 @@ class SlaveManager(QObject):
             slave.measurement_complete.connect(self._on_measurement_complete)
             slave.measurement_error.connect(self._on_measurement_error)
             
+            if not slave.is_initialized:
+                # Инициализация не удалась — очищаем и сообщаем об ошибке
+                try:
+                    slave.close()
+                except Exception:
+                    pass
+                del self.slaves[slave_id]
+                self.log.error(f"Add slave failed (not initialized): {slave_id} ({uri})")
+                return False
+
             self.log.info(f"Added slave: {slave_id} ({uri})")
             return True
             

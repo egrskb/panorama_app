@@ -28,7 +28,9 @@ from panorama.features.calibration.manager import CalibrationManager
 from panorama.features.map3d import MapView
 from panorama.features.spectrum import SpectrumView
 from panorama.features.settings.dialog import SettingsDialog
+from panorama.features.settings.manager_improved import ImprovedDeviceManagerDialog
 from panorama.features.settings.storage import load_sdr_settings, save_sdr_settings
+from panorama.features.spectrum.master_adapter import MasterSourceAdapter
 
 
 class RSSIPanoramaMainWindow(QMainWindow):
@@ -264,27 +266,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
         
         layout.addWidget(params_group)
         
-        # Панель оркестратора
-        orchestrator_group = QGroupBox("Оркестратор")
-        orchestrator_layout = QVBoxLayout(orchestrator_group)
-        
-        # Кнопки управления
-        orch_buttons_layout = QHBoxLayout()
-        self.start_orch_btn = QPushButton("Старт")
-        self.start_orch_btn.clicked.connect(self._start_orchestrator)
-        orch_buttons_layout.addWidget(self.start_orch_btn)
-        
-        self.stop_orch_btn = QPushButton("Стоп")
-        self.stop_orch_btn.clicked.connect(self._stop_orchestrator)
-        self.stop_orch_btn.setEnabled(False)
-        orch_buttons_layout.addWidget(self.stop_orch_btn)
-        orchestrator_layout.addLayout(orch_buttons_layout)
-        
-        # Статус
-        self.orchestrator_status_label = QLabel("Статус: Остановлен")
-        orchestrator_layout.addWidget(self.orchestrator_status_label)
-        
-        layout.addWidget(orchestrator_group)
+        # Оркестратор перенесен в отдельную вкладку справа
         
         # Лог
         log_group = QGroupBox("Лог")
@@ -312,11 +294,21 @@ class RSSIPanoramaMainWindow(QMainWindow):
         
         # Вкладка спектра
         self.spectrum_view = SpectrumView()
+        # Привязываем источник к мастеру через адаптер, чтобы старт сразу запускал C-свип
+        try:
+            if self.master_controller:
+                self.spectrum_view.set_source(MasterSourceAdapter(self.master_controller))
+        except Exception:
+            pass
         tab_widget.addTab(self.spectrum_view, "Спектр")
         
         # Вкладка результатов
         results_widget = self._create_results_widget()
         tab_widget.addTab(results_widget, "Результаты")
+        
+        # Вкладка оркестратора
+        orch_widget = self._create_orchestrator_widget()
+        tab_widget.addTab(orch_widget, "Оркестратор")
         
         layout.addWidget(tab_widget)
         
@@ -353,6 +345,36 @@ class RSSIPanoramaMainWindow(QMainWindow):
         
         layout.addWidget(tasks_group)
         
+        return widget
+
+    def _create_orchestrator_widget(self):
+        """Создает вкладку управления оркестратором."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        
+        # Кнопки управления
+        buttons = QHBoxLayout()
+        self.start_orch_btn = QPushButton("Старт")
+        self.start_orch_btn.clicked.connect(self._start_orchestrator)
+        buttons.addWidget(self.start_orch_btn)
+        
+        self.stop_orch_btn = QPushButton("Стоп")
+        self.stop_orch_btn.clicked.connect(self._stop_orchestrator)
+        self.stop_orch_btn.setEnabled(False)
+        buttons.addWidget(self.stop_orch_btn)
+        
+        layout.addLayout(buttons)
+        
+        # Статус
+        self.orchestrator_status_label = QLabel("Статус: Остановлен")
+        layout.addWidget(self.orchestrator_status_label)
+        
+        # Пояснение
+        hint = QLabel("Оркестратор распределяет измерения по Slave (SoapySDR) для трилатерации.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        
+        layout.addStretch(1)
         return widget
     
     def _create_menu(self):
@@ -394,18 +416,14 @@ class RSSIPanoramaMainWindow(QMainWindow):
         """Создает панель инструментов."""
         toolbar = self.addToolBar('Основная панель')
         
-        # Кнопка старт/стоп Master
-        self.toolbar_master_action = toolbar.addAction('▶ Master')
-        self.toolbar_master_action.triggered.connect(self._toggle_master)
-        
         # Кнопка старт/стоп оркестратора
         self.toolbar_orch_action = toolbar.addAction('▶ Оркестратор')
         self.toolbar_orch_action.triggered.connect(self._toggle_orchestrator)
         
         toolbar.addSeparator()
         
-        # Кнопка настройки устройств (Master/Slaves)
-        toolbar.addAction('⚙ Устройства', self._open_settings)
+        # Только новый диспетчер устройств
+        toolbar.addAction('🧭 Диспетчер устройств', self._open_device_manager)
         
         # Убираем дублирование кнопки "Измерить" в тулбаре — остаётся кнопка в параметрах
     
@@ -434,174 +452,56 @@ class RSSIPanoramaMainWindow(QMainWindow):
             self.log.error(f"Error connecting signals: {e}")
 
     def _open_settings(self):
-        """Открывает диалог настроек устройств (Master/Slaves)."""
+        # Устаревший диалог — переадресация на новый диспетчер
+        self._open_device_manager()
+
+    def _open_device_manager(self):
         current = {
             'master': {
-                'enabled': True,
                 'nickname': self.sdr_settings.get('master', {}).get('nickname', 'Master'),
-                'uri': self.sdr_settings.get('master', {}).get('serial', ''),
-                'pos': self.sdr_settings.get('master', {}).get('pos', [0.0, 0.0, 0.0]),
+                'serial': self.sdr_settings.get('master', {}).get('serial', ''),
+                'pos': [0.0, 0.0, 0.0],
             },
             'slaves': self.sdr_settings.get('slaves', [])
         }
-        dlg = SettingsDialog(self, current)
-        # Попробуем заполнить список доступных HackRF через C-библиотеку
-        try:
-            if self.master_controller and getattr(self.master_controller, 'sweep_source', None):
-                devs = self.master_controller.sweep_source.enumerate_devices()
-                dlg.master_uri.clear()
-                dlg.master_uri.addItem("(нет)")
-                for s in devs or []:
-                    dlg.master_uri.addItem(s if s else "(по умолчанию)")
-        except Exception:
-            pass
-        # Заполним список Slaves через SoapySDR, если доступен
-        try:
-            if self.slave_manager:
-                devices = self.slave_manager.enumerate_soapy_devices()
-                if devices and hasattr(dlg, 'populate_slave_devices'):
-                    dlg.populate_slave_devices(devices)
-        except Exception:
-            pass
-        def _save(data: dict):
-            # Применяем Master (пока просто храним URI; запуск/стоп — через кнопки)
-            # Применяем Slaves: пересоздаём список ТОЛЬКО из сохранённых строк, не автодобавляем найденные
-            if self.slave_manager:
-                # Удаляем текущие
-                for sid in list(self.slave_manager.slaves.keys()):
-                    self.slave_manager.remove_slave(sid)
-                # Добавляем устройства из таблицы диалога
-                for idx, entry in enumerate(data.get('slaves', []), start=1):
-                    sid = entry.get('nickname') or (entry.get('label') or entry.get('serial') or f"slave{idx:02d}")
-                    uri = entry.get('uri') or (f"driver={entry.get('driver')}" if entry.get('driver') else '')
-                    if uri:
-                        self.slave_manager.add_slave(sid, uri)
-            # Обновим настройки в памяти и сохраним на диск
-            self.sdr_settings = {
-                'master': {
-                    'nickname': data.get('master', {}).get('nickname') or 'Master',
-                    'serial': '' if data.get('master', {}).get('uri') in ('', '(нет)') else data.get('master', {}).get('uri'),
-                    'pos': [0.0, 0.0, 0.0],  # Master всегда (0,0,0)
-                },
-                'slaves': []
-            }
-            for entry in data.get('slaves', []):
-                pos = entry.get('pos') or [0.0, 0.0, 0.0]
-                self.sdr_settings['slaves'].append({
-                    'nickname': entry.get('nickname') or '',
-                    'uri': entry.get('uri') or '',
-                    'driver': entry.get('driver') or '',
-                    'serial': entry.get('serial') or '',
-                    'label': entry.get('label') or '',
-                    'pos': pos,
-                })
-            save_sdr_settings(self.sdr_settings)
-            # Применим выбранный serial для Master
+        dlg = ImprovedDeviceManagerDialog(self, current)
+        def _on_conf(data: dict):
+            # Apply to runtime
+            self.sdr_settings = data
+            # Master
             try:
-                master_serial = data.get('master', {}).get('uri')
-                if master_serial in ('(по умолчанию)',):
-                    master_serial = ''
+                serial = data.get('master', {}).get('serial')
                 if self.master_controller and getattr(self.master_controller, 'sweep_source', None):
-                    if master_serial in ('', '(нет)'):
-                        # Отключаем мастер
+                    if not serial:
                         self.master_controller.stop_sweep()
                         self.master_controller.sweep_source.set_serial(None)
                     else:
-                        self.master_controller.sweep_source.set_serial(master_serial)
-                        # Пробуем заранее проинициализировать/проверить — если не доступен, не падаем
-                        self.master_controller.sweep_source.probe()
+                        self.master_controller.sweep_source.set_serial(serial)
             except Exception:
                 pass
-            # Обновим таблицу слейвов, если она присутствует
+            # Rebuild slaves
             try:
-                self._update_slave_table()
+                if self.slave_manager:
+                    for sid in list(self.slave_manager.slaves.keys()):
+                        self.slave_manager.remove_slave(sid)
+                    for idx, s in enumerate(data.get('slaves', []), start=1):
+                        sid = s.get('nickname') or (s.get('label') or s.get('serial') or f"slave{idx:02d}")
+                        uri = s.get('uri') or (f"driver={s.get('driver')}" if s.get('driver') else '')
+                        if uri:
+                            self.slave_manager.add_slave(sid, uri)
+                try:
+                    self._update_slave_table()
+                except Exception:
+                    pass
             except Exception:
                 pass
-        dlg.saved.connect(_save)
-        def _next(payload: dict):
-            # Внешняя логика "Далее": валидируем мастер, блокируем вкладку Master и подгружаем Slaves
+            # Re-configure trilateration stations
             try:
-                master_serial = payload.get('master', {}).get('uri')
-                if master_serial in ('(по умолчанию)',):
-                    master_serial = ''
-                if self.master_controller and getattr(self.master_controller, 'sweep_source', None):
-                    if master_serial in ('', '(нет)'):
-                        # Ручной режим без мастера допустим
-                        self.master_controller.stop_sweep()
-                        self.master_controller.sweep_source.set_serial(None)
-                        # Обновим список Slaves
-                        if self.slave_manager and hasattr(dlg, 'populate_slave_devices'):
-                            devices = self.slave_manager.enumerate_soapy_devices()
-                            # Дедуп
-                            uniq, seen = [], set()
-                            for d in devices or []:
-                                key = (d.get('serial') or '').strip() or (d.get('uri') or '').strip() or d.get('label','')
-                                if key in seen:
-                                    continue
-                                seen.add(key)
-                                uniq.append(d)
-                            dlg.populate_slave_devices(uniq)
-                            if hasattr(dlg, 'apply_saved_overrides'):
-                                dlg.apply_saved_overrides(self.sdr_settings.get('slaves', []))
-                        if hasattr(dlg, 'proceed_to_slaves'):
-                            dlg.proceed_to_slaves()
-                    else:
-                        self.master_controller.sweep_source.set_serial(master_serial)
-                        if self.master_controller.sweep_source.probe():
-                            # Исключаем мастер HackRF из списка Slaves (если Soapy его показывает)
-                            if self.slave_manager and hasattr(dlg, 'populate_slave_devices'):
-                                devices = self.slave_manager.enumerate_soapy_devices()
-                                filtered = []
-                                for d in devices or []:
-                                    if (d.get('driver') == 'hackrf') and d.get('serial') == master_serial:
-                                        continue
-                                    filtered.append(d)
-                                # Дедуп
-                                uniq, seen = [], set()
-                                for d in filtered:
-                                    key = (d.get('serial') or '').strip() or (d.get('uri') or '').strip() or d.get('label','')
-                                    if key in seen:
-                                        continue
-                                    seen.add(key)
-                                    uniq.append(d)
-                                dlg.populate_slave_devices(uniq)
-                                if hasattr(dlg, 'apply_saved_overrides'):
-                                    dlg.apply_saved_overrides(self.sdr_settings.get('slaves', []))
-                            if hasattr(dlg, 'proceed_to_slaves'):
-                                dlg.proceed_to_slaves()
-                        else:
-                            QMessageBox.critical(self, "Master", "Выбранный HackRF недоступен")
-                else:
-                    # Нет контроллера — просто показываем Slaves
-                    if self.slave_manager and hasattr(dlg, 'populate_slave_devices'):
-                        devices = self.slave_manager.enumerate_soapy_devices()
-                        dlg.populate_slave_devices(devices)
-                        if hasattr(dlg, 'apply_saved_overrides'):
-                            dlg.apply_saved_overrides(self.sdr_settings.get('slaves', []))
-                    if hasattr(dlg, 'proceed_to_slaves'):
-                        dlg.proceed_to_slaves()
-            except Exception as e:
-                QMessageBox.critical(self, "Master", f"Ошибка при проверке Master: {e}")
-        dlg.next_step.connect(_next)
-
-        # Пополняем Slaves обнаруженными устройствами и применяем сохранённые правки (с дедупликацией)
-        try:
-            if self.slave_manager:
-                devices = self.slave_manager.enumerate_soapy_devices()
-                uniq = []
-                seen = set()
-                for d in devices or []:
-                    key = (d.get('serial') or '').strip() or (d.get('uri') or '').strip() or d.get('label','')
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    uniq.append(d)
-                if uniq and hasattr(dlg, 'populate_slave_devices'):
-                    dlg.populate_slave_devices(uniq)
-                    if hasattr(dlg, 'apply_saved_overrides'):
-                        dlg.apply_saved_overrides(self.sdr_settings.get('slaves', []))
-        except Exception:
-            pass
+                self.trilateration_engine.stations.clear()
+                self._setup_trilateration()
+            except Exception:
+                pass
+        dlg.devicesConfigured.connect(_on_conf)
         dlg.exec_()
     
     def _load_calibration(self):
@@ -611,53 +511,6 @@ class RSSIPanoramaMainWindow(QMainWindow):
             self.log.info("Calibration loaded successfully")
         except Exception as e:
             self.log.error(f"Error loading calibration: {e}")
-    
-    def _start_master(self):
-        """Запускает Master sweep."""
-        try:
-            # Используем дефолтные параметры, т.к. элементы управления убраны в упрощённом UI
-            start_hz = 24e6
-            stop_hz = 6e9
-            bin_hz = 200e3
-            dwell_ms = self.global_dwell_spin.value()
-            
-            self.master_controller.start_sweep(
-                start_hz=start_hz,
-                stop_hz=stop_hz,
-                bin_hz=bin_hz,
-                dwell_ms=dwell_ms
-            )
-            
-            self.toolbar_master_action.setText('⏹ Master')
-            
-            self.system_status['master_running'] = True
-            self.log.info("Master sweep started")
-            
-        except Exception as e:
-            self.log.error(f"Error starting master: {e}")
-            QMessageBox.critical(self, "Ошибка", f"Не удалось запустить Master: {e}")
-    
-    def _stop_master(self):
-        """Останавливает Master sweep."""
-        try:
-            self.master_controller.stop_sweep()
-            
-            self.start_master_btn.setEnabled(True)
-            self.stop_master_btn.setEnabled(False)
-            self.toolbar_master_action.setText('▶ Master')
-            
-            self.system_status['master_running'] = False
-            self.log.info("Master sweep stopped")
-            
-        except Exception as e:
-            self.log.error(f"Error stopping master: {e}")
-    
-    def _toggle_master(self):
-        """Переключает состояние Master."""
-        if self.system_status['master_running']:
-            self._stop_master()
-        else:
-            self._start_master()
     
     def _add_slave(self):
         """Добавляет новый slave SDR."""

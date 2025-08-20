@@ -184,10 +184,10 @@ class Orchestrator(QObject):
         try:
             self._mutex.lock()
             
-            # Создаем окно измерения
+            # Создаем окно измерения с параметрами GUI (глобальные)
             window = MeasurementWindow(
                 center=peak.f_peak,
-                span=peak.span_user,
+                span=self.global_span_hz,
                 dwell_ms=self.global_dwell_ms,
                 epoch=time.time()
             )
