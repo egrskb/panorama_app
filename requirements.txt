@@ -6,6 +6,9 @@ numpy>=1.20.0
 # For CFFI/libhackrf support
 cffi>=1.15.0
 
+# UI theme (dark)
+qdarkstyle<3
+
 # For color palettes (optional but recommended)
 matplotlib>=3.3.0
 
@@ -14,7 +17,6 @@ PyYAML>=5.4.0
 
 # RSSI Trilateration dependencies
 scipy>=1.7.0
-SoapySDR>=0.8.0
 
 # Development dependencies (optional)
 # Uncomment for development

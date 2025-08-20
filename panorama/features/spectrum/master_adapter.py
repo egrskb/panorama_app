@@ -28,10 +28,10 @@ class MasterSourceAdapter(SourceBackend):
         # Передаём параметры в мастер
         try:
             self._master.start_sweep(
-                start_hz=config.start_hz,
-                stop_hz=config.stop_hz,
+                start_hz=config.freq_start_hz,
+                stop_hz=config.freq_end_hz,
                 bin_hz=config.bin_hz,
-                dwell_ms=int(config.dwell_ms or 100),
+                dwell_ms=100,
             )
             self._running = True
             self.started.emit()
