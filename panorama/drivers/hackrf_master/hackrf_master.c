@@ -428,6 +428,13 @@ static void* sweep_worker_thread(void* arg) {
             
             // Обрабатываем sweep данные
             // Вычисляем количество бинов в шаге, исходя из step_hz/bin_hz
+            // Защита от деления на ноль/некорректных параметров
+            if (current_config.bin_hz <= 0) {
+                if (error_callback) {
+                    error_callback("Invalid bin_hz (<=0)");
+                }
+                break;
+            }
             int bins_per_step = (int)(current_config.step_hz / current_config.bin_hz);
             if (bins_per_step < 1) bins_per_step = 1;
             double f_stop = current_freq + current_config.bin_hz * bins_per_step;

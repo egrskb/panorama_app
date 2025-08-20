@@ -237,7 +237,7 @@ class MasterSweepController(QObject):
             )
             
             self.is_running = True
-            self.log.info(f"Master sweep started: {self.start_hz/1e6:.1f}-{self.stop_hz/1e9:.1f} MHz, "
+            self.log.info(f"Master sweep started: {self.start_hz/1e6:.1f}-{self.stop_hz/1e6:.1f} MHz, "
                          f"bin: {self.bin_hz/1e3:.0f} kHz, dwell: {self.dwell_ms} ms")
             
         except Exception as e:

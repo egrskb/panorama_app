@@ -803,6 +803,9 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def _update_status(self):
         """Обновляет статус системы."""
         try:
+            # Обновляем статус мастера по факту работы контроллера
+            if self.master_controller is not None:
+                self.system_status['master_running'] = bool(getattr(self.master_controller, 'is_running', False))
             # Обновляем статус оркестратора
             if self.orchestrator:
                 orch_status = self.orchestrator.get_system_status()
