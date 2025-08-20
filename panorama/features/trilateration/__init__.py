@@ -1,3 +1,11 @@
-from .engine import TrilaterationEngine, SignalMeasurement, SynchronizedMeasurement, TargetPosition
+from .engine import RSSITrilaterationEngine, TrilaterationResult, StationPosition
 
-__all__ = ["TrilaterationEngine", "SignalMeasurement", "SynchronizedMeasurement", "TargetPosition"]
+# Backward-compatible alias for older imports
+TrilaterationEngine = RSSITrilaterationEngine  # type: ignore
+
+__all__ = [
+    "RSSITrilaterationEngine",
+    "TrilaterationEngine",
+    "TrilaterationResult",
+    "StationPosition",
+]

@@ -1,380 +1,336 @@
-# panorama/features/trilateration/engine.py
-from __future__ import annotations
-from typing import Dict, List, Optional, Tuple, Deque
-from dataclasses import dataclass, field
-from collections import deque
-import numpy as np
+"""
+Engine for RSSI-based trilateration using multiple SDR stations.
+Implements Levenberg-Marquardt algorithm for position estimation.
+"""
+
 import time
-import threading
-from queue import Queue, Empty
+import logging
+import numpy as np
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
+from PyQt5.QtCore import QObject, pyqtSignal
+from scipy.optimize import least_squares
+from scipy.spatial.distance import cdist
 
 
 @dataclass
-class SignalMeasurement:
-    """Измерение сигнала от одного SDR."""
-    timestamp: float
-    device_serial: str
-    freq_mhz: float
-    power_dbm: float
-    bandwidth_khz: float
-    noise_floor_dbm: float = -110.0
-    
+class StationPosition:
+    """Позиция SDR станции."""
+    id: str
+    x: float      # X координата (м)
+    y: float      # Y координата (м)
+    z: float      # Z координата (м, опционально)
+    k_cal_db: float  # Калибровочный коэффициент (дБ)
+
 
 @dataclass
-class SynchronizedMeasurement:
-    """Синхронизированное измерение от всех SDR."""
-    timestamp: float
-    freq_mhz: float
-    master_power: float
-    slave1_power: float
-    slave2_power: float
-    confidence: float = 0.0
-    
+class TrilaterationResult:
+    """Результат трилатерации."""
+    center_hz: float           # Центральная частота (Гц)
+    span_hz: float            # Ширина полосы (Гц)
+    x: float                  # X координата (м)
+    y: float                  # Y координата (м)
+    z: Optional[float]        # Z координата (м)
+    cov: np.ndarray           # Ковариационная матрица
+    confidence: float         # Уровень доверия (0-1)
+    age_ms: float            # Возраст измерения (мс)
+    n_stations: int          # Количество использованных станций
+    rssi_measurements: List  # RSSI измерения
 
-@dataclass
-class TargetPosition:
-    """Вычисленная позиция цели."""
-    timestamp: float
-    freq_mhz: float
-    x: float
-    y: float
-    z: float = 0.0
-    error_estimate: float = 0.0  # Оценка ошибки в метрах
-    confidence: float = 0.0  # 0-1
-    signal_type: str = "Unknown"
-    measurements_count: int = 0
-    
 
-class TrilaterationEngine:
-    """
-    Движок трилатерации с синхронизацией измерений.
+class RSSITrilaterationEngine(QObject):
+    """Движок трилатерации по RSSI для множественных SDR станций."""
     
-    Принцип работы:
-    1. Каждый SDR отправляет измерения с временными метками
-    2. Синхронизатор группирует измерения по частоте и времени
-    3. Для синхронизированных измерений вычисляются координаты
-    4. Используется фильтр Калмана для сглаживания траекторий
-    """
+    # Сигналы
+    target_update = pyqtSignal(object)  # TrilaterationResult
+    trilateration_error = pyqtSignal(str)  # Ошибка трилатерации
     
-    # Параметры синхронизации
-    TIME_WINDOW_MS = 100  # Окно синхронизации в миллисекундах
-    FREQ_TOLERANCE_MHZ = 0.5  # Допуск по частоте
-    MIN_MEASUREMENTS = 3  # Минимум измерений для трилатерации
-    
-    # Параметры модели распространения сигнала
-    PATH_LOSS_EXPONENT = 2.5  # Показатель затухания (2 для свободного пространства)
-    REFERENCE_DISTANCE_M = 1.0  # Референсное расстояние
-    REFERENCE_POWER_DBM = -40.0  # Мощность на референсном расстоянии
-    
-    def __init__(self):
-        self.device_positions: Dict[str, Tuple[float, float, float]] = {}
-        self.measurements_queue: Queue[SignalMeasurement] = Queue(maxsize=1000)
-        self.pending_measurements: Dict[float, List[SignalMeasurement]] = {}  # freq -> measurements
-        self.synchronized_measurements: Deque[SynchronizedMeasurement] = deque(maxlen=100)
-        self.target_positions: Dict[float, TargetPosition] = {}  # freq -> last position
-        self.kalman_filters: Dict[float, KalmanFilter] = {}  # freq -> filter
+    def __init__(self, logger: logging.Logger):
+        super().__init__()
+        self.log = logger
         
-        self.is_running = False
-        self.sync_thread: Optional[threading.Thread] = None
-        self.calc_thread: Optional[threading.Thread] = None
+        # Параметры модели распространения
+        self.path_loss_exponent = 2.7  # Показатель затухания по умолчанию
+        self.reference_distance = 1.0  # Опорное расстояние (м)
+        self.reference_power = -30.0   # Опорная мощность на опорном расстоянии (дБм)
         
-    def set_device_positions(self, master_pos: Tuple[float, float, float],
-                           slave1_pos: Tuple[float, float, float],
-                           slave2_pos: Tuple[float, float, float],
-                           master_serial: str, slave1_serial: str, slave2_serial: str):
-        """Устанавливает позиции SDR устройств."""
-        self.device_positions = {
-            master_serial: master_pos,
-            slave1_serial: slave1_pos,
-            slave2_serial: slave2_pos
-        }
-        self.master_serial = master_serial
-        self.slave1_serial = slave1_serial
-        self.slave2_serial = slave2_serial
+        # Станции
+        self.stations: Dict[str, StationPosition] = {}
         
-    def start(self):
-        """Запускает движок трилатерации."""
-        if self.is_running:
-            return
-            
-        self.is_running = True
+        # Кэш результатов
+        self.results_cache: Dict[str, TrilaterationResult] = {}
         
-        # Запускаем поток синхронизации
-        self.sync_thread = threading.Thread(target=self._sync_worker, daemon=True)
-        self.sync_thread.start()
+        # Параметры алгоритма
+        self.min_stations = 3          # Минимальное количество станций
+        self.max_iterations = 100      # Максимальное количество итераций
+        self.tolerance = 1e-6          # Точность сходимости
         
-        # Запускаем поток вычислений
-        self.calc_thread = threading.Thread(target=self._calc_worker, daemon=True)
-        self.calc_thread.start()
-        
-    def stop(self):
-        """Останавливает движок."""
-        self.is_running = False
-        
-        if self.sync_thread:
-            self.sync_thread.join(timeout=1.0)
-        if self.calc_thread:
-            self.calc_thread.join(timeout=1.0)
-            
-    def add_measurement(self, measurement: SignalMeasurement):
-        """Добавляет измерение от SDR."""
-        if self.is_running:
-            try:
-                self.measurements_queue.put_nowait(measurement)
-            except:
-                pass  # Очередь полная, пропускаем
-                
-    def _sync_worker(self):
-        """Рабочий поток синхронизации измерений."""
-        while self.is_running:
-            try:
-                # Получаем измерение из очереди
-                measurement = self.measurements_queue.get(timeout=0.1)
-                
-                # Округляем частоту для группировки
-                freq_key = round(measurement.freq_mhz / self.FREQ_TOLERANCE_MHZ) * self.FREQ_TOLERANCE_MHZ
-                
-                # Добавляем в pending
-                if freq_key not in self.pending_measurements:
-                    self.pending_measurements[freq_key] = []
-                
-                self.pending_measurements[freq_key].append(measurement)
-                
-                # Очищаем старые измерения
-                current_time = time.time()
-                cutoff_time = current_time - self.TIME_WINDOW_MS / 1000.0
-                
-                for freq in list(self.pending_measurements.keys()):
-                    # Фильтруем старые
-                    self.pending_measurements[freq] = [
-                        m for m in self.pending_measurements[freq]
-                        if m.timestamp > cutoff_time
-                    ]
-                    
-                    # Проверяем возможность синхронизации
-                    measurements = self.pending_measurements[freq]
-                    if len(measurements) >= self.MIN_MEASUREMENTS:
-                        sync_result = self._try_synchronize(freq, measurements)
-                        if sync_result:
-                            self.synchronized_measurements.append(sync_result)
-                            # Очищаем использованные измерения
-                            self.pending_measurements[freq] = []
-                            
-            except Empty:
-                continue
-            except Exception as e:
-                print(f"Sync error: {e}")
-                
-    def _try_synchronize(self, freq: float, measurements: List[SignalMeasurement]) -> Optional[SynchronizedMeasurement]:
-        """Пытается синхронизировать измерения от разных SDR."""
-        # Группируем по устройствам
-        by_device = {}
-        for m in measurements:
-            if m.device_serial not in by_device:
-                by_device[m.device_serial] = []
-            by_device[m.device_serial].append(m)
-            
-        # Проверяем наличие всех устройств
-        if not all(serial in by_device for serial in [self.master_serial, self.slave1_serial, self.slave2_serial]):
-            return None
-            
-        # Берем последние измерения от каждого устройства
-        master_m = by_device[self.master_serial][-1]
-        slave1_m = by_device[self.slave1_serial][-1]
-        slave2_m = by_device[self.slave2_serial][-1]
-        
-        # Проверяем временную синхронность
-        timestamps = [master_m.timestamp, slave1_m.timestamp, slave2_m.timestamp]
-        time_spread = max(timestamps) - min(timestamps)
-        
-        if time_spread > self.TIME_WINDOW_MS / 1000.0:
-            return None
-            
-        # Создаем синхронизированное измерение
-        return SynchronizedMeasurement(
-            timestamp=np.mean(timestamps),
-            freq_mhz=freq,
-            master_power=master_m.power_dbm,
-            slave1_power=slave1_m.power_dbm,
-            slave2_power=slave2_m.power_dbm,
-            confidence=1.0 - (time_spread * 1000.0 / self.TIME_WINDOW_MS)
+    def add_station(self, station_id: str, x: float, y: float, 
+                    z: float = 0.0, k_cal_db: float = 0.0):
+        """Добавляет SDR станцию."""
+        self.stations[station_id] = StationPosition(
+            id=station_id,
+            x=x, y=y, z=z,
+            k_cal_db=k_cal_db
         )
-        
-    def _calc_worker(self):
-        """Рабочий поток вычисления координат."""
-        while self.is_running:
-            try:
-                # Обрабатываем синхронизированные измерения
-                if len(self.synchronized_measurements) > 0:
-                    measurement = self.synchronized_measurements.popleft()
-                    position = self._calculate_position(measurement)
-                    
-                    if position:
-                        # Применяем фильтр Калмана
-                        if measurement.freq_mhz not in self.kalman_filters:
-                            self.kalman_filters[measurement.freq_mhz] = KalmanFilter()
-                            
-                        filtered_pos = self.kalman_filters[measurement.freq_mhz].update(
-                            position.x, position.y, position.z
-                        )
-                        
-                        position.x, position.y, position.z = filtered_pos
-                        self.target_positions[measurement.freq_mhz] = position
-                        
-                time.sleep(0.01)  # Небольшая задержка
-                
-            except Exception as e:
-                print(f"Calc error: {e}")
-                
-    def _calculate_position(self, measurement: SynchronizedMeasurement) -> Optional[TargetPosition]:
-        """
-        Вычисляет позицию цели методом трилатерации.
-        
-        Используется метод наименьших квадратов для решения системы уравнений:
-        (x - x_i)² + (y - y_i)² + (z - z_i)² = d_i²
-        """
-        # Преобразуем RSSI в расстояния
-        d_master = self._rssi_to_distance(measurement.master_power)
-        d_slave1 = self._rssi_to_distance(measurement.slave1_power)
-        d_slave2 = self._rssi_to_distance(measurement.slave2_power)
-        
-        # Получаем позиции SDR
-        p_master = np.array(self.device_positions[self.master_serial])
-        p_slave1 = np.array(self.device_positions[self.slave1_serial])
-        p_slave2 = np.array(self.device_positions[self.slave2_serial])
-        
-        # Решаем систему методом наименьших квадратов
-        # Линеаризуем систему уравнений относительно master
-        A = 2 * np.array([
-            p_slave1 - p_master,
-            p_slave2 - p_master
-        ])
-        
-        b = np.array([
-            d_master**2 - d_slave1**2 + np.linalg.norm(p_slave1)**2 - np.linalg.norm(p_master)**2,
-            d_master**2 - d_slave2**2 + np.linalg.norm(p_slave2)**2 - np.linalg.norm(p_master)**2
-        ])
+        self.log.info(f"Added station {station_id} at ({x:.1f}, {y:.1f}, {z:.1f})")
+    
+    def remove_station(self, station_id: str):
+        """Удаляет SDR станцию."""
+        if station_id in self.stations:
+            del self.stations[station_id]
+            self.log.info(f"Removed station {station_id}")
+    
+    def set_path_loss_exponent(self, n: float):
+        """Устанавливает показатель затухания."""
+        self.path_loss_exponent = n
+        self.log.info(f"Set path loss exponent to {n}")
+    
+    def set_reference_parameters(self, ref_distance: float, ref_power: float):
+        """Устанавливает опорные параметры модели."""
+        self.reference_distance = ref_distance
+        self.reference_power = ref_power
+        self.log.info(f"Set reference: distance={ref_distance}m, power={ref_power}dBm")
+    
+    def calculate_position(self, rssi_measurements: List) -> Optional[TrilaterationResult]:
+        """Вычисляет позицию источника по RSSI измерениям."""
+        if len(rssi_measurements) < self.min_stations:
+            self.log.warning(f"Insufficient measurements: {len(rssi_measurements)} < {self.min_stations}")
+            return None
         
         try:
-            # Решаем для 2D (x, y)
-            solution_2d = np.linalg.lstsq(A[:, :2], b, rcond=None)[0]
+            # Группируем измерения по частоте и полосе
+            measurements_by_band = self._group_measurements_by_band(rssi_measurements)
             
-            # Вычисляем z из уравнения сферы
-            x, y = solution_2d
-            z_squared = d_master**2 - (x - p_master[0])**2 - (y - p_master[1])**2
-            z = np.sqrt(max(0, z_squared)) if z_squared > 0 else 0
+            results = []
+            for band_key, measurements in measurements_by_band.items():
+                if len(measurements) >= self.min_stations:
+                    result = self._trilaterate_band(measurements)
+                    if result:
+                        results.append(result)
             
-            # Оцениваем ошибку
-            distances = [
-                np.linalg.norm([x, y, z] - p_master),
-                np.linalg.norm([x, y, z] - p_slave1),
-                np.linalg.norm([x, y, z] - p_slave2)
-            ]
-            
-            errors = [
-                abs(distances[0] - d_master),
-                abs(distances[1] - d_slave1),
-                abs(distances[2] - d_slave2)
-            ]
-            
-            error_estimate = np.mean(errors)
-            
-            # Вычисляем уверенность на основе ошибки и уровня сигнала
-            signal_strength = np.mean([measurement.master_power, measurement.slave1_power, measurement.slave2_power])
-            confidence = max(0, min(1, (1.0 - error_estimate / 10.0) * (1.0 + signal_strength / 100.0)))
-            
-            return TargetPosition(
-                timestamp=measurement.timestamp,
-                freq_mhz=measurement.freq_mhz,
-                x=float(x),
-                y=float(y),
-                z=float(z),
-                error_estimate=float(error_estimate),
-                confidence=float(confidence),
-                measurements_count=3
-            )
+            return results[0] if results else None
             
         except Exception as e:
-            print(f"Trilateration failed: {e}")
+            error_msg = f"Error in calculate_position: {e}"
+            self.log.error(error_msg)
+            self.trilateration_error.emit(error_msg)
             return None
-            
-    def _rssi_to_distance(self, rssi_dbm: float) -> float:
-        """
-        Преобразует RSSI в расстояние используя логарифмическую модель затухания.
-        
-        PL(d) = PL(d0) + 10*n*log10(d/d0)
-        где:
-        - PL(d) - затухание на расстоянии d
-        - PL(d0) - затухание на референсном расстоянии d0
-        - n - показатель затухания (2 для свободного пространства)
-        """
-        path_loss = self.REFERENCE_POWER_DBM - rssi_dbm
-        distance = self.REFERENCE_DISTANCE_M * (10 ** (path_loss / (10 * self.PATH_LOSS_EXPONENT)))
-        
-        # Ограничиваем разумными пределами
-        return np.clip(distance, 0.1, 1000.0)
-        
-    def get_current_positions(self) -> Dict[float, TargetPosition]:
-        """Возвращает текущие позиции всех целей."""
-        return self.target_positions.copy()
-        
-
-class KalmanFilter:
-    """
-    Простой фильтр Калмана для 3D позиции.
-    """
     
-    def __init__(self):
-        # Состояние: [x, y, z, vx, vy, vz]
-        self.state = np.zeros(6)
-        self.covariance = np.eye(6) * 100
+    def _group_measurements_by_band(self, measurements: List) -> Dict:
+        """Группирует измерения по частоте и полосе."""
+        grouped = {}
         
-        # Матрица перехода (модель постоянной скорости)
-        self.F = np.array([
-            [1, 0, 0, 1, 0, 0],  # x = x + vx*dt
-            [0, 1, 0, 0, 1, 0],  # y = y + vy*dt
-            [0, 0, 1, 0, 0, 1],  # z = z + vz*dt
-            [0, 0, 0, 1, 0, 0],  # vx = vx
-            [0, 0, 0, 0, 1, 0],  # vy = vy
-            [0, 0, 0, 0, 0, 1],  # vz = vz
-        ])
-        
-        # Матрица измерений (измеряем только позицию)
-        self.H = np.array([
-            [1, 0, 0, 0, 0, 0],
-            [0, 1, 0, 0, 0, 0],
-            [0, 0, 1, 0, 0, 0]
-        ])
-        
-        # Шум процесса
-        self.Q = np.eye(6) * 0.1
-        self.Q[3:, 3:] *= 0.01  # Меньше шума для скорости
-        
-        # Шум измерений
-        self.R = np.eye(3) * 5.0
-        
-        self.initialized = False
-        
-    def update(self, x: float, y: float, z: float) -> Tuple[float, float, float]:
-        """Обновляет фильтр новым измерением."""
-        measurement = np.array([x, y, z])
-        
-        if not self.initialized:
-            # Первое измерение - инициализация
-            self.state[:3] = measurement
-            self.initialized = True
-            return x, y, z
+        for measurement in measurements:
+            # Создаем ключ для группировки
+            band_key = f"{measurement.center_hz:.0f}_{measurement.span_hz:.0f}"
             
-        # Предсказание
-        self.state = self.F @ self.state
-        self.covariance = self.F @ self.covariance @ self.F.T + self.Q
+            if band_key not in grouped:
+                grouped[band_key] = []
+            
+            grouped[band_key].append(measurement)
         
-        # Коррекция
-        innovation = measurement - self.H @ self.state
-        S = self.H @ self.covariance @ self.H.T + self.R
-        K = self.covariance @ self.H.T @ np.linalg.inv(S)
+        return grouped
+    
+    def _trilaterate_band(self, measurements: List) -> Optional[TrilaterationResult]:
+        """Выполняет трилатерацию для одной полосы частот."""
+        try:
+            # Проверяем, что все измерения от разных станций
+            station_ids = [m.slave_id for m in measurements]
+            if len(set(station_ids)) < self.min_stations:
+                self.log.warning(f"Measurements from same stations: {station_ids}")
+                return None
+            
+            # Получаем позиции станций
+            station_positions = []
+            rssi_values = []
+            weights = []
+            
+            for measurement in measurements:
+                if measurement.slave_id not in self.stations:
+                    self.log.warning(f"Station {measurement.slave_id} not found")
+                    continue
+                
+                station = self.stations[measurement.slave_id]
+                station_positions.append([station.x, station.y, station.z])
+                rssi_values.append(measurement.band_rssi_dbm)
+                
+                # Вес по SNR (чем выше SNR, тем выше вес)
+                weight = max(0.1, min(10.0, measurement.snr_db / 10.0))
+                weights.append(weight)
+            
+            if len(station_positions) < self.min_stations:
+                return None
+            
+            # Начальная оценка позиции (центр масс станций)
+            initial_guess = np.mean(station_positions, axis=0)
+            
+            # Выполняем оптимизацию
+            result = self._optimize_position(
+                station_positions, rssi_values, weights, initial_guess
+            )
+            
+            if result is None:
+                return None
+            
+            # Создаем результат
+            center_hz = measurements[0].center_hz
+            span_hz = measurements[0].span_hz
+            
+            trilateration_result = TrilaterationResult(
+                center_hz=center_hz,
+                span_hz=span_hz,
+                x=result[0],
+                y=result[1],
+                z=result[2] if len(result) > 2 else None,
+                cov=self._estimate_covariance(station_positions, rssi_values, result),
+                confidence=self._calculate_confidence(measurements, result),
+                age_ms=(time.time() - min(m.ts for m in measurements)) * 1000,
+                n_stations=len(measurements),
+                rssi_measurements=measurements
+            )
+            
+            # Кэшируем результат
+            band_key = f"{center_hz:.0f}_{span_hz:.0f}"
+            self.results_cache[band_key] = trilateration_result
+            
+            # Эмитим сигнал
+            self.target_update.emit(trilateration_result)
+            
+            return trilateration_result
+            
+        except Exception as e:
+            self.log.error(f"Error in _trilaterate_band: {e}")
+            return None
+    
+    def _optimize_position(self, station_positions: List, rssi_values: List, 
+                          weights: List, initial_guess: np.ndarray) -> Optional[np.ndarray]:
+        """Оптимизирует позицию источника."""
+        try:
+            # Функция ошибки для минимизации
+            def error_function(position):
+                errors = []
+                for i, (station_pos, rssi, weight) in enumerate(zip(station_positions, rssi_values, weights)):
+                    # Вычисляем расстояние
+                    distance = np.linalg.norm(np.array(position) - np.array(station_pos))
+                    
+                    # Предсказанный RSSI по модели
+                    predicted_rssi = self._predict_rssi(distance)
+                    
+                    # Ошибка
+                    error = (rssi - predicted_rssi) * weight
+                    errors.append(error)
+                
+                return np.array(errors)
+            
+            # Запускаем оптимизацию
+            result = least_squares(
+                error_function,
+                initial_guess,
+                method='lm',  # Levenberg-Marquardt
+                max_nfev=self.max_iterations,
+                ftol=self.tolerance,
+                xtol=self.tolerance
+            )
+            
+            if result.success:
+                return result.x
+            else:
+                self.log.warning(f"Optimization failed: {result.message}")
+                return None
+                
+        except Exception as e:
+            self.log.error(f"Error in _optimize_position: {e}")
+            return None
+    
+    def _predict_rssi(self, distance: float) -> float:
+        """Предсказывает RSSI по расстоянию используя модель затухания."""
+        if distance <= 0:
+            return self.reference_power
         
-        self.state = self.state + K @ innovation
-        self.covariance = (np.eye(6) - K @ self.H) @ self.covariance
-        
-        return tuple(self.state[:3])
+        # Модель затухания: RSSI = P_ref - 10*n*log10(d/d_ref)
+        rssi = self.reference_power - 10 * self.path_loss_exponent * np.log10(distance / self.reference_distance)
+        return rssi
+    
+    def _estimate_covariance(self, station_positions: List, rssi_values: List, 
+                           estimated_position: np.ndarray) -> np.ndarray:
+        """Оценивает ковариационную матрицу позиции."""
+        try:
+            # Простая оценка ковариации на основе расстояний до станций
+            distances = [np.linalg.norm(np.array(estimated_position) - np.array(pos)) for pos in station_positions]
+            
+            # Среднее расстояние
+            mean_distance = np.mean(distances)
+            
+            # Оценка ошибки позиции (пропорциональна среднему расстоянию)
+            position_error = mean_distance * 0.1  # 10% от среднего расстояния
+            
+            # Создаем диагональную ковариационную матрицу
+            if len(estimated_position) == 2:
+                cov = np.array([[position_error**2, 0], [0, position_error**2]])
+            else:
+                cov = np.array([[position_error**2, 0, 0], 
+                              [0, position_error**2, 0], 
+                              [0, 0, position_error**2]])
+            
+            return cov
+            
+        except Exception as e:
+            self.log.error(f"Error estimating covariance: {e}")
+            # Возвращаем единичную матрицу в случае ошибки
+            if len(estimated_position) == 2:
+                return np.eye(2)
+            else:
+                return np.eye(3)
+    
+    def _calculate_confidence(self, measurements: List, estimated_position: np.ndarray) -> float:
+        """Вычисляет уровень доверия к результату."""
+        try:
+            # Факторы, влияющие на доверие:
+            # 1. Количество станций
+            n_stations = len(measurements)
+            station_confidence = min(1.0, n_stations / 6.0)  # Максимум при 6+ станциях
+            
+            # 2. Качество SNR
+            snr_values = [m.snr_db for m in measurements]
+            avg_snr = np.mean(snr_values)
+            snr_confidence = min(1.0, avg_snr / 20.0)  # Максимум при SNR > 20 дБ
+            
+            # 3. Согласованность измерений
+            rssi_values = [m.band_rssi_dbm for m in measurements]
+            rssi_std = np.std(rssi_values)
+            consistency_confidence = max(0.0, 1.0 - rssi_std / 20.0)  # Максимум при малом разбросе
+            
+            # Взвешенная сумма
+            confidence = 0.4 * station_confidence + 0.4 * snr_confidence + 0.2 * consistency_confidence
+            
+            return max(0.0, min(1.0, confidence))
+            
+        except Exception as e:
+            self.log.error(f"Error calculating confidence: {e}")
+            return 0.5  # Среднее значение по умолчанию
+    
+    def get_station_positions(self) -> Dict[str, Tuple[float, float, float]]:
+        """Возвращает позиции всех станций."""
+        return {station_id: (station.x, station.y, station.z) 
+                for station_id, station in self.stations.items()}
+    
+    def get_latest_results(self) -> List[TrilaterationResult]:
+        """Возвращает последние результаты трилатерации."""
+        return list(self.results_cache.values())
+    
+    def clear_cache(self):
+        """Очищает кэш результатов."""
+        self.results_cache.clear()
+        self.log.info("Trilateration cache cleared")
+    
+    def get_status(self) -> Dict:
+        """Возвращает статус движка трилатерации."""
+        return {
+            'n_stations': len(self.stations),
+            'n_cached_results': len(self.results_cache),
+            'path_loss_exponent': self.path_loss_exponent,
+            'reference_distance': self.reference_distance,
+            'reference_power': self.reference_power,
+            'min_stations': self.min_stations
+        }
