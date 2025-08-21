@@ -405,6 +405,28 @@ class DeviceConfigDialog(QtWidgets.QDialog):
     
     def _refresh_devices(self):
         """Обновляет список устройств."""
-        # Здесь должен быть код получения списка устройств
-        # Пока заглушка
-        self._refresh_table()
+        try:
+            # Получаем список доступных устройств через Master контроллер
+            # (если он доступен)
+            available_serials = []
+            
+            # Пытаемся получить доступ к Master контроллеру через parent
+            if hasattr(self.parent(), 'master_controller'):
+                master_controller = self.parent().master_controller
+                if hasattr(master_controller, 'scan_available_devices'):
+                    available_serials = master_controller.scan_available_devices()
+                    if available_serials:
+                        self.manager.update_device_list(available_serials)
+            
+            # Если не удалось получить устройства, используем заглушку
+            if not available_serials:
+                # Заглушка для тестирования
+                available_serials = ["hackrf_0000000000000000", "hackrf_0000000000000001"]
+                self.manager.update_device_list(available_serials)
+            
+            self._refresh_table()
+            
+        except Exception as e:
+            print(f"Error refreshing devices: {e}")
+            # В случае ошибки просто обновляем таблицу
+            self._refresh_table()

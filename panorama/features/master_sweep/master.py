@@ -12,7 +12,7 @@ from PyQt5.QtCore import QObject, pyqtSignal, QTimer
 
 # Импортируем C библиотеку через CFFI
 try:
-    from panorama.drivers.hackrf_master.hackrf_master_wrapper import HackRFMaster
+    from panorama.drivers.hrf_backend import HackRFMaster
     C_LIB_AVAILABLE = True
 except ImportError:
     HackRFMaster = None
@@ -147,6 +147,9 @@ class MasterSweepController(QObject):
     sweep_tile_received = pyqtSignal(object)  # SweepTile
     peak_detected = pyqtSignal(object)        # DetectedPeak
     sweep_error = pyqtSignal(str)             # Ошибка sweep
+    # Внутренние сигналы для безопасной доставки данных из CFFI-потока
+    _sweep_data_received = pyqtSignal(object)  # dict payload from C callback
+    _peak_data_received = pyqtSignal(object)   # dict payload from C callback
     
     def __init__(self, logger: logging.Logger):
         super().__init__()
@@ -157,16 +160,13 @@ class MasterSweepController(QObject):
             self.log.error("HackRF Master C library not available")
             self.sweep_source = None
         else:
-            try:
-                # Инициализируем C библиотеку
-                self.sweep_source = HackRFMaster()
-                self.log.info("HackRF Master C library initialized successfully")
-            except Exception as e:
-                self.log.error(f"Failed to initialize HackRF Master C library: {e}")
-                self.sweep_source = None
+            # НЕ инициализируем SDR здесь - только проверяем доступность
+            self.sweep_source = None  # Будет инициализирован позже
+            self.log.info("HackRF Master C library available (will be initialized when needed)")
         
         self.peak_detector = PeakDetector()
         self.is_running = False
+        self._sdr_initialized = False  # Флаг инициализации SDR
         
         # Параметры sweep
         self.start_hz = 24e6      # 24 МГц
@@ -184,35 +184,107 @@ class MasterSweepController(QObject):
         # Буфер для watchlist
         self.watchlist: Dict[str, DetectedPeak] = {}
         
-        # Подключаем callbacks если C библиотека доступна
-        if self.sweep_source:
+        # Проксируем данные из CFFI-потока в GUI-поток через сигналы
+        self._sweep_data_received.connect(self._on_sweep_tile_received)
+        self._peak_data_received.connect(self._on_peak_received)
+    
+    def initialize_sdr(self):
+        """Инициализирует SDR устройство. Вызывается при необходимости."""
+        if self._sdr_initialized:
+            self.log.info("SDR already initialized")
+            return True
+            
+        if not C_LIB_AVAILABLE:
+            self.log.error("HackRF Master C library not available")
+            return False
+            
+        try:
+            # Инициализируем C библиотеку
+            self.sweep_source = HackRFMaster()
+            self._sdr_initialized = True
+            
+            # Настраиваем callbacks
             self._setup_callbacks()
+            
+            self.log.info("HackRF Master C library initialized successfully")
+            return True
+            
+        except Exception as e:
+            self.log.error(f"Failed to initialize HackRF Master C library: {e}")
+            self.sweep_source = None
+            self._sdr_initialized = False
+            return False
+    
+    def deinitialize_sdr(self):
+        """Деинициализирует SDR устройство."""
+        if not self._sdr_initialized:
+            return
+            
+        try:
+            # Останавливаем sweep если запущен
+            if self.is_running:
+                self.stop_sweep()
+            
+            # Очищаем ресурсы
+            if self.sweep_source:
+                self.sweep_source = None
+            
+            self._sdr_initialized = False
+            self.log.info("HackRF Master C library deinitialized")
+            
+        except Exception as e:
+            self.log.error(f"Error deinitializing SDR: {e}")
+    
+    def is_sdr_available(self):
+        """Проверяет доступность SDR библиотеки."""
+        return C_LIB_AVAILABLE
+    
+    def is_sdr_initialized(self):
+        """Проверяет инициализирован ли SDR."""
+        return self._sdr_initialized
     
     def _setup_callbacks(self):
         """Настраивает callback функции для C библиотеки."""
+        if not self._sdr_initialized or not self.sweep_source:
+            self.log.error("Cannot setup callbacks - SDR not initialized")
+            return
+            
         try:
-            # Callback для sweep tiles
-            self.sweep_source.set_sweep_callback(self._on_sweep_tile_received)
+            self.log.info("Setting up callbacks for sweep data...")
             
-            # Callback для обнаруженных пиков
-            self.sweep_source.set_peak_callback(self._on_peak_received)
-            
-            # Callback для ошибок
-            self.sweep_source.set_error_callback(self._on_sweep_error)
-            
+            # CFFI вызывает эти лямбды из своего потока; эмитим внутренние сигналы (queued connections)
+            self.sweep_source.set_sweep_callback(lambda data: self._sweep_data_received.emit(data))
+            self.sweep_source.set_peak_callback(lambda data: self._peak_data_received.emit(data))
+            self.sweep_source.set_error_callback(lambda msg: self.sweep_error.emit(msg))
+
             self.log.info("Callbacks configured successfully")
-            
+
         except Exception as e:
             self.log.error(f"Failed to setup callbacks: {e}")
     
     def start_sweep(self, start_hz: float = None, stop_hz: float = None, 
                     bin_hz: float = None, dwell_ms: float = None):
         """Запускает sweep с заданными параметрами."""
-        if not self.sweep_source:
+        if not C_LIB_AVAILABLE:
             error_msg = "HackRF Master C library not available"
             self.log.error(error_msg)
             self.sweep_error.emit(error_msg)
             return
+        
+        # Инициализируем SDR если нужно
+        if not self._sdr_initialized:
+            if not self.initialize_sdr():
+                error_msg = "Failed to initialize SDR"
+                self.log.error(error_msg)
+                self.sweep_error.emit(error_msg)
+                return
+        
+        # Проверяем не запущен ли уже sweep
+        if self.is_running:
+            self.log.warning("Sweep already running. Stopping first...")
+            self.stop_sweep()
+            # Даем время на остановку
+            time.sleep(0.1)
         
         if start_hz is not None:
             self.start_hz = start_hz
@@ -246,21 +318,56 @@ class MasterSweepController(QObject):
     
     def stop_sweep(self):
         """Останавливает sweep."""
-        if not self.sweep_source:
+        if not self._sdr_initialized or not self.sweep_source:
             return
         
         try:
-            self.sweep_source.stop_sweep()
+            # Проверяем состояние через C библиотеку
+            if self.sweep_source.is_running():
+                self.sweep_source.stop_sweep()
+                # Ждем полной остановки
+                for _ in range(10):  # Максимум 1 секунда
+                    if not self.sweep_source.is_running():
+                        break
+                    time.sleep(0.1)
+            
             self.is_running = False
             self.log.info("Master sweep stopped")
             
         except Exception as e:
             self.log.error(f"Failed to stop sweep: {e}")
+            # Принудительно сбрасываем флаг
+            self.is_running = False
     
     def _on_sweep_tile_received(self, tile_data: Dict):
         """Обрабатывает sweep tile от C библиотеки."""
         try:
-            # Преобразуем данные в SweepTile
+            # Детальное логирование для отладки
+            self.log.info(f"Raw tile data received: {tile_data}")
+            self.log.info(f"Tile data type: {type(tile_data)}")
+            self.log.info(f"Tile data keys: {list(tile_data.keys()) if isinstance(tile_data, dict) else 'Not a dict'}")
+            
+            # Проверяем структуру данных
+            if not isinstance(tile_data, dict):
+                self.log.error(f"Invalid tile data type: {type(tile_data)}, expected dict")
+                return
+                
+            required_keys = ['f_start', 'bin_hz', 'count', 'power', 't0']
+            missing_keys = [key for key in required_keys if key not in tile_data]
+            if missing_keys:
+                self.log.error(f"Missing required keys in tile data: {missing_keys}")
+                return
+            
+            # Проверяем типы данных
+            if not isinstance(tile_data['power'], (list, tuple)):
+                self.log.error(f"Invalid power data type: {type(tile_data['power'])}, expected list")
+                return
+                
+            if not isinstance(tile_data['count'], int):
+                self.log.error(f"Invalid count data type: {type(tile_data['count'])}, expected int")
+                return
+            
+            # Создаем SweepTile
             tile = SweepTile(
                 f_start=tile_data['f_start'],
                 bin_hz=tile_data['bin_hz'],
@@ -273,10 +380,15 @@ class MasterSweepController(QObject):
             self.peak_detector.add_sweep_tile(tile)
             
             # Эмитим сигнал
+            self.log.info(f"Emitting sweep_tile_received signal to {self.sweep_tile_received.receivers()} receivers")
             self.sweep_tile_received.emit(tile)
+            
+            self.log.info(f"Sweep tile emitted to GUI: {tile.f_start/1e6:.1f} MHz")
             
         except Exception as e:
             self.log.error(f"Error processing sweep tile: {e}")
+            import traceback
+            self.log.error(f"Traceback: {traceback.format_exc()}")
     
     def _on_peak_received(self, peak_data: Dict):
         """Обрабатывает обнаруженный пик от C библиотеки."""
@@ -414,8 +526,52 @@ class MasterSweepController(QObject):
     def cleanup(self):
         """Очищает ресурсы."""
         try:
+            # Останавливаем sweep если запущен
+            if self.is_running:
+                self.stop_sweep()
+            
+            # Останавливаем таймер
+            if hasattr(self, 'peak_detection_timer'):
+                self.peak_detection_timer.stop()
+            
+            # Очищаем C библиотеку
             if self.sweep_source:
                 self.sweep_source.cleanup()
                 self.sweep_source = None
+            
+            self.log.info("MasterSweepController cleanup completed")
+            
         except Exception as e:
             self.log.error(f"Error during cleanup: {e}")
+
+    def get_sdr_info(self):
+        """Получает информацию об SDR устройствах без инициализации."""
+        if not C_LIB_AVAILABLE:
+            return {"error": "HackRF Master C library not available"}
+        
+        try:
+            # Создаем временный объект для получения информации
+            temp_sdr = HackRFMaster()
+            info = temp_sdr.get_device_info()
+            # Уничтожаем временный объект
+            del temp_sdr
+            return info
+        except Exception as e:
+            return {"error": f"Failed to get SDR info: {e}"}
+    
+    def enumerate_devices(self):
+        """Сканирует доступные SDR устройства без инициализации."""
+        if not C_LIB_AVAILABLE:
+            return []
+        
+        try:
+            # Создаем временный объект для сканирования
+            temp_sdr = HackRFMaster()
+            devices = temp_sdr.enumerate_devices()
+            # Важно: деинициализируем SDR после использования
+            temp_sdr.deinitialize_sdr()
+            del temp_sdr
+            return devices
+        except Exception as e:
+            self.log.error(f"Failed to scan devices: {e}")
+            return []

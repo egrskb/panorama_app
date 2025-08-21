@@ -37,6 +37,8 @@ static error_callback_t error_callback = NULL;
 
 // Конфигурация
 static sweep_config_t current_config;
+
+// Буферы - возвращаем static для правильной работы
 static sweep_tile_t* sweep_buffer = NULL;
 static detected_peak_t* peak_buffer = NULL;
 static int peak_buffer_count = 0;
@@ -44,7 +46,7 @@ static int peak_buffer_count = 0;
 // Статистика
 static master_stats_t stats = {0};
 
-// Буферы для обработки
+// Буферы для обработки - возвращаем static
 static float* power_buffer = NULL;
 static float* smoothed_power = NULL;
 static int* peak_indices = NULL;
@@ -60,9 +62,14 @@ static void smooth_power_data(const float* input, float* output, int count);
 
 // Инициализация библиотеки
 int hackrf_master_init(void) {
-    if (device != NULL) {
+    printf("DEBUG: hackrf_master_init called\n");
+    
+    if (lib_initialized) {
+        printf("DEBUG: Library already initialized, returning success\n");
         return 0; // Уже инициализирован
     }
+    
+    printf("DEBUG: Initializing buffers...\n");
     
     // Выделяем память для буферов
     sweep_buffer = malloc(MAX_SWEEP_BUFFER * sizeof(sweep_tile_t));
@@ -72,12 +79,19 @@ int hackrf_master_init(void) {
     peak_indices = malloc(MAX_BIN_COUNT * sizeof(int));
     
     if (!sweep_buffer || !peak_buffer || !power_buffer || !smoothed_power || !peak_indices) {
+        printf("DEBUG: Failed to allocate buffers\n");
         hackrf_master_cleanup();
         return -1;
     }
     
+    printf("DEBUG: Buffers allocated successfully\n");
+    printf("DEBUG: power_buffer=%p, smoothed_power=%p\n", (void*)power_buffer, (void*)smoothed_power);
+    
     // Сбрасываем статистику
     hackrf_master_reset_stats();
+    
+    lib_initialized = true;
+    printf("DEBUG: Initialization completed successfully\n");
     
     return 0;
 }
@@ -123,6 +137,23 @@ void hackrf_master_cleanup(void) {
 
 // Запуск sweep
 int hackrf_master_start_sweep(const sweep_config_t* config) {
+    printf("DEBUG: hackrf_master_start_sweep called\n");
+    printf("DEBUG: Current buffer status:\n");
+    printf("DEBUG:   power_buffer=%p\n", (void*)power_buffer);
+    printf("DEBUG:   smoothed_power=%p\n", (void*)smoothed_power);
+    printf("DEBUG:   sweep_buffer=%p\n", (void*)sweep_buffer);
+    printf("DEBUG:   peak_buffer=%p\n", (void*)peak_buffer);
+    printf("DEBUG:   peak_indices=%p\n", (void*)peak_indices);
+    printf("DEBUG:   lib_initialized=%d\n", lib_initialized);
+    
+    // Проверяем что буферы выделены
+    if (!power_buffer || !smoothed_power || !sweep_buffer || !peak_buffer || !peak_indices) {
+        printf("DEBUG: ERROR - Buffers not allocated! Library not properly initialized.\n");
+        return -1;
+    }
+    
+    printf("DEBUG: Buffers are properly allocated\n");
+    
     // Открываем устройство при первом запуске
     if (!device) {
         if (hackrf_setup_device() != 0) {
@@ -150,6 +181,7 @@ int hackrf_master_start_sweep(const sweep_config_t* config) {
         return -1;
     }
     
+    printf("DEBUG: Sweep thread started successfully\n");
     return 0;
 }
 
@@ -412,14 +444,25 @@ static void hackrf_cleanup_device(void) {
 static void* sweep_worker_thread(void* arg) {
     (void)arg; // Неиспользуемый параметр
     
+    printf("DEBUG: sweep_worker_thread started\n");
+    
     while (is_running) {
         clock_t start_time = clock();
+        
+        printf("DEBUG: Starting sweep cycle\n");
         
         // Выполняем sweep по диапазону
         double current_freq = current_config.start_hz;
         while (current_freq < current_config.stop_hz && is_running) {
+            // Проверяем состояние перед каждой итерацией
+            if (!is_running) {
+                printf("DEBUG: Sweep stopped, breaking loop\n");
+                break;
+            }
+            
             // Устанавливаем частоту
             if (hackrf_set_freq(device, (uint64_t)current_freq) != HACKRF_SUCCESS) {
+                printf("DEBUG: Failed to set frequency: %f\n", current_freq);
                 if (error_callback) {
                     error_callback("Failed to set frequency");
                 }
@@ -430,6 +473,7 @@ static void* sweep_worker_thread(void* arg) {
             // Вычисляем количество бинов в шаге, исходя из step_hz/bin_hz
             // Защита от деления на ноль/некорректных параметров
             if (current_config.bin_hz <= 0) {
+                printf("DEBUG: Invalid bin_hz: %f\n", current_config.bin_hz);
                 if (error_callback) {
                     error_callback("Invalid bin_hz (<=0)");
                 }
@@ -442,15 +486,24 @@ static void* sweep_worker_thread(void* arg) {
                 f_stop = current_config.stop_hz;
             }
             
-            if (process_sweep_data(current_freq, f_stop, current_config.dwell_ms) == 0) {
+            printf("DEBUG: Processing sweep data: %f - %f Hz\n", current_freq, f_stop);
+            
+            if (is_running && process_sweep_data(current_freq, f_stop, current_config.dwell_ms) == 0) {
                 // Обновляем статистику
                 pthread_mutex_lock(&data_mutex);
                 stats.sweep_count++;
                 pthread_mutex_unlock(&data_mutex);
+                printf("DEBUG: Sweep data processed successfully\n");
+            } else {
+                printf("DEBUG: Failed to process sweep data\n");
             }
             
             // Переходим к следующей частоте
             current_freq += current_config.step_hz;
+            if (!is_running) {
+                printf("DEBUG: Sweep stopped during iteration\n");
+                break;
+            }
             
             // Небольшая задержка между sweep (1 мс)
             struct timespec ts;
@@ -467,18 +520,40 @@ static void* sweep_worker_thread(void* arg) {
         stats.last_sweep_time = sweep_time;
         stats.avg_sweep_time = (stats.avg_sweep_time * (stats.sweep_count - 1) + sweep_time) / stats.sweep_count;
         pthread_mutex_unlock(&data_mutex);
+        
+        printf("DEBUG: Sweep cycle completed, time: %.2f ms\n", sweep_time);
     }
     
+    printf("DEBUG: sweep_worker_thread exiting\n");
     return NULL;
 }
 
 // Обработка sweep данных
 static int process_sweep_data(double f_start, double f_stop, int dwell_ms) {
+    printf("DEBUG: process_sweep_data called: f_start=%f, f_stop=%f, dwell_ms=%d\n", f_start, f_stop, dwell_ms);
+    
+    // Проверяем что буферы инициализированы
+    if (!power_buffer || !smoothed_power) {
+        printf("DEBUG: ERROR - Buffers not initialized!\n");
+        printf("DEBUG: power_buffer=%p, smoothed_power=%p\n", (void*)power_buffer, (void*)smoothed_power);
+        return -1;
+    }
+    
     // Симулируем получение данных (в реальной реализации здесь будет чтение от HackRF)
     int bin_count = (int)((f_stop - f_start) / current_config.bin_hz);
     if (bin_count > MAX_BIN_COUNT) {
         bin_count = MAX_BIN_COUNT;
     }
+    
+    printf("DEBUG: bin_count=%d, max_bins=%d\n", bin_count, MAX_BIN_COUNT);
+    
+    // Проверяем валидность параметров
+    if (bin_count <= 0) {
+        printf("DEBUG: Invalid bin_count: %d\n", bin_count);
+        return -1;
+    }
+    
+    printf("DEBUG: About to generate test data\n");
     
     // Генерируем тестовые данные (замените на реальное чтение от HackRF)
     for (int i = 0; i < bin_count; i++) {
@@ -494,25 +569,52 @@ static int process_sweep_data(double f_start, double f_stop, int dwell_ms) {
         }
     }
     
+    printf("DEBUG: Generated test data for %d bins\n", bin_count);
+    
+    printf("DEBUG: About to smooth data\n");
+    
     // Сглаживаем данные
     smooth_power_data(power_buffer, smoothed_power, bin_count);
+    printf("DEBUG: Data smoothed\n");
+    
+    printf("DEBUG: About to detect peaks\n");
     
     // Детектируем пики
-    (void)detect_peaks_in_sweep(smoothed_power, bin_count, f_start, current_config.bin_hz);
+    int peaks_found = detect_peaks_in_sweep(smoothed_power, bin_count, f_start, current_config.bin_hz);
+    printf("DEBUG: Detected %d peaks\n", peaks_found);
     
-    // Создаем sweep tile
+    // Создаем sweep tile с копированием данных
     sweep_tile_t tile;
     tile.f_start = f_start;
     tile.bin_hz = current_config.bin_hz;
     tile.count = bin_count;
-    tile.power = smoothed_power;
-    tile.t0 = (double)time(NULL);
     
-    // Вызываем callback
-    if (sweep_callback) {
-        sweep_callback(&tile);
+    // Копируем данные мощности вместо передачи указателя
+    if (tile.count > 0 && tile.count <= MAX_BIN_COUNT) {
+        // Выделяем память для копии данных
+        tile.power = malloc(tile.count * sizeof(float));
+        if (tile.power) {
+            memcpy(tile.power, smoothed_power, tile.count * sizeof(float));
+            
+            printf("DEBUG: Calling sweep_callback with %d bins\n", tile.count);
+            
+            // Вызываем callback
+            if (sweep_callback) {
+                sweep_callback(&tile);
+                printf("DEBUG: sweep_callback completed\n");
+            }
+            
+            // Освобождаем память после callback
+            free(tile.power);
+            printf("DEBUG: Memory freed\n");
+        } else {
+            printf("DEBUG: Failed to allocate memory for tile.power\n");
+        }
+    } else {
+        printf("DEBUG: Invalid tile.count: %d\n", tile.count);
     }
     
+    printf("DEBUG: process_sweep_data completed successfully\n");
     return 0;
 }
 
@@ -558,9 +660,10 @@ static int detect_peaks_in_sweep(const float* powers, int count, double f_start,
                     stats.peak_count++;
                     pthread_mutex_unlock(&data_mutex);
                     
-                    // Вызываем callback
+                    // Вызываем callback с копией данных
                     if (peak_callback) {
-                        peak_callback(&peak);
+                        detected_peak_t peak_copy = peak;  // Создаем копию
+                        peak_callback(&peak_copy);
                     }
                     
                     peaks_found++;

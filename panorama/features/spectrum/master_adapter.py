@@ -27,6 +27,8 @@ class MasterSourceAdapter(SourceBackend):
             return
         # Передаём параметры в мастер
         try:
+            print(f"[MasterSourceAdapter] Starting sweep: {config.freq_start_hz/1e6:.1f}-{config.freq_end_hz/1e6:.1f} MHz, bin={config.bin_hz/1e3:.0f} kHz")
+            
             self._master.start_sweep(
                 start_hz=config.freq_start_hz,
                 stop_hz=config.freq_end_hz,
@@ -36,7 +38,10 @@ class MasterSourceAdapter(SourceBackend):
             self._running = True
             self.started.emit()
             self.status.emit("Master sweep running")
+            print("[MasterSourceAdapter] Sweep started successfully")
+            
         except Exception as e:
+            print(f"[MasterSourceAdapter] Error starting sweep: {e}")
             self.error.emit(str(e))
 
     def stop(self):
@@ -56,19 +61,38 @@ class MasterSourceAdapter(SourceBackend):
     @QtCore.pyqtSlot(object)
     def _on_tile(self, tile):
         try:
+            print(f"[MasterSourceAdapter] Received tile: type={type(tile)}")
+            print(f"[MasterSourceAdapter] Tile attributes: {dir(tile)}")
+            
+            # Проверяем что это SweepTile
+            if not hasattr(tile, 'f_start') or not hasattr(tile, 'power'):
+                print(f"[MasterSourceAdapter] Invalid tile object: missing required attributes")
+                return
+                
+            print(f"[MasterSourceAdapter] Tile data: f_start={tile.f_start/1e6:.1f} MHz, "
+                  f"count={tile.count}, power_range=[{min(tile.power):.1f}, {max(tile.power):.1f}] dBm")
+            
             f0 = float(tile.f_start)
             bin_hz = float(tile.bin_hz)
             count = int(tile.count)
             if count <= 0 or bin_hz <= 0:
+                print(f"[MasterSourceAdapter] Invalid tile data: count={count}, bin_hz={bin_hz}")
                 return
             # Частоты и мощность
             freqs = f0 + np.arange(count, dtype=np.float64) * bin_hz
             # tile.power — list[float]
             power = np.asarray(tile.power, dtype=np.float32)
             if power.size != count:
+                print(f"[MasterSourceAdapter] Power size mismatch: {power.size} != {count}")
                 return
+            
+            print(f"[MasterSourceAdapter] Emitting fullSweepReady: freqs={freqs.size}, power={power.size}")
             self.fullSweepReady.emit(freqs, power)
+            
         except Exception as e:
+            print(f"[MasterSourceAdapter] Error processing tile: {e}")
+            import traceback
+            print(f"[MasterSourceAdapter] Traceback: {traceback.format_exc()}")
             self.error.emit(f"Adapter tile error: {e}")
 
     @QtCore.pyqtSlot(str)

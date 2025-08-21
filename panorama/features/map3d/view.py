@@ -578,3 +578,104 @@ class MapView(QtWidgets.QWidget):
         self.lbl_status.setStyleSheet("padding: 5px; background-color: #c8e6c9;")
         
         self.trilaterationStopped.emit()
+
+    def update_stations_from_config(self, sdr_settings: dict):
+        """Обновляет позиции станций из конфигурации SDR."""
+        try:
+            # Очищаем старые позиции
+            self.sdr_positions.clear()
+            
+            # Добавляем Master (только для отображения, не для трилатерации)
+            master_config = sdr_settings.get('master', {})
+            if master_config.get('serial') or master_config.get('uri'):
+                # Master всегда в центре (0, 0) - он отвечает только за спектр
+                self.sdr_positions['master'] = (0.0, 0.0)
+                self.master_device = master_config
+            
+            # Добавляем Slave устройства (для трилатерации)
+            for i, slave_config in enumerate(sdr_settings.get('slaves', []), start=1):
+                if slave_config.get('serial') or slave_config.get('uri'):
+                    # Получаем позицию из конфигурации
+                    pos = slave_config.get('pos', [0.0, 0.0, 0.0])
+                    x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+                    
+                    # Сохраняем позицию (X, Y для 2D карты, Z для высоты)
+                    self.sdr_positions[f'slave{i}'] = (x, y)
+                    
+                    # Сохраняем полную информацию об устройстве
+                    if i == 1:
+                        self.slave1_device = slave_config
+                    elif i == 2:
+                        self.slave2_device = slave_config
+            
+            # Обновляем информацию об устройствах
+            self._update_device_info()
+            
+            # Перерисовываем карту
+            self._refresh_map()
+            
+        except Exception as e:
+            print(f"Error updating stations from config: {e}")
+
+    def _update_device_info(self):
+        """Обновляет информацию об устройствах в UI."""
+        try:
+            # Информация об устройствах
+            device_text = ""
+            if self.master_device:
+                device_text += f"Master: {self.master_device.get('nickname', 'N/A')}\n"
+                device_text += f"Serial: {self.master_device.get('serial', 'N/A')}\n"
+                device_text += f"URI: {self.master_device.get('uri', 'N/A')}\n\n"
+            else:
+                device_text += "Master: не настроен\n\n"
+            
+            # Добавляем информацию о Slave устройствах
+            slave_count = 0
+            for i in range(1, 3):
+                slave_key = f'slave{i}'
+                if slave_key in self.sdr_positions:
+                    slave_count += 1
+                    if i == 1 and self.slave1_device:
+                        device_text += f"Slave {i}: {self.slave1_device.get('nickname', 'N/A')}\n"
+                        device_text += f"Serial: {self.slave1_device.get('serial', 'N/A')}\n"
+                        device_text += f"URI: {self.slave1_device.get('uri', 'N/A')}\n\n"
+                    elif i == 2 and self.slave2_device:
+                        device_text += f"Slave {i}: {self.slave2_device.get('nickname', 'N/A')}\n"
+                        device_text += f"Serial: {self.slave2_device.get('serial', 'N/A')}\n"
+                        device_text += f"URI: {self.slave2_device.get('uri', 'N/A')}\n\n"
+            
+            if slave_count == 0:
+                device_text += "Slave устройства: не настроены\n"
+            
+            self.device_info.setPlainText(device_text)
+            
+            # Информация о позициях
+            position_text = ""
+            if 'master' in self.sdr_positions:
+                x, y = self.sdr_positions['master']
+                position_text += f"Master: ({x:.1f}, {y:.1f}) м\n"
+            
+            for i in range(1, 3):
+                slave_key = f'slave{i}'
+                if slave_key in self.sdr_positions:
+                    x, y = self.sdr_positions[slave_key]
+                    # Получаем Z координату из конфигурации
+                    z = 0.0
+                    if i == 1 and self.slave1_device:
+                        pos = self.slave1_device.get('pos', [0.0, 0.0, 0.0])
+                        z = float(pos[2])
+                    elif i == 2 and self.slave2_device:
+                        pos = self.slave2_device.get('pos', [0.0, 0.0, 0.0])
+                        z = float(pos[2])
+                    
+                    position_text += f"Slave {i}: ({x:.1f}, {y:.1f}, {z:.1f}) м\n"
+            
+            if not position_text:
+                position_text = "Позиции не заданы"
+            
+            self.position_info.setPlainText(position_text)
+            
+        except Exception as e:
+            print(f"Error updating device info: {e}")
+            self.device_info.setPlainText("Ошибка обновления информации")
+            self.position_info.setPlainText("Ошибка обновления позиций")

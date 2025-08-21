@@ -107,7 +107,7 @@ panorama/drivers/hackrf_master/
 ### В Python коде
 
 ```python
-from panorama.drivers.hackrf_master.hackrf_master_wrapper import HackRFMaster
+from panorama.drivers.hrf_backend import HackRFMaster
 
 # Создание экземпляра
 master = HackRFMaster()

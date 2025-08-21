@@ -458,9 +458,15 @@ class SpectrumView(QtWidgets.QWidget):
         Пришла ПОЛНАЯ строка спектра без пропусков.
         Рисуем без мерцания: поддерживаем стабильный даунсемплированный буфер self._water_view.
         """
+        print(f"[SpectrumView] Received full sweep: freqs={freqs_hz.size}, power={power_dbm.size}, "
+              f"freq_range=[{freqs_hz[0]/1e6:.1f}, {freqs_hz[-1]/1e6:.1f}] MHz, "
+              f"power_range=[{power_dbm.min():.1f}, {power_dbm.max():.1f}] dBm")
+        
         if freqs_hz is None or power_dbm is None:
+            print("[SpectrumView] None data received")
             return
         if freqs_hz.size == 0 or power_dbm.size == 0 or freqs_hz.size != power_dbm.size:
+            print(f"[SpectrumView] Invalid data: freqs={freqs_hz.size}, power={power_dbm.size}")
             return
 
         # Нужно ли переинициализировать сетку и водопад
@@ -470,6 +476,7 @@ class SpectrumView(QtWidgets.QWidget):
         )
 
         if first_or_size_changed:
+            print(f"[SpectrumView] Initializing display grid: freqs={freqs_hz.size}")
             # Полная сетка (храним для экспорта/курсора и т.д.)
             self._model.freqs_hz = freqs_hz.astype(np.float64, copy=True)
             self._model.last_row = power_dbm.astype(np.float32, copy=True)
@@ -486,7 +493,7 @@ class SpectrumView(QtWidgets.QWidget):
             self.water_plot.setXRange(x0, x1, padding=0.0)
             self.water_plot.setYRange(0, self._model.rows, padding=0)
 
-            # --- СТАБИЛЬНЫЙ буфер водопада (даунсемпленный по колонкам) ---
+            # --- СТАБИЛЬНЫЙ буфер водопада (даунсемплированный по колонкам) ---
             self._wf_max_cols = 4096
             self._wf_ds_factor = int(np.ceil(n / self._wf_max_cols))
             if self._wf_ds_factor < 1:
@@ -542,14 +549,16 @@ class SpectrumView(QtWidgets.QWidget):
                     row_ds = row_ds[:self._wf_cols_ds]
                 else:
                     row_ds = np.pad(row_ds, (0, self._wf_cols_ds - row_ds.size), mode='edge')
-
-            # сдвиг + вставка
-            self._water_view[:-1, :] = self._water_view[1:, :]
+            
+            # Сдвигаем водопад вниз и добавляем новую строку
+            self._water_view = np.roll(self._water_view, -1, axis=0)
             self._water_view[-1, :] = row_ds
-
-            # Быстрое обновление (без смены LUT/levels/rect)
             self.water_img.setImage(self._water_view, autoLevels=False)
-
+            
+            print(f"[SpectrumView] Updated waterfall: rows={self._water_view.shape[0]}, cols={self._water_view.shape[1]}")
+        else:
+            print(f"[SpectrumView] Waterfall view not initialized yet")
+            
         # Коалессация обновлений через таймер (необязательно, но пусть будет)
         self._pending_water_update = True
         if not self._update_timer.isActive():

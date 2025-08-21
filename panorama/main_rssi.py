@@ -14,7 +14,7 @@ from PyQt5.QtCore import QSettings, QTimer
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout
 from PyQt5.QtWidgets import QTabWidget, QGroupBox, QLabel, QPushButton, QSpinBox, QDoubleSpinBox
 from PyQt5.QtWidgets import QTextEdit, QTableWidget, QTableWidgetItem, QComboBox, QCheckBox
-from PyQt5.QtWidgets import QSplitter, QFrame, QMessageBox, QFileDialog
+from PyQt5.QtWidgets import QSplitter, QFrame, QMessageBox, QFileDialog, QFormLayout
 import numpy as np
 
 # Импортируем наши модули
@@ -31,6 +31,7 @@ from panorama.features.settings.dialog import SettingsDialog
 from panorama.features.settings.manager_improved import ImprovedDeviceManagerDialog
 from panorama.features.settings.storage import load_sdr_settings, save_sdr_settings
 from panorama.features.spectrum.master_adapter import MasterSourceAdapter
+from panorama.features.detector.settings_dialog import DetectorSettingsDialog, DetectorSettings
 
 
 class RSSIPanoramaMainWindow(QMainWindow):
@@ -133,27 +134,27 @@ class RSSIPanoramaMainWindow(QMainWindow):
                     cal_params['reference_power']
                 )
             
-            # Добавляем станции: Master по умолчанию (0,0,0), Slaves — из настроек, но только доступные
-            self.trilateration_engine.add_station("master", 0.0, 0.0, 0.0, 0.0)
-            # Фильтруем по реально доступным Soapy устройствам
-            available = []
-            try:
-                if self.slave_manager:
-                    available = self.slave_manager.enumerate_soapy_devices()
-            except Exception:
-                available = []
-            avail_serials = {d.get('serial', '') for d in (available or []) if d.get('serial')}
-            avail_uris = {d.get('uri', '') for d in (available or []) if d.get('uri')}
+            # Очищаем все станции
+            self.trilateration_engine.stations.clear()
+            
+            # НЕ добавляем Master в трилатерацию - он отвечает только за спектр
+            # Master добавляем только если он настроен
+            # master_config = self.sdr_settings.get('master', {})
+            # if master_config.get('serial') or master_config.get('uri'):
+            #     self.trilateration_engine.add_station("master", 0.0, 0.0, 0.0, 0.0)
+            
+            # Slaves добавляем только те, которые реально настроены
             for s in self.sdr_settings.get('slaves', []):
+                # Проверяем, что устройство реально доступно
                 ser = s.get('serial', '')
                 uri = s.get('uri', '')
-                if (ser and ser in avail_serials) or (uri and uri in avail_uris):
+                if ser or uri:  # Если есть хотя бы один идентификатор
                     x, y, z = s.get('pos', [0.0, 0.0, 0.0])
                     sid = s.get('nickname') or (s.get('label') or s.get('serial') or 'slave')
                     self.trilateration_engine.add_station(sid, float(x), float(y), float(z), 0.0)
             
             stations_count = len(self.trilateration_engine.get_station_positions())
-            self.log.info(f"Trilateration engine configured with {stations_count} stations")
+            self.log.info(f"Trilateration engine configured with {stations_count} stations (Master excluded - spectrum only)")
             
         except Exception as e:
             self.log.error(f"Error setting up trilateration: {e}")
@@ -268,15 +269,39 @@ class RSSIPanoramaMainWindow(QMainWindow):
         
         # Оркестратор перенесен в отдельную вкладку справа
         
-        # Лог
-        log_group = QGroupBox("Лог")
-        log_layout = QVBoxLayout(log_group)
+        # Дополнительные параметры измерений
+        advanced_params_group = QGroupBox("Дополнительные параметры")
+        advanced_params_layout = QFormLayout(advanced_params_group)
         
-        self.log_text = QTextEdit()
-        self.log_text.setMaximumHeight(150)
-        log_layout.addWidget(self.log_text)
+        # SNR порог
+        self.snr_threshold_spin = QDoubleSpinBox()
+        self.snr_threshold_spin.setRange(3.0, 50.0)
+        self.snr_threshold_spin.setValue(10.0)
+        self.snr_threshold_spin.setDecimals(1)
+        self.snr_threshold_spin.setSuffix(" дБ")
+        advanced_params_layout.addRow("SNR порог:", self.snr_threshold_spin)
         
-        layout.addWidget(log_group)
+        # Минимальная ширина пика
+        self.min_peak_width_spin = QSpinBox()
+        self.min_peak_width_spin.setRange(1, 20)
+        self.min_peak_width_spin.setValue(3)
+        self.min_peak_width_spin.setSuffix(" бинов")
+        advanced_params_layout.addRow("Мин. ширина пика:", self.min_peak_width_spin)
+        
+        # Минимальное расстояние между пиками
+        self.min_peak_distance_spin = QSpinBox()
+        self.min_peak_distance_spin.setRange(1, 50)
+        self.min_peak_distance_spin.setValue(5)
+        self.min_peak_distance_spin.setSuffix(" бинов")
+        advanced_params_layout.addRow("Мин. расстояние пиков:", self.min_peak_distance_spin)
+        
+        # Количество усреднений
+        self.avg_count_spin = QSpinBox()
+        self.avg_count_spin.setRange(1, 10)
+        self.avg_count_spin.setValue(1)
+        advanced_params_layout.addRow("Усреднений:", self.avg_count_spin)
+        
+        layout.addWidget(advanced_params_group)
         
         return left_widget
     
@@ -290,6 +315,11 @@ class RSSIPanoramaMainWindow(QMainWindow):
         
         # Вкладка карты
         self.map_view = MapView()
+        try:
+            if hasattr(self, 'sdr_settings') and self.sdr_settings:
+                self.map_view.update_stations_from_config(self.sdr_settings)
+        except Exception:
+            pass
         tab_widget.addTab(self.map_view, "Карта")
         
         # Вкладка спектра
@@ -308,7 +338,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
         
         # Вкладка оркестратора
         orch_widget = self._create_orchestrator_widget()
-        tab_widget.addTab(orch_widget, "Оркестратор")
+        tab_widget.addTab(orch_widget, "Контроль")
         
         layout.addWidget(tab_widget)
         
@@ -370,7 +400,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
         layout.addWidget(self.orchestrator_status_label)
         
         # Пояснение
-        hint = QLabel("Оркестратор распределяет измерения по Slave (SoapySDR) для трилатерации.")
+        hint = QLabel("Контроль распределяет измерения по Slave (SoapySDR) для трилатерации.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
         
@@ -404,6 +434,10 @@ class RSSIPanoramaMainWindow(QMainWindow):
         # Действие настройки калибровки
         cal_settings_action = settings_menu.addAction('Настройки калибровки...')
         cal_settings_action.triggered.connect(self._show_calibration_settings)
+
+        # Действие настройки детектора
+        det_settings_action = settings_menu.addAction('Настройки детектора...')
+        det_settings_action.triggered.connect(self._show_detector_settings)
         
         # Меню Справка
         help_menu = menubar.addMenu('Справка')
@@ -417,7 +451,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
         toolbar = self.addToolBar('Основная панель')
         
         # Кнопка старт/стоп оркестратора
-        self.toolbar_orch_action = toolbar.addAction('▶ Оркестратор')
+        self.toolbar_orch_action = toolbar.addAction('▶ Контроль')
         self.toolbar_orch_action.triggered.connect(self._toggle_orchestrator)
         
         toolbar.addSeparator()
@@ -465,6 +499,9 @@ class RSSIPanoramaMainWindow(QMainWindow):
             'slaves': self.sdr_settings.get('slaves', [])
         }
         dlg = ImprovedDeviceManagerDialog(self, current)
+        # Передаем Master контроллер для сканирования устройств
+        if hasattr(dlg, 'set_master_controller'):
+            dlg.set_master_controller(self.master_controller)
         def _on_conf(data: dict):
             # Apply to runtime
             self.sdr_settings = data
@@ -499,6 +536,12 @@ class RSSIPanoramaMainWindow(QMainWindow):
             try:
                 self.trilateration_engine.stations.clear()
                 self._setup_trilateration()
+            except Exception:
+                pass
+            # Update map stations from new config
+            try:
+                if hasattr(self, 'map_view') and self.map_view:
+                    self.map_view.update_stations_from_config(self.sdr_settings)
             except Exception:
                 pass
         dlg.devicesConfigured.connect(_on_conf)
@@ -609,6 +652,13 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def _start_orchestrator(self):
         """Запускает оркестратор."""
         try:
+            # Инициализируем SDR если нужно
+            if self.master_controller and not self.master_controller.is_sdr_initialized():
+                self.log.info("Initializing SDR for orchestrator...")
+                if not self.master_controller.initialize_sdr():
+                    raise RuntimeError("Failed to initialize SDR")
+                self.log.info("SDR initialized successfully")
+            
             # Устанавливаем глобальные параметры
             span_hz = self.span_spin.value() * 1e6
             dwell_ms = self.global_dwell_spin.value()
@@ -620,7 +670,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
             
             self.start_orch_btn.setEnabled(False)
             self.stop_orch_btn.setEnabled(True)
-            self.toolbar_orch_action.setText('⏹ Оркестратор')
+            self.toolbar_orch_action.setText('⏹ Контроль')
             
             self.system_status['orchestrator_running'] = True
             self.log.info("Orchestrator started")
@@ -640,9 +690,15 @@ class RSSIPanoramaMainWindow(QMainWindow):
                 pass
             self.orchestrator.stop()
             
+            # Деинициализируем SDR после остановки
+            if self.master_controller and self.master_controller.is_sdr_initialized():
+                self.log.info("Deinitializing SDR after orchestrator stop...")
+                self.master_controller.deinitialize_sdr()
+                self.log.info("SDR deinitialized successfully")
+            
             self.start_orch_btn.setEnabled(True)
             self.stop_orch_btn.setEnabled(False)
-            self.toolbar_orch_action.setText('▶ Оркестратор')
+            self.toolbar_orch_action.setText('▶ Контроль')
             
             self.system_status['orchestrator_running'] = False
             self.log.info("Orchestrator stopped")
@@ -660,7 +716,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def _on_peak_detected(self, peak):
         """Обрабатывает обнаружение пика."""
         try:
-            self.log_text.append(f"Пик: {peak.f_peak/1e6:.1f} MHz, SNR: {peak.snr_db:.1f} dB")
+            self.log.info(f"Пик: {peak.f_peak/1e6:.1f} MHz, SNR: {peak.snr_db:.1f} dB")
             
             # Обновляем спектр
             if hasattr(self.spectrum_view, 'add_peak'):
@@ -671,12 +727,12 @@ class RSSIPanoramaMainWindow(QMainWindow):
     
     def _on_sweep_error(self, error_msg):
         """Обрабатывает ошибку sweep."""
-        self.log_text.append(f"Ошибка sweep: {error_msg}")
+        self.log.info(f"Ошибка sweep: {error_msg}")
     
     def _on_task_created(self, task):
         """Обрабатывает создание задачи."""
         try:
-            self.log_text.append(f"Задача создана: {task.id}")
+            self.log.info(f"Задача создана: {task.id}")
             self._update_tasks_table()
             
         except Exception as e:
@@ -685,7 +741,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def _on_task_completed(self, task):
         """Обрабатывает завершение задачи."""
         try:
-            self.log_text.append(f"Задача завершена: {task.id}")
+            self.log.info(f"Задача завершена: {task.id}")
             self._update_tasks_table()
             
         except Exception as e:
@@ -694,7 +750,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def _on_task_failed(self, task):
         """Обрабатывает ошибку задачи."""
         try:
-            self.log_text.append(f"Задача провалена: {task.id}")
+            self.log.info(f"Задача провалена: {task.id}")
             self._update_tasks_table()
             
         except Exception as e:
@@ -703,7 +759,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def _on_target_detected(self, target):
         """Обрабатывает обнаружение цели."""
         try:
-            self.log_text.append(f"Цель: {target.center_hz/1e6:.1f} MHz, "
+            self.log.info(f"Цель: {target.center_hz/1e6:.1f} MHz, "
                                f"({target.x:.1f}, {target.y:.1f}), доверие: {target.confidence:.2f}")
             
             # Обновляем карту
@@ -733,11 +789,11 @@ class RSSIPanoramaMainWindow(QMainWindow):
     
     def _on_trilateration_error(self, error_msg):
         """Обрабатывает ошибку трилатерации."""
-        self.log_text.append(f"Ошибка трилатерации: {error_msg}")
+        self.log.info(f"Ошибка трилатерации: {error_msg}")
     
     def _on_measurement_error(self, error_msg):
         """Обрабатывает ошибку измерения."""
-        self.log_text.append(f"Ошибка измерения: {error_msg}")
+        self.log.info(f"Ошибка измерения: {error_msg}")
     
     def _update_tasks_table(self):
         """Обновляет таблицу задач."""
@@ -866,6 +922,23 @@ class RSSIPanoramaMainWindow(QMainWindow):
         """Показывает настройки калибровки."""
         # TODO: Реализовать диалог настроек калибровки
         QMessageBox.information(self, "Информация", "Настройки калибровки будут добавлены в следующей версии")
+
+    def _show_detector_settings(self):
+        """Показывает диалог настроек детектора."""
+        try:
+            dlg = DetectorSettingsDialog(self)
+            def _on_changed(s: DetectorSettings):
+                # Применяем некоторые глобальные параметры к оркестратору
+                try:
+                    if self.orchestrator:
+                        self.orchestrator.set_global_parameters(span_hz=s.watchlist_span_mhz * 1e6,
+                                                                dwell_ms=int(s.watchlist_dwell_ms))
+                except Exception:
+                    pass
+            dlg.settingsChanged.connect(_on_changed)
+            dlg.exec_()
+        except Exception as e:
+            self.log.error(f"Detector settings dialog error: {e}")
     
     def _show_about(self):
         """Показывает информацию о программе."""
@@ -878,9 +951,10 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def closeEvent(self, event):
         """Обрабатывает закрытие приложения."""
         try:
-            # Останавливаем все компоненты
+            # Останавливаем все компоненты в правильном порядке
             if self.master_controller:
                 self.master_controller.stop_sweep()
+                self.master_controller.cleanup()
             
             if self.orchestrator:
                 self.orchestrator.stop()
