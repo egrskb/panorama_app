@@ -293,45 +293,55 @@ double hackrf_master_get_max_bandwidth(void) {
 }
 
 int hackrf_master_enumerate(hackrf_devinfo_t* out_list, int max_count) {
-    if (!out_list || max_count <= 0) return 0;
+    printf("DEBUG: hackrf_master_enumerate called, max_count=%d\n", max_count);
+    
+    if (!out_list || max_count <= 0) {
+        printf("DEBUG: Invalid parameters\n");
+        return 0;
+    }
+    
     int found = 0;
     bool need_init = !lib_initialized;
 
     if (need_init) {
+        printf("DEBUG: Initializing hackrf library\n");
         if (hackrf_init() != HACKRF_SUCCESS) {
+            printf("DEBUG: hackrf_init failed\n");
             return 0;
         }
         lib_initialized = true;
     }
 
-    // Попробуем получить список устройств из libhackrf
+    // Получаем список устройств
     hackrf_device_list_t* list = hackrf_device_list();
-    if (list) {
-        for (int i = 0; i < list->devicecount && found < max_count; i++) {
-            const char* serial = list->serial_numbers[i];
-            if (serial && serial[0] != '\0') {
-                strncpy(out_list[found].serial, serial, sizeof(out_list[found].serial) - 1);
-                out_list[found].serial[sizeof(out_list[found].serial) - 1] = '\0';
-            } else {
-                out_list[found].serial[0] = '\0';
+    
+    if (!list) {
+        printf("DEBUG: hackrf_device_list returned NULL\n");
+    } else {
+        printf("DEBUG: hackrf_device_list found %d devices\n", list->devicecount);
+        
+        if (list->devicecount > 0) {
+            for (int i = 0; i < list->devicecount && found < max_count; i++) {
+                const char* serial = list->serial_numbers[i];
+                if (serial && serial[0] != '\0') {
+                    printf("DEBUG: Found device with serial: %s\n", serial);
+                    strncpy(out_list[found].serial, serial, sizeof(out_list[found].serial) - 1);
+                    out_list[found].serial[sizeof(out_list[found].serial) - 1] = '\0';
+                    found++;
+                } else {
+                    printf("DEBUG: Device %d has empty serial\n", i);
+                }
             }
-            found++;
         }
-        // Освободим список, если функция доступна (в новых версиях)
-        // В старых версиях free не требуется; безопасно пропустить
-        // hackrf_device_list_free(list); // закомментировано для совместимости
     }
-
-    // Если ничего не нашли, вернём «устройство по умолчанию»
-    if (found == 0) {
-        out_list[found].serial[0] = '\0';
-        found = 1;
-    }
+    
     if (need_init) {
         hackrf_exit();
         lib_initialized = false;
     }
-    return found;
+    
+    printf("DEBUG: hackrf_master_enumerate returning %d devices\n", found);
+    return found;  // Возвращаем реальное количество
 }
 
 void hackrf_master_set_serial(const char* serial) {

@@ -9,16 +9,23 @@ import os
 from pathlib import Path
 from cffi import FFI
 
+# Проверка доступности C библиотеки
+try:
+    current_dir = Path(__file__).parent
+    lib_path = current_dir / "hackrf_master" / "build" / "libhackrf_master.so"
+    C_LIB_AVAILABLE = lib_path.exists()
+except Exception:
+    C_LIB_AVAILABLE = False
+
 class HackRFMaster:
     """Wrapper for libhackrf_master.so via CFFI."""
     
+    _enumerating = False  # Класс-переменная для предотвращения рекурсии
+    
     def __init__(self):
-        # Путь к библиотеке
-        current_dir = Path(__file__).parent
-        lib_path = current_dir / "hackrf_master" / "build" / "libhackrf_master.so"
-        
-        if not lib_path.exists():
-            raise FileNotFoundError(f"Библиотека не найдена: {lib_path}")
+        # Проверяем доступность библиотеки
+        if not C_LIB_AVAILABLE:
+            raise FileNotFoundError("C библиотека libhackrf_master.so недоступна")
         
         # Создаем FFI
         self.ffi = FFI()
@@ -69,6 +76,8 @@ class HackRFMaster:
         """, override=True)
         
         # Загружаем библиотеку
+        current_dir = Path(__file__).parent
+        lib_path = current_dir / "hackrf_master" / "build" / "libhackrf_master.so"
         self.lib = self.ffi.dlopen(str(lib_path))
         
         # Callback функции
@@ -180,28 +189,72 @@ class HackRFMaster:
 
     def enumerate_devices(self):
         """Перечисляет доступные HackRF устройства."""
+        print(f"DEBUG: HackRFMaster.enumerate_devices called")
+        
+        if not C_LIB_AVAILABLE:
+            print("DEBUG: C library not available")
+            return []
+        
         try:
-            # Если SDR не инициализирован, возвращаем базовый список
-            if not self._is_initialized:
-                return ["default"]
-            
             maxn = 16
             arr = self.ffi.new("hackrf_devinfo_t[]", maxn)
             n = int(self.lib.hackrf_master_enumerate(arr, maxn))
-            out: list[str] = []
-            seen_serials = set()  # Для отслеживания уникальности
+            
+            print(f"DEBUG: C library returned {n} devices")
+            
+            if n <= 0:
+                print("DEBUG: No devices found by C library")
+                return []
+            
+            out = []
+            seen_serials = set()
             
             for i in range(n):
-                serial = self.ffi.string(arr[i].serial).decode("utf-8")
-                # Добавляем только уникальные серийные номера
+                serial_bytes = arr[i].serial
+                serial = self.ffi.string(serial_bytes).decode("utf-8").strip()
+                
+                print(f"DEBUG: Device {i}: serial='{serial}', len={len(serial)}")
+                
+                # Очень строгая проверка
+                if not serial:
+                    print(f"DEBUG: Skipping empty serial")
+                    continue
+                    
+                if serial in ["", "default", "0", "none", "N/A"]:
+                    print(f"DEBUG: Skipping invalid serial: {serial}")
+                    continue
+                
+                # HackRF серийники - это 32 символа hex (16 байт)
+                # Пример: 0000000000000000916463c829709f43
+                if len(serial) != 32:
+                    print(f"DEBUG: Skipping serial with wrong length: {len(serial)}")
+                    continue
+                    
+                # Проверяем что все символы - hex
+                try:
+                    int(serial, 16)
+                except ValueError:
+                    print(f"DEBUG: Skipping non-hex serial: {serial}")
+                    continue
+                
+                # Проверяем что не все нули
+                if serial == "0" * 32:
+                    print(f"DEBUG: Skipping all-zeros serial")
+                    continue
+                
                 if serial not in seen_serials:
                     seen_serials.add(serial)
                     out.append(serial)
+                    print(f"DEBUG: Added valid device: {serial}")
             
-            # Если ничего не найдено, возвращаем default
-            return out if out else ["default"]
-        except Exception:
-            return ["default"]
+            print(f"DEBUG: Returning {len(out)} valid devices")
+            return out
+            
+        except Exception as e:
+            print(f"DEBUG: Exception in enumerate_devices: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
 
     def set_serial(self, serial: str | None):
         if serial is None:

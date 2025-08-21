@@ -79,6 +79,7 @@ class DeviceDiscoveryThread(QThread):
         super().__init__(parent)
         self._stop = False
         self.master_controller = None  # Master контроллер для сканирования
+        self.selected_master_serial = None  # Добавляем хранение выбранного Master
 
     def set_master_controller(self, master_controller):
         """Устанавливает Master контроллер для сканирования."""
@@ -115,82 +116,69 @@ class DeviceDiscoveryThread(QThread):
     
     def _find_hackrf_devices(self) -> List[SDRDeviceInfo]:
         """Поиск HackRF устройств через C библиотеку."""
+        print("DEBUG: _find_hackrf_devices called")
         devices = []
         
         if not HACKRF_AVAILABLE:
+            print("DEBUG: HACKRF_AVAILABLE is False")
             return devices
         
         try:
-            # Если доступен Master контроллер, используем его для сканирования
+            # Используем Master контроллер если есть
             if self.master_controller and hasattr(self.master_controller, 'enumerate_devices'):
-                try:
-                    serials = self.master_controller.enumerate_devices()
-                    if serials:
-                        for serial in serials:
-                            serial = serial or "default"
-                            info = SDRDeviceInfo(
-                                driver="hackrf",
-                                serial=serial,
-                                label=f"HackRF {serial[-4:]}" if serial != "default" else "HackRF (default)",
-                                uri=f"driver=hackrf,serial={serial}" if serial != "default" else "driver=hackrf",
-                                capabilities={
-                                    "frequency_range": (24e6, 6e9),
-                                    "bandwidth": 20e6,
-                                    "sample_rates": [2e6, 4e6, 8e6, 10e6, 12.5e6, 16e6, 20e6]
-                                }
-                            )
-                            info.is_available = True
-                            info.last_seen = time.time()
-                            devices.append(info)
-                        return devices
-                except Exception as e:
-                    print(f"Error using master controller for scanning: {e}")
-            
-            # Fallback: создаем временный объект для получения информации
-            hw = HackRFMaster()
-            
-            # Получаем список устройств
-            serials = hw.enumerate_devices() or []
-            
-            for serial in serials:
-                serial = serial or "default"
-                info = SDRDeviceInfo(
-                    driver="hackrf",
-                    serial=serial,
-                    label=f"HackRF {serial[-4:]}" if serial != "default" else "HackRF (default)",
-                    uri=f"driver=hackrf,serial={serial}" if serial != "default" else "driver=hackrf",
-                    capabilities={
-                        "frequency_range": (24e6, 6e9),
-                        "bandwidth": 20e6,
-                        "sample_rates": [2e6, 4e6, 8e6, 10e6, 12.5e6, 16e6, 20e6]
-                    }
-                )
+                print("DEBUG: Using master_controller.enumerate_devices")
+                serials = self.master_controller.enumerate_devices()
+                print(f"DEBUG: Got {len(serials) if serials else 0} serials from master_controller")
                 
-                # Проверяем доступность БЕЗ инициализации SDR
-                try:
-                    # Просто проверяем что устройство видно в системе
-                    info.is_available = True  # Пока считаем доступным
-                except Exception:
-                    info.is_available = False
+                if not serials:
+                    print("DEBUG: No serials returned")
+                    return []
+                    
+                for serial in serials:
+                    print(f"DEBUG: Processing serial: '{serial}'")
+                    # Еще более строгая проверка
+                    if not serial or len(serial) != 32:
+                        print(f"DEBUG: Skipping invalid serial: '{serial}'")
+                        continue
+                    
+                    try:
+                        # Проверяем что это hex
+                        int(serial, 16)
+                    except:
+                        print(f"DEBUG: Skipping non-hex serial: '{serial}'")
+                        continue
+                    
+                    info = SDRDeviceInfo(
+                        driver="hackrf",
+                        serial=serial,
+                        label=f"HackRF {serial[-4:]}",
+                        uri=f"driver=hackrf,serial={serial}",
+                        capabilities={
+                            "frequency_range": (24e6, 6e9),
+                            "bandwidth": 20e6,
+                            "sample_rates": [2e6, 4e6, 8e6, 10e6, 12.5e6, 16e6, 20e6]
+                        }
+                    )
+                    info.is_available = True
+                    info.last_seen = time.time()
+                    devices.append(info)
+                    print(f"DEBUG: Added device: {serial[-4:]}")
                 
-                info.last_seen = time.time()
-                devices.append(info)
-            
-            # Важно: деинициализируем SDR после использования
-            try:
-                hw.deinitialize_sdr()
-            except Exception:
-                pass
+                return devices
+                
+            else:
+                print("DEBUG: No master_controller, trying direct approach")
+                # Если нет контроллера - НЕ создаем фиктивные устройства
+                return []
                 
         except Exception as e:
-            print(f"Error finding HackRF devices: {e}")
-            # Возвращаем пустой список вместо падения
+            print(f"DEBUG: Exception in _find_hackrf_devices: {e}")
+            import traceback
+            traceback.print_exc()
             return []
-        
-        return devices
     
     def _find_soapy_devices(self) -> List[SDRDeviceInfo]:
-        """Поиск устройств через SoapySDR."""
+        """Поиск устройств через SoapySDR (исключая выбранный Master)."""
         devices = []
         
         if not SOAPY_AVAILABLE:
@@ -213,11 +201,17 @@ class DeviceDiscoveryThread(QThread):
                     serial = ''
                     label = ''
                 
-                # Пропускаем HackRF, так как они уже найдены через C библиотеку
-                if driver == 'hackrf':
-                        continue
+                # ВАЖНО: Исключаем устройство, выбранное как Master
+                if self.selected_master_serial and serial == self.selected_master_serial:
+                    print(f"Skipping Master device: {serial}")
+                    continue
                 
-                # Формируем URI
+                # Также пропускаем HackRF устройства (они только для Master)
+                if driver.lower() == 'hackrf':
+                    print(f"Skipping HackRF for Slave: {serial}")
+                    continue
+                
+                # Формируем URI для Slave
                 uri_parts = []
                 if driver:
                     uri_parts.append(f"driver={driver}")
@@ -453,6 +447,18 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
         """Обрабатывает найденные устройства."""
         self.all_devices = devices
         
+        # Если устройств нет, показываем сообщение
+        if not devices:
+            self.master_list.clear()
+            item = QtWidgets.QListWidgetItem("Нет доступных HackRF устройств")
+            item.setForeground(QtGui.QBrush(QtGui.QColor(150, 150, 150)))
+            item.setFlags(QtCore.Qt.NoItemFlags)  # Делаем неселектируемым
+            self.master_list.addItem(item)
+            
+            self.available_table.setRowCount(0)
+            self.status_label.setText("Устройства не найдены")
+            return
+        
         # Применяем сохраненную конфигурацию
         self._apply_saved_config()
         
@@ -490,9 +496,21 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
     
     def _update_available_table(self):
         """Обновляет таблицу доступных устройств для Slave."""
-        # Фильтруем только не-HackRF устройства или HackRF не выбранные как Master
-        available = [d for d in self.all_devices 
-                    if d.driver != "hackrf" or d != self.master_device]
+        # Фильтруем устройства для Slave:
+        # 1. Исключаем все HackRF (они только для Master)
+        # 2. Исключаем выбранный Master
+        available = []
+        
+        for d in self.all_devices:
+            # Пропускаем HackRF устройства
+            if d.driver.lower() == "hackrf":
+                continue
+            
+            # Пропускаем выбранный Master
+            if self.master_device and d.serial == self.master_device.serial:
+                continue
+            
+            available.append(d)
         
         self.available_table.setRowCount(len(available))
         
@@ -563,6 +581,14 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
             device = selected[0].data(QtCore.Qt.UserRole)
             self.master_device = device
             
+            # ВАЖНО: Обновляем список доступных Slave устройств
+            # исключая выбранный Master
+            if hasattr(self, '_discovery_thread'):
+                self._discovery_thread.selected_master_serial = device.serial
+            
+            # Удаляем Master из списка Slaves если он там есть
+            self._remove_master_from_slaves(device.serial)
+            
             # Обновляем информацию
             info_text = f"Устройство: {device.nickname}\n"
             info_text += f"Серийный номер: {device.serial}\n"
@@ -580,9 +606,11 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
             self.master_info.setPlainText(info_text)
         else:
             self.master_device = None
+            if hasattr(self, '_discovery_thread'):
+                self._discovery_thread.selected_master_serial = None
             self.master_info.clear()
         
-        # Обновляем таблицу доступных (исключаем выбранный Master)
+        # Обновляем таблицу доступных устройств
         self._update_available_table()
     
     def _add_slave(self, device: SDRDeviceInfo):
@@ -600,6 +628,17 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
             self.slave_devices.remove(device)
             self._update_available_table()
             self._update_slaves_table()
+    
+    def _remove_master_from_slaves(self, master_serial: str):
+        """Удаляет Master из списка Slave устройств."""
+        # Удаляем из slave_devices если есть
+        self.slave_devices = [
+            dev for dev in self.slave_devices 
+            if dev.serial != master_serial
+        ]
+        
+        # Обновляем таблицу Slaves
+        self._update_slaves_table()
     
     def _preset_triangle(self):
         """Устанавливает позиции Slave в виде треугольника."""

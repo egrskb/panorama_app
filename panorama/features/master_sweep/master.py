@@ -9,6 +9,7 @@ import numpy as np
 from typing import List, Dict, Optional, Callable
 from dataclasses import dataclass
 from PyQt5.QtCore import QObject, pyqtSignal, QTimer
+from pathlib import Path
 
 # Импортируем C библиотеку через CFFI
 try:
@@ -565,13 +566,44 @@ class MasterSweepController(QObject):
             return []
         
         try:
-            # Создаем временный объект для сканирования
-            temp_sdr = HackRFMaster()
-            devices = temp_sdr.enumerate_devices()
-            # Важно: деинициализируем SDR после использования
-            temp_sdr.deinitialize_sdr()
-            del temp_sdr
+            # Если у нас уже есть инициализированный sweep_source, используем его
+            if self.sweep_source and hasattr(self.sweep_source, 'enumerate_devices'):
+                return self.sweep_source.enumerate_devices()
+            
+            # Иначе вызываем статический метод C библиотеки напрямую
+            # БЕЗ создания нового экземпляра HackRFMaster
+            from cffi import FFI
+            ffi = FFI()
+            
+            # Минимальное определение для enumerate
+            ffi.cdef("""
+                typedef struct {
+                    char serial[64];
+                } hackrf_devinfo_t;
+                
+                int hackrf_master_enumerate(void* out_list, int max_count);
+            """, override=True)
+            
+            # Загружаем библиотеку напрямую
+            lib_path = Path(__file__).parent.parent.parent / "drivers" / "hackrf_master" / "build" / "libhackrf_master.so"
+            if not lib_path.exists():
+                return []
+                
+            lib = ffi.dlopen(str(lib_path))
+            
+            # Вызываем enumerate
+            maxn = 16
+            arr = ffi.new("hackrf_devinfo_t[]", maxn)
+            n = int(lib.hackrf_master_enumerate(arr, maxn))
+            
+            devices = []
+            for i in range(n):
+                serial = ffi.string(arr[i].serial).decode("utf-8")
+                if serial and serial != "default":
+                    devices.append(serial)
+            
             return devices
+            
         except Exception as e:
             self.log.error(f"Failed to scan devices: {e}")
             return []

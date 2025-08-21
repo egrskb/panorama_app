@@ -585,34 +585,48 @@ class MapView(QtWidgets.QWidget):
             # Очищаем старые позиции
             self.sdr_positions.clear()
             
-            # Добавляем Master (только для отображения, не для трилатерации)
+            # Проверяем что есть реальные устройства
+            has_real_devices = False
+            
+            # Master
             master_config = sdr_settings.get('master', {})
-            if master_config.get('serial') or master_config.get('uri'):
-                # Master всегда в центре (0, 0) - он отвечает только за спектр
+            master_serial = master_config.get('serial', '')
+            
+            # Проверяем что серийный номер валидный (не пустой и достаточной длины)
+            if master_serial and len(master_serial) >= 16:
                 self.sdr_positions['master'] = (0.0, 0.0)
                 self.master_device = master_config
+                has_real_devices = True
             
-            # Добавляем Slave устройства (для трилатерации)
+            # Slaves
             for i, slave_config in enumerate(sdr_settings.get('slaves', []), start=1):
-                if slave_config.get('serial') or slave_config.get('uri'):
-                    # Получаем позицию из конфигурации
+                slave_serial = slave_config.get('serial', '')
+                slave_uri = slave_config.get('uri', '')
+                
+                # Проверяем что есть валидный идентификатор
+                if (slave_serial and len(slave_serial) >= 4) or slave_uri:
                     pos = slave_config.get('pos', [0.0, 0.0, 0.0])
                     x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
                     
-                    # Сохраняем позицию (X, Y для 2D карты, Z для высоты)
                     self.sdr_positions[f'slave{i}'] = (x, y)
                     
-                    # Сохраняем полную информацию об устройстве
                     if i == 1:
                         self.slave1_device = slave_config
                     elif i == 2:
                         self.slave2_device = slave_config
+                    
+                    has_real_devices = True
             
-            # Обновляем информацию об устройствах
-            self._update_device_info()
-            
-            # Перерисовываем карту
-            self._refresh_map()
+            # Обновляем только если есть реальные устройства
+            if has_real_devices:
+                self._update_device_info()
+                self._refresh_map()
+            else:
+                # Очищаем карту если нет устройств
+                self.sdr_positions.clear()
+                self.device_info.setPlainText("Устройства не настроены\n\nИсточник → Настройка SDR")
+                self.position_info.setPlainText("Позиции не заданы")
+                self._refresh_map()
             
         except Exception as e:
             print(f"Error updating stations from config: {e}")

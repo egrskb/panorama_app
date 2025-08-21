@@ -418,15 +418,12 @@ class DeviceConfigDialog(QtWidgets.QDialog):
                     if available_serials:
                         self.manager.update_device_list(available_serials)
             
-            # Если не удалось получить устройства, используем заглушку
-            if not available_serials:
-                # Заглушка для тестирования
-                available_serials = ["hackrf_0000000000000000", "hackrf_0000000000000001"]
+            # Убираем заглушки - показываем только реальные устройства
+            if available_serials:
                 self.manager.update_device_list(available_serials)
             
             self._refresh_table()
             
         except Exception as e:
             print(f"Error refreshing devices: {e}")
-            # В случае ошибки просто обновляем таблицу
             self._refresh_table()
