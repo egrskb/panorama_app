@@ -30,10 +30,19 @@ static pthread_t sweep_thread;
 static pthread_mutex_t data_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char selected_serial[64] = {0};
 
-// Callback функции
+// Глобальные переменные для callback функций
 static sweep_tile_callback_t sweep_callback = NULL;
 static peak_detected_callback_t peak_callback = NULL;
 static error_callback_t error_callback = NULL;
+
+// Глобальные переменные для передачи данных между потоками
+static sweep_tile_t last_sweep_tile;
+static detected_peak_t last_detected_peak;
+static char last_error_message[256];
+static bool new_sweep_data_available = false;
+static bool new_peak_data_available = false;
+static bool new_error_message_available = false;
+static pthread_mutex_t callback_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Конфигурация
 static sweep_config_t current_config;
@@ -59,6 +68,72 @@ static int process_sweep_data(double f_start, double f_stop, int dwell_ms);
 static int detect_peaks_in_sweep(const float* powers, int count, double f_start, double bin_hz);
 static float estimate_noise_level(const float* powers, int count, int exclude_start, int exclude_end);
 static void smooth_power_data(const float* input, float* output, int count);
+
+// Функции для получения данных (альтернатива callback)
+int hackrf_master_get_last_sweep_tile(sweep_tile_t* tile_out) {
+    if (!tile_out) return -1;
+    
+    pthread_mutex_lock(&callback_mutex);
+    if (new_sweep_data_available) {
+        // Копируем данные вместо передачи указателей
+        tile_out->f_start = last_sweep_tile.f_start;
+        tile_out->bin_hz = last_sweep_tile.bin_hz;
+        tile_out->count = last_sweep_tile.count;
+        tile_out->t0 = last_sweep_tile.t0;
+        
+        // Копируем power данные
+        if (last_sweep_tile.power && last_sweep_tile.count > 0) {
+            // Выделяем новую память для power данных
+            tile_out->power = malloc(last_sweep_tile.count * sizeof(float));
+            if (tile_out->power) {
+                memcpy(tile_out->power, last_sweep_tile.power, last_sweep_tile.count * sizeof(float));
+                printf("DEBUG: Copied %d power values to output tile\n", last_sweep_tile.count);
+            } else {
+                printf("DEBUG: Failed to allocate memory for power data\n");
+                pthread_mutex_unlock(&callback_mutex);
+                return -1;
+            }
+        } else {
+            tile_out->power = NULL;
+        }
+        
+        new_sweep_data_available = false;
+        pthread_mutex_unlock(&callback_mutex);
+        printf("DEBUG: Successfully copied sweep tile data\n");
+        return 0;
+    }
+    pthread_mutex_unlock(&callback_mutex);
+    return -1; // Нет новых данных
+}
+
+int hackrf_master_get_last_peak(detected_peak_t* peak_out) {
+    if (!peak_out) return -1;
+    
+    pthread_mutex_lock(&callback_mutex);
+    if (new_peak_data_available) {
+        memcpy(peak_out, &last_detected_peak, sizeof(detected_peak_t));
+        new_peak_data_available = false;
+        pthread_mutex_unlock(&callback_mutex);
+        return 0;
+    }
+    pthread_mutex_unlock(&callback_mutex);
+    return -1; // Нет новых данных
+}
+
+int hackrf_master_get_last_error_message(char* message_out, int max_len) {
+    if (!message_out || max_len <= 0) return -1;
+    
+    pthread_mutex_lock(&callback_mutex);
+    if (new_error_message_available) {
+        strncpy(message_out, last_error_message, max_len - 1);
+        message_out[max_len - 1] = '\0';
+        new_error_message_available = false;
+        pthread_mutex_unlock(&callback_mutex);
+        return 0;
+    }
+    pthread_mutex_unlock(&callback_mutex);
+    return -1; // Нет новых данных
+}
 
 // Инициализация библиотеки
 int hackrf_master_init(void) {
@@ -210,15 +285,49 @@ bool hackrf_master_is_running(void) {
 
 // Установка callbacks
 void hackrf_master_set_sweep_callback(sweep_tile_callback_t callback) {
+    printf("DEBUG: Setting sweep_callback to: %p\n", (void*)callback);
+    
+    pthread_mutex_lock(&callback_mutex);
     sweep_callback = callback;
+    printf("DEBUG: sweep_callback now set to: %p\n", (void*)sweep_callback);
+    pthread_mutex_unlock(&callback_mutex);
+    
+    // Проверяем что callback установлен
+    if (sweep_callback) {
+        printf("DEBUG: sweep_callback successfully set\n");
+    } else {
+        printf("DEBUG: WARNING: sweep_callback is still NULL after setting!\n");
+    }
 }
 
 void hackrf_master_set_peak_callback(peak_detected_callback_t callback) {
+    printf("DEBUG: Setting peak_callback to: %p\n", (void*)callback);
+    
+    pthread_mutex_lock(&callback_mutex);
     peak_callback = callback;
+    printf("DEBUG: peak_callback now set to: %p\n", (void*)peak_callback);
+    pthread_mutex_unlock(&callback_mutex);
+    
+    if (peak_callback) {
+        printf("DEBUG: peak_callback successfully set\n");
+    } else {
+        printf("DEBUG: WARNING: peak_callback is still NULL after setting!\n");
+    }
 }
 
 void hackrf_master_set_error_callback(error_callback_t callback) {
+    printf("DEBUG: Setting error_callback to: %p\n", (void*)callback);
+    
+    pthread_mutex_lock(&callback_mutex);
     error_callback = callback;
+    printf("DEBUG: error_callback now set to: %p\n", (void*)error_callback);
+    pthread_mutex_unlock(&callback_mutex);
+    
+    if (error_callback) {
+        printf("DEBUG: error_callback successfully set\n");
+    } else {
+        printf("DEBUG: WARNING: error_callback is still NULL after setting!\n");
+    }
 }
 
 // Установка параметров детекции пиков
@@ -608,11 +717,51 @@ static int process_sweep_data(double f_start, double f_stop, int dwell_ms) {
             
             printf("DEBUG: Calling sweep_callback with %d bins\n", tile.count);
             
-            // Вызываем callback
+            pthread_mutex_lock(&callback_mutex);
+            printf("DEBUG: sweep_callback pointer: %p\n", (void*)sweep_callback);
+            
+            // Сохраняем данные для получения через функции (альтернатива callback)
+            pthread_mutex_lock(&callback_mutex);
+            
+            // Копируем основные данные
+            last_sweep_tile.f_start = tile.f_start;
+            last_sweep_tile.bin_hz = tile.bin_hz;
+            last_sweep_tile.count = tile.count;
+            last_sweep_tile.t0 = tile.t0;
+            
+            // Копируем power данные
+            if (tile.power && tile.count > 0) {
+                // Освобождаем старую память если есть
+                if (last_sweep_tile.power) {
+                    free(last_sweep_tile.power);
+                }
+                
+                // Выделяем новую память и копируем данные
+                last_sweep_tile.power = malloc(tile.count * sizeof(float));
+                if (last_sweep_tile.power) {
+                    memcpy(last_sweep_tile.power, tile.power, tile.count * sizeof(float));
+                    printf("DEBUG: Saved %d power values for retrieval\n", tile.count);
+                } else {
+                    printf("DEBUG: Failed to allocate memory for saving power data\n");
+                }
+            } else {
+                last_sweep_tile.power = NULL;
+            }
+            
+            new_sweep_data_available = true;
+            printf("DEBUG: Data saved for retrieval via get_last_sweep_tile\n");
+            
+            pthread_mutex_unlock(&callback_mutex);
+            
+            // Вызываем callback если установлен
             if (sweep_callback) {
+                printf("DEBUG: About to call sweep_callback...\n");
                 sweep_callback(&tile);
                 printf("DEBUG: sweep_callback completed\n");
+            } else {
+                printf("DEBUG: sweep_callback is NULL, but data saved for polling\n");
             }
+            pthread_mutex_unlock(&callback_mutex);
             
             // Освобождаем память после callback
             free(tile.power);

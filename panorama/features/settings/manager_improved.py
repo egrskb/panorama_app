@@ -5,6 +5,11 @@ Master - только один HackRF из списка C библиотеки.
 Slaves - множество устройств через SoapySDR.
 """
 
+import os
+# ОТКЛЮЧАЕМ AVAHI В SOAPYSDR ДО ВСЕХ ИМПОРТОВ
+# Это предотвращает ошибки "avahi_service_browser_new() failed: Bad state"
+os.environ['SOAPY_SDR_DISABLE_AVAHI'] = '1'
+
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -185,7 +190,18 @@ class DeviceDiscoveryThread(QThread):
             return devices
         
         try:
+            # Отключаем Avahi для предотвращения ошибок при поиске сетевых устройств
+            import os
+            old_env = os.environ.get('SOAPY_SDR_DISABLE_AVAHI')
+            os.environ['SOAPY_SDR_DISABLE_AVAHI'] = '1'
+            
             results = SoapySDR.Device.enumerate()
+            
+            # Восстанавливаем старое значение
+            if old_env is not None:
+                os.environ['SOAPY_SDR_DISABLE_AVAHI'] = old_env
+            else:
+                del os.environ['SOAPY_SDR_DISABLE_AVAHI']
             
             for info_dict in results:
                 # SoapyKwargs у разных сборок может не иметь .get — используем безопасные извлечения
@@ -194,22 +210,64 @@ class DeviceDiscoveryThread(QThread):
                     serial = info_dict.get('serial', '')
                     label = info_dict.get('label', '')
                 else:
+                    # Пробуем извлечь данные из строкового представления
                     try:
-                        driver = str(info_dict)
-                    except Exception:
+                        info_str = str(info_dict)
+                        print(f"DEBUG: Processing SoapyKwargs: {info_str}")
+                        
+                        # Инициализируем переменные
                         driver = ''
-                    serial = ''
-                    label = ''
+                        serial = ''
+                        label = ''
+                        
+                        # Парсим строку для извлечения данных
+                        if 'driver=' in info_str:
+                            driver_start = info_str.find('driver=') + 7
+                            driver_end = info_str.find(',', driver_start)
+                            if driver_end == -1:
+                                driver_end = info_str.find('}', driver_start)
+                            driver = info_str[driver_start:driver_end].strip()
+                        
+                        if 'serial=' in info_str:
+                            serial_start = info_str.find('serial=') + 7
+                            serial_end = info_str.find(',', serial_start)
+                            if serial_end == -1:
+                                serial_end = info_str.find('}', serial_start)
+                            serial = info_str[serial_start:serial_end].strip()
+                        
+                        if 'label=' in info_str:
+                            label_start = info_str.find('label=') + 6
+                            label_end = info_str.find(',', label_start)
+                            if label_end == -1:
+                                label_end = info_str.find('}', label_start)
+                            label = info_str[label_start:label_end].strip()
+                        
+                        print(f"DEBUG: Parsed - driver: '{driver}', serial: '{serial}', label: '{label}'")
+                    except Exception as e:
+                        print(f"DEBUG: Error parsing SoapyKwargs: {e}")
+                        driver = ''
+                        serial = ''
+                        label = ''
+                
+                # ВАЖНО: Пропускаем пустые или некорректные устройства
+                if not driver or driver == '':
+                    print(f"Skipping empty driver device")
+                    continue
+                
+                # Пропускаем аудио устройства (не SDR)
+                if driver.lower() in ['audio', 'pulse', 'alsa', 'jack']:
+                    print(f"Skipping audio device: {driver}")
+                    continue
                 
                 # ВАЖНО: Исключаем устройство, выбранное как Master
                 if self.selected_master_serial and serial == self.selected_master_serial:
                     print(f"Skipping Master device: {serial}")
                     continue
                 
-                # Также пропускаем HackRF устройства (они только для Master)
-                if driver.lower() == 'hackrf':
-                    print(f"Skipping HackRF for Slave: {serial}")
-                    continue
+                # НЕ пропускаем HackRF устройства - они могут быть Slave!
+                # if driver.lower() == 'hackrf':
+                #     print(f"Skipping HackRF for Slave: {serial}")
+                #     continue
                 
                 # Формируем URI для Slave
                 uri_parts = []
@@ -218,9 +276,6 @@ class DeviceDiscoveryThread(QThread):
                 if serial:
                     uri_parts.append(f"serial={serial}")
                 uri = ",".join(uri_parts) if uri_parts else ""
-                
-                if not driver:
-                    continue
                 
                 device_info = SDRDeviceInfo(
                     driver=driver,
@@ -232,6 +287,7 @@ class DeviceDiscoveryThread(QThread):
                 )
                 
                 devices.append(device_info)
+                print(f"Found SoapySDR device: {driver} ({serial})")
                 
         except Exception as e:
             print(f"Error finding SoapySDR devices: {e}")
@@ -445,10 +501,15 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
 
     def _on_devices_found(self, devices: List[SDRDeviceInfo]):
         """Обрабатывает найденные устройства."""
+        print(f"DEBUG: _on_devices_found called with {len(devices)} devices")
+        for i, device in enumerate(devices):
+            print(f"DEBUG: Device {i}: {device.driver} ({device.serial}) - {device.label}")
+        
         self.all_devices = devices
         
         # Если устройств нет, показываем сообщение
         if not devices:
+            print("DEBUG: No devices found, showing empty message")
             self.master_list.clear()
             item = QtWidgets.QListWidgetItem("Нет доступных HackRF устройств")
             item.setForeground(QtGui.QBrush(QtGui.QColor(150, 150, 150)))
@@ -459,6 +520,7 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
             self.status_label.setText("Устройства не найдены")
             return
         
+        print("DEBUG: Applying saved config and updating UI")
         # Применяем сохраненную конфигурацию
         self._apply_saved_config()
         
@@ -497,21 +559,24 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
     def _update_available_table(self):
         """Обновляет таблицу доступных устройств для Slave."""
         # Фильтруем устройства для Slave:
-        # 1. Исключаем все HackRF (они только для Master)
-        # 2. Исключаем выбранный Master
+        # 1. Исключаем только выбранный Master
+        # 2. HackRF устройства могут быть Slave!
         available = []
         
         for d in self.all_devices:
-            # Пропускаем HackRF устройства
-            if d.driver.lower() == "hackrf":
-                continue
-            
             # Пропускаем выбранный Master
             if self.master_device and d.serial == self.master_device.serial:
+                print(f"DEBUG: Skipping selected Master from Slave list: {d.serial}")
                 continue
             
+            # HackRF устройства могут быть Slave!
+            # if d.driver.lower() == "hackrf":
+            #     continue
+            
             available.append(d)
+            print(f"DEBUG: Added device to Slave list: {d.driver} ({d.serial})")
         
+        print(f"DEBUG: Total devices available for Slave: {len(available)}")
         self.available_table.setRowCount(len(available))
         
         for row, device in enumerate(available):
@@ -579,6 +644,7 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
         
         if selected:
             device = selected[0].data(QtCore.Qt.UserRole)
+            old_master_serial = self.master_device.serial if self.master_device else None
             self.master_device = device
             
             # ВАЖНО: Обновляем список доступных Slave устройств
@@ -586,8 +652,20 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
             if hasattr(self, '_discovery_thread'):
                 self._discovery_thread.selected_master_serial = device.serial
             
+            # Сохраняем текущих Slave (кроме старого Master)
+            saved_slaves = []
+            if old_master_serial:
+                for slave in self.slave_devices:
+                    if slave.serial != old_master_serial:
+                        saved_slaves.append(slave)
+            
             # Удаляем Master из списка Slaves если он там есть
             self._remove_master_from_slaves(device.serial)
+            
+            # Восстанавливаем Slave устройства (кроме нового Master)
+            for slave in saved_slaves:
+                if slave.serial != device.serial:
+                    self._add_slave(slave)
             
             # Обновляем информацию
             info_text = f"Устройство: {device.nickname}\n"
@@ -604,6 +682,9 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
                     info_text += f"Полоса: {bandwidth/1e6:.0f} МГц\n"
             
             self.master_info.setPlainText(info_text)
+            
+            # Автоматически сохраняем обновленную конфигурацию
+            self._auto_save_config()
         else:
             self.master_device = None
             if hasattr(self, '_discovery_thread'):
@@ -631,11 +712,16 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
     
     def _remove_master_from_slaves(self, master_serial: str):
         """Удаляет Master из списка Slave устройств."""
+        print(f"DEBUG: Removing master {master_serial} from slaves list")
+        print(f"DEBUG: Before removal: {len(self.slave_devices)} slaves")
+        
         # Удаляем из slave_devices если есть
         self.slave_devices = [
             dev for dev in self.slave_devices 
             if dev.serial != master_serial
         ]
+        
+        print(f"DEBUG: After removal: {len(self.slave_devices)} slaves")
         
         # Обновляем таблицу Slaves
         self._update_slaves_table()
@@ -740,6 +826,49 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
                 device.position = (x, y, z)
             except (AttributeError, ValueError):
                 pass
+    
+    def _auto_save_config(self):
+        """Автоматически сохраняет конфигурацию при изменениях."""
+        if not self.master_device:
+            return
+        
+        try:
+            # Собираем данные из таблиц
+            self._gather_table_data()
+            
+            # Формируем конфигурацию
+            config = {
+                'master': {
+                    'driver': self.master_device.driver,
+                    'serial': self.master_device.serial,
+                    'nickname': self.master_device.nickname,
+                    'uri': self.master_device.uri,
+                    'pos': [0.0, 0.0, 0.0]
+                },
+                'slaves': [
+                    {
+                        'driver': device.driver,
+                        'serial': device.serial,
+                        'nickname': device.nickname,
+                        'uri': device.uri,
+                        'pos': list(device.position),
+                        'label': device.label
+                    }
+                    for device in self.slave_devices
+                ]
+            }
+            
+            print(f"DEBUG: Auto-saving config: {len(config.get('slaves', []))} slaves")
+            
+            # Сохраняем конфигурацию
+            self.devicesConfigured.emit(config)
+            save_sdr_settings(config)
+            self._save_to_file(config)
+            
+        except Exception as e:
+            print(f"DEBUG: Error auto-saving config: {e}")
+            import traceback
+            print(f"DEBUG: Traceback: {traceback.format_exc()}")
     
     def _save_configuration(self):
         """Сохраняет конфигурацию."""

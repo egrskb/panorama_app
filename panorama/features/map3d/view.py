@@ -139,9 +139,14 @@ class MapView(QtWidgets.QWidget):
         self.btn_stop = QtWidgets.QPushButton("Стоп")
         self.btn_stop.setEnabled(False)
         
+        # Кнопка центрирования карты
+        self.btn_center = QtWidgets.QPushButton("🎯 Центрировать карту (0,0)")
+        self.btn_center.clicked.connect(self._center_map)
+        
         control_layout.addWidget(self.lbl_status)
         control_layout.addWidget(self.btn_start)
         control_layout.addWidget(self.btn_stop)
+        control_layout.addWidget(self.btn_center)
         
         left_panel.addWidget(control_group)
         left_panel.addStretch()
@@ -409,20 +414,29 @@ class MapView(QtWidgets.QWidget):
 
     def _refresh_map(self):
         """Обновление карты."""
-        # SDR
+        print(f"DEBUG: _refresh_map called with sdr_positions: {self.sdr_positions}")
+        
+        # SDR - только Slave устройства (Master не на карте)
         sdr_points = []
         sdr_brushes = []
         
-        sdr_points.append({'pos': self.sdr_positions['master']})
-        sdr_brushes.append(pg.mkBrush(50, 100, 255, 200))
+        # Добавляем только Slave устройства
+        for name, pos in self.sdr_positions.items():
+            if name.startswith('slave'):
+                sdr_points.append({'pos': pos})
+                if name == 'slave1':
+                    sdr_brushes.append(pg.mkBrush(50, 255, 100, 200))  # Зеленый
+                elif name == 'slave2':
+                    sdr_brushes.append(pg.mkBrush(255, 50, 50, 200))   # Красный
+                else:
+                    sdr_brushes.append(pg.mkBrush(255, 150, 50, 200))  # Оранжевый
         
-        sdr_points.append({'pos': self.sdr_positions['slave1']})
-        sdr_brushes.append(pg.mkBrush(50, 255, 100, 200))
-        
-        sdr_points.append({'pos': self.sdr_positions['slave2']})
-        sdr_brushes.append(pg.mkBrush(255, 50, 50, 200))
-        
-        self.sdr_scatter.setData(sdr_points, brush=sdr_brushes)
+        if sdr_points:
+            self.sdr_scatter.setData(sdr_points, brush=sdr_brushes)
+            print(f"DEBUG: Added {len(sdr_points)} SDR points to map")
+        else:
+            print(f"DEBUG: No SDR points to add")
+            self.sdr_scatter.setData([], brush=[])
         
         # Подписи
         for label in self.sdr_labels:
@@ -430,13 +444,13 @@ class MapView(QtWidgets.QWidget):
         self.sdr_labels.clear()
         
         if self.chk_labels.isChecked():
-            for name, pos in [('Master', self.sdr_positions['master']),
-                              ('Slave1', self.sdr_positions['slave1']),
-                              ('Slave2', self.sdr_positions['slave2'])]:
-                label = pg.TextItem(name, anchor=(0.5, -0.5))
-                label.setPos(pos[0], pos[1])
-                self.map_plot.addItem(label)
-                self.sdr_labels.append(label)
+            for name, pos in self.sdr_positions.items():
+                if name.startswith('slave'):
+                    label = pg.TextItem(name.upper(), anchor=(0.5, -0.5))
+                    label.setPos(pos[0], pos[1])
+                    self.map_plot.addItem(label)
+                    self.sdr_labels.append(label)
+                    print(f"DEBUG: Added label {name} at position {pos}")
         
         # Цели
         if self.targets:
@@ -582,24 +596,31 @@ class MapView(QtWidgets.QWidget):
     def update_stations_from_config(self, sdr_settings: dict):
         """Обновляет позиции станций из конфигурации SDR."""
         try:
+            print(f"DEBUG: update_stations_from_config called with: {sdr_settings}")
+            
             # Очищаем старые позиции
             self.sdr_positions.clear()
+            print(f"DEBUG: Cleared old positions")
             
             # Проверяем что есть реальные устройства
             has_real_devices = False
             
-            # Master
-            master_config = sdr_settings.get('master', {})
-            master_serial = master_config.get('serial', '')
+            # Master НЕ добавляем на карту - он только для спектра!
+            # master_config = sdr_settings.get('master', {})
+            # master_serial = master_config.get('serial', '')
+            # 
+            # # Проверяем что серийный номер валидный (не пустой и достаточной длины)
+            # if master_serial and len(master_serial) >= 16:
+            #     self.sdr_positions['master'] = (0.0, 0.0)
+            #     self.master_device = master_config
+            #     has_real_devices = True
             
-            # Проверяем что серийный номер валидный (не пустой и достаточной длины)
-            if master_serial and len(master_serial) >= 16:
-                self.sdr_positions['master'] = (0.0, 0.0)
-                self.master_device = master_config
-                has_real_devices = True
+            # Slaves - только они участвуют в трилатерации
+            slaves = sdr_settings.get('slaves', [])
+            print(f"DEBUG: Found {len(slaves)} slaves in config")
             
-            # Slaves
-            for i, slave_config in enumerate(sdr_settings.get('slaves', []), start=1):
+            for i, slave_config in enumerate(slaves, start=1):
+                print(f"DEBUG: Processing slave {i}: {slave_config}")
                 slave_serial = slave_config.get('serial', '')
                 slave_uri = slave_config.get('uri', '')
                 
@@ -607,6 +628,7 @@ class MapView(QtWidgets.QWidget):
                 if (slave_serial and len(slave_serial) >= 4) or slave_uri:
                     pos = slave_config.get('pos', [0.0, 0.0, 0.0])
                     x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+                    print(f"DEBUG: Adding slave{i} at position ({x}, {y}, {z})")
                     
                     self.sdr_positions[f'slave{i}'] = (x, y)
                     
@@ -616,32 +638,44 @@ class MapView(QtWidgets.QWidget):
                         self.slave2_device = slave_config
                     
                     has_real_devices = True
+                else:
+                    print(f"DEBUG: Skipping slave {i} - invalid serial/uri: serial='{slave_serial}', uri='{slave_uri}'")
             
-            # Обновляем только если есть реальные устройства
+            print(f"DEBUG: Final sdr_positions: {self.sdr_positions}")
+            print(f"DEBUG: has_real_devices: {has_real_devices}")
+            
+            # Обновляем только если есть Slave устройства
             if has_real_devices:
+                print(f"DEBUG: Updating device info and refreshing map")
                 self._update_device_info()
                 self._refresh_map()
             else:
-                # Очищаем карту если нет устройств
+                # Очищаем карту если нет Slave устройств
+                print(f"DEBUG: No slave devices, clearing map")
                 self.sdr_positions.clear()
-                self.device_info.setPlainText("Устройства не настроены\n\nИсточник → Настройка SDR")
+                self.device_info.setPlainText("Slave устройства не настроены\n\nИсточник → Настройка SDR")
                 self.position_info.setPlainText("Позиции не заданы")
                 self._refresh_map()
             
         except Exception as e:
             print(f"Error updating stations from config: {e}")
+            import traceback
+            print(f"Traceback: {traceback.format_exc()}")
 
     def _update_device_info(self):
         """Обновляет информацию об устройствах в UI."""
         try:
             # Информация об устройствах
             device_text = ""
-            if self.master_device:
-                device_text += f"Master: {self.master_device.get('nickname', 'N/A')}\n"
-                device_text += f"Serial: {self.master_device.get('serial', 'N/A')}\n"
-                device_text += f"URI: {self.master_device.get('uri', 'N/A')}\n\n"
-            else:
-                device_text += "Master: не настроен\n\n"
+            # Master НЕ показываем на карте - он только для спектра!
+            # if self.master_device:
+            #     device_text += f"Master: {self.master_device.get('nickname', 'N/A')}\n"
+            #     device_text += f"Serial: {self.master_device.get('serial', 'N/A')}\n"
+            #     device_text += f"URI: {self.master_device.get('uri', 'N/A')}\n\n"
+            # else:
+            #     device_text += "Master: не настроен\n\n"
+            
+            device_text += "Master: используется для спектра (не на карте)\n\n"
             
             # Добавляем информацию о Slave устройствах
             slave_count = 0
@@ -665,9 +699,10 @@ class MapView(QtWidgets.QWidget):
             
             # Информация о позициях
             position_text = ""
-            if 'master' in self.sdr_positions:
-                x, y = self.sdr_positions['master']
-                position_text += f"Master: ({x:.1f}, {y:.1f}) м\n"
+            # Master НЕ показываем позицию - он не на карте
+            # if 'master' in self.sdr_positions:
+            #     x, y = self.sdr_positions['master']
+            #     position_text += f"Master: ({x:.1f}, {y:.1f}) м\n"
             
             for i in range(1, 3):
                 slave_key = f'slave{i}'
@@ -693,3 +728,13 @@ class MapView(QtWidgets.QWidget):
             print(f"Error updating device info: {e}")
             self.device_info.setPlainText("Ошибка обновления информации")
             self.position_info.setPlainText("Ошибка обновления позиций")
+
+    def _center_map(self):
+        """Центрирует карту на координату (0,0)."""
+        self.map_plot.setXRange(-50, 50)
+        self.map_plot.setYRange(-50, 50)
+        self.map_plot.setAspectLocked(True)
+        self.map_plot.setLabel('left', 'Y (м)')
+        self.map_plot.setLabel('bottom', 'X (м)')
+        self.map_plot.showGrid(x=True, y=True, alpha=0.3)
+        self._refresh_map()

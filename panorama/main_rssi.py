@@ -55,6 +55,12 @@ class RSSIPanoramaMainWindow(QMainWindow):
         # Загрузка калибровки
         self._load_calibration()
         
+        # Проверяем наличие конфигурации Master (БЕЗ инициализации SDR)
+        self.master_ready = self._check_and_init_master()
+        
+        # Обновляем состояние кнопок в зависимости от наличия конфигурации Master
+        self._update_ui_for_master_status()
+        
         # Статус системы
         self.system_status = {
             'master_running': False,
@@ -120,6 +126,82 @@ class RSSIPanoramaMainWindow(QMainWindow):
             self.log.error(f"Error initializing components: {e}")
             QMessageBox.critical(self, "Ошибка инициализации", 
                                f"Не удалось инициализировать компоненты: {e}")
+    
+    def _check_and_init_master(self):
+        """Проверяет наличие конфигурации Master устройства при старте (БЕЗ инициализации SDR)."""
+        try:
+            if not self.sdr_settings or 'master' not in self.sdr_settings:
+                self.log.warning("No SDR settings found - Master device not configured")
+                return False
+            
+            master_config = self.sdr_settings['master']
+            if not master_config or 'serial' not in master_config:
+                self.log.warning("Invalid master configuration - no serial number")
+                return False
+            
+            master_serial = master_config['serial']
+            if not master_serial or len(master_serial) < 16:
+                self.log.warning(f"Invalid master serial: {master_serial}")
+                return False
+            
+            self.log.info(f"Found master configuration: {master_serial}")
+            self.log.info("Master device configured but NOT initialized (will be initialized when needed)")
+            return True
+            
+        except Exception as e:
+            self.log.error(f"Error checking master configuration: {e}")
+            return False
+    
+    def _update_ui_for_master_status(self):
+        """Обновляет состояние UI в зависимости от наличия конфигурации Master устройства."""
+        try:
+            if hasattr(self, 'start_orch_btn'):
+                if self.master_ready:
+                    self.start_orch_btn.setEnabled(True)
+                    self.start_orch_btn.setToolTip("Master устройство настроено. Можно запускать спектр.")
+                    self.start_orch_btn.setStyleSheet("""
+                        QPushButton {
+                            background-color: #4CAF50;
+                            color: white;
+                            font-weight: bold;
+                            padding: 8px 15px;
+                        }
+                        QPushButton:hover {
+                            background-color: #45a049;
+                        }
+                    """)
+                else:
+                    self.start_orch_btn.setEnabled(False)
+                    self.start_orch_btn.setToolTip("Master устройство не настроено. Перейдите в Настройки → Диспетчер устройств")
+                    self.start_orch_btn.setStyleSheet("""
+                        QPushButton {
+                            background-color: #f44336;
+                            color: white;
+                            font-weight: bold;
+                            padding: 8px 15px;
+                        }
+                    """)
+            
+            if hasattr(self, 'toolbar_orch_action'):
+                if self.master_ready:
+                    self.toolbar_orch_action.setEnabled(True)
+                    self.toolbar_orch_action.setToolTip("Master устройство настроено. Можно запускать спектр.")
+                else:
+                    self.toolbar_orch_action.setEnabled(False)
+                    self.toolbar_orch_action.setToolTip("Master устройство не настроено")
+            
+            # Показываем сообщение о статусе Master
+            if not self.master_ready:
+                QMessageBox.information(self, "Настройка Master устройства", 
+                    "Master устройство не настроено.\n\n"
+                    "Для работы спектра необходимо:\n"
+                    "1. Перейти в Настройки → Диспетчер устройств\n"
+                    "2. Выбрать HackRF устройство как Master\n"
+                    "3. Сохранить конфигурацию\n\n"
+                    "После настройки перезапустите приложение.")
+            
+        except Exception as e:
+            self.log.error(f"Error updating UI for master status: {e}")
     
     def _setup_trilateration(self):
         """Настраивает движок трилатерации."""
@@ -652,6 +734,13 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def _start_orchestrator(self):
         """Запускает оркестратор."""
         try:
+            # Проверяем наличие конфигурации Master устройства
+            if not self.master_ready:
+                QMessageBox.warning(self, "Master устройство не настроено", 
+                    "Для запуска спектра необходимо настроить Master устройство.\n\n"
+                    "Перейдите в Настройки → Диспетчер устройств")
+                return
+            
             # Инициализируем SDR если нужно
             if self.master_controller and not self.master_controller.is_sdr_initialized():
                 self.log.info("Initializing SDR for orchestrator...")

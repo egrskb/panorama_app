@@ -182,6 +182,11 @@ class MasterSweepController(QObject):
         self.peak_detection_timer.timeout.connect(self._update_peak_detection)
         self.peak_detection_timer.start(500)  # Каждые 500 мс
         
+        # Таймер для опроса данных от C библиотеки (альтернатива callback)
+        self.data_polling_timer = QTimer()
+        self.data_polling_timer.timeout.connect(self._poll_data_from_c_library)
+        self.data_polling_timer.start(50)  # Каждые 50 мс для быстрого отклика
+        
         # Буфер для watchlist
         self.watchlist: Dict[str, DetectedPeak] = {}
         
@@ -204,8 +209,11 @@ class MasterSweepController(QObject):
             self.sweep_source = HackRFMaster()
             self._sdr_initialized = True
             
-            # Настраиваем callbacks
-            self._setup_callbacks()
+            # Проверяем data reader
+            if self.sweep_source.data_reader:
+                self.log.info("Data reader is available for polling data")
+            else:
+                self.log.warning("Data reader is not available")
             
             self.log.info("HackRF Master C library initialized successfully")
             return True
@@ -245,23 +253,15 @@ class MasterSweepController(QObject):
         return self._sdr_initialized
     
     def _setup_callbacks(self):
-        """Настраивает callback функции для C библиотеки."""
-        if not self._sdr_initialized or not self.sweep_source:
-            self.log.error("Cannot setup callbacks - SDR not initialized")
-            return
-            
-        try:
-            self.log.info("Setting up callbacks for sweep data...")
-            
-            # CFFI вызывает эти лямбды из своего потока; эмитим внутренние сигналы (queued connections)
-            self.sweep_source.set_sweep_callback(lambda data: self._sweep_data_received.emit(data))
-            self.sweep_source.set_peak_callback(lambda data: self._peak_data_received.emit(data))
-            self.sweep_source.set_error_callback(lambda msg: self.sweep_error.emit(msg))
-
-            self.log.info("Callbacks configured successfully")
-
-        except Exception as e:
-            self.log.error(f"Failed to setup callbacks: {e}")
+        """Настраивает callback функции для C библиотеки (больше не используется)."""
+        self.log.info("Callbacks are no longer used - using data reader polling instead")
+        self.log.info("Data will be retrieved via data_reader.get_last_sweep_tile() every 50ms")
+        
+        # Проверяем что data reader доступен
+        if self.sweep_source and self.sweep_source.data_reader:
+            self.log.info("Data reader is available and ready for polling")
+        else:
+            self.log.warning("Data reader is not available - data polling may not work")
     
     def start_sweep(self, start_hz: float = None, stop_hz: float = None, 
                     bin_hz: float = None, dwell_ms: float = None):
@@ -272,13 +272,17 @@ class MasterSweepController(QObject):
             self.sweep_error.emit(error_msg)
             return
         
-        # Инициализируем SDR если нужно
+        # Принудительно инициализируем SDR
+        self.log.info(f"Starting sweep - SDR initialized: {self._sdr_initialized}")
         if not self._sdr_initialized:
+            self.log.info("SDR not initialized, initializing now...")
             if not self.initialize_sdr():
                 error_msg = "Failed to initialize SDR"
                 self.log.error(error_msg)
                 self.sweep_error.emit(error_msg)
                 return
+            else:
+                self.log.info("SDR initialized successfully")
         
         # Проверяем не запущен ли уже sweep
         if self.is_running:
@@ -296,7 +300,19 @@ class MasterSweepController(QObject):
         if dwell_ms is not None:
             self.dwell_ms = dwell_ms
             
+        self.log.info(f"Sweep parameters: {self.start_hz/1e6:.1f}-{self.stop_hz/1e6:.1f} MHz, "
+                     f"bin: {self.bin_hz/1e3:.0f} kHz, dwell: {self.dwell_ms} ms")
+        
         try:
+            # Проверяем sweep_source
+            if not self.sweep_source:
+                error_msg = "Sweep source not available"
+                self.log.error(error_msg)
+                self.sweep_error.emit(error_msg)
+                return
+            
+            self.log.info(f"Starting sweep via sweep_source: {self.sweep_source}")
+            
             # Запускаем sweep через C библиотеку
             self.sweep_source.start_sweep(
                 start_hz=self.start_hz,
@@ -315,6 +331,8 @@ class MasterSweepController(QObject):
             
         except Exception as e:
             self.log.error(f"Failed to start sweep: {e}")
+            import traceback
+            self.log.error(f"Traceback: {traceback.format_exc()}")
             self.sweep_error.emit(str(e))
     
     def stop_sweep(self):
@@ -380,10 +398,9 @@ class MasterSweepController(QObject):
             # Передаем плитку детектору
             self.peak_detector.add_sweep_tile(tile)
             
-            # Эмитим сигнал
-            self.log.info(f"Emitting sweep_tile_received signal to {self.sweep_tile_received.receivers()} receivers")
+            # Эмитим сигнал (без проверки receivers)
+            self.log.info(f"Emitting sweep_tile_received signal")
             self.sweep_tile_received.emit(tile)
-            
             self.log.info(f"Sweep tile emitted to GUI: {tile.f_start/1e6:.1f} MHz")
             
         except Exception as e:
@@ -392,9 +409,25 @@ class MasterSweepController(QObject):
             self.log.error(f"Traceback: {traceback.format_exc()}")
     
     def _on_peak_received(self, peak_data: Dict):
-        """Обрабатывает обнаруженный пик от C библиотеки."""
+        """Обрабатывает peak данные от C библиотеки."""
         try:
-            # Создаем объект пика
+            # Детальное логирование для отладки
+            self.log.info(f"Raw peak data received: {peak_data}")
+            self.log.info(f"Peak data type: {type(peak_data)}")
+            self.log.info(f"Peak data keys: {list(peak_data.keys()) if isinstance(peak_data, dict) else 'Not a dict'}")
+            
+            # Проверяем структуру данных
+            if not isinstance(peak_data, dict):
+                self.log.error(f"Invalid peak data type: {type(peak_data)}, expected dict")
+                return
+                
+            required_keys = ['f_peak', 'snr_db', 'bin_hz', 't0', 'status']
+            missing_keys = [key for key in required_keys if key not in peak_data]
+            if missing_keys:
+                self.log.error(f"Missing required keys in peak data: {missing_keys}")
+                return
+            
+            # Создаем DetectedPeak
             peak = DetectedPeak(
                 id=f"peak_{peak_data['f_peak']:.0f}",
                 f_peak=peak_data['f_peak'],
@@ -406,16 +439,15 @@ class MasterSweepController(QObject):
                 status="ACTIVE"
             )
             
-            # Добавляем в watchlist
-            self.watchlist[peak.id] = peak
-            
-            # Эмитим сигнал
+            # Эмитим сигнал (без проверки receivers)
+            self.log.info(f"Emitting peak_detected signal")
             self.peak_detected.emit(peak)
-            
-            self.log.info(f"Peak detected by C library: {peak.f_peak/1e6:.1f} MHz, SNR: {peak.snr_db:.1f} dB")
+            self.log.info(f"Peak detected and emitted to GUI: {peak.f_peak/1e6:.1f} MHz")
             
         except Exception as e:
-            self.log.error(f"Error processing detected peak: {e}")
+            self.log.error(f"Error processing peak data: {e}")
+            import traceback
+            self.log.error(f"Traceback: {traceback.format_exc()}")
     
     def _on_sweep_error(self, error_msg: str):
         """Обрабатывает ошибку от C библиотеки."""
@@ -607,3 +639,32 @@ class MasterSweepController(QObject):
         except Exception as e:
             self.log.error(f"Failed to scan devices: {e}")
             return []
+
+    def _poll_data_from_c_library(self):
+        """Опрашивает C библиотеку на наличие новых данных (альтернатива callback)."""
+        if not self._sdr_initialized or not self.sweep_source or not self.sweep_source.data_reader:
+            return
+            
+        try:
+            # Получаем sweep данные
+            sweep_tile = self.sweep_source.data_reader.get_last_sweep_tile()
+            if sweep_tile:
+                self.log.info(f"Got sweep tile from data reader: {sweep_tile['f_start']/1e6:.1f} MHz")
+                self._sweep_data_received.emit(sweep_tile)
+            
+            # Получаем peak данные
+            peak_data = self.sweep_source.data_reader.get_last_peak()
+            if peak_data:
+                self.log.info(f"Got peak from data reader: {peak_data['f_peak']/1e6:.1f} MHz")
+                self._peak_data_received.emit(peak_data)
+            
+            # Получаем error сообщения
+            error_message = self.sweep_source.data_reader.get_last_error_message()
+            if error_message:
+                self.log.info(f"Got error from data reader: {error_message}")
+                self.sweep_error.emit(error_message)
+                
+        except Exception as e:
+            self.log.error(f"Error polling data from C library: {e}")
+            import traceback
+            self.log.error(f"Traceback: {traceback.format_exc()}")

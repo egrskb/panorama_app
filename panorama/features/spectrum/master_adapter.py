@@ -31,6 +31,15 @@ class MasterSourceAdapter(SourceBackend):
         
         try:
             print(f"[MasterSourceAdapter] Starting sweep: {config.freq_start_hz/1e6:.1f}-{config.freq_end_hz/1e6:.1f} MHz, bin={config.bin_hz/1e3:.0f} kHz")
+            print(f"[MasterSourceAdapter] Master controller: {self._master}")
+            print(f"[MasterSourceAdapter] Master controller type: {type(self._master)}")
+            print(f"[MasterSourceAdapter] Master controller methods: {[m for m in dir(self._master) if not m.startswith('_')]}")
+            
+            # Проверяем состояние Master контроллера
+            if hasattr(self._master, 'is_running'):
+                print(f"[MasterSourceAdapter] Master is_running: {self._master.is_running}")
+            if hasattr(self._master, '_sdr_initialized'):
+                print(f"[MasterSourceAdapter] Master _sdr_initialized: {self._master._sdr_initialized}")
             
             self._master.start_sweep(
                 start_hz=config.freq_start_hz,
@@ -45,6 +54,8 @@ class MasterSourceAdapter(SourceBackend):
             
         except Exception as e:
             print(f"[MasterSourceAdapter] Error starting sweep: {e}")
+            import traceback
+            print(f"[MasterSourceAdapter] Traceback: {traceback.format_exc()}")
             self.error.emit(str(e))
 
     def stop(self):
@@ -66,10 +77,12 @@ class MasterSourceAdapter(SourceBackend):
         try:
             print(f"[MasterSourceAdapter] Received tile: type={type(tile)}")
             print(f"[MasterSourceAdapter] Tile attributes: {dir(tile)}")
+            print(f"[MasterSourceAdapter] Tile content: {tile}")
             
             # Проверяем что это SweepTile
             if not hasattr(tile, 'f_start') or not hasattr(tile, 'power'):
                 print(f"[MasterSourceAdapter] Invalid tile object: missing required attributes")
+                print(f"[MasterSourceAdapter] Available attributes: {[attr for attr in dir(tile) if not attr.startswith('_')]}")
                 return
                 
             print(f"[MasterSourceAdapter] Tile data: f_start={tile.f_start/1e6:.1f} MHz, "
@@ -97,6 +110,9 @@ class MasterSourceAdapter(SourceBackend):
             
             self._last_freq = f_start
             
+            print(f"[MasterSourceAdapter] Added tile to accumulator: {len(self._sweep_accumulator)} points, "
+                  f"range: {min(self._sweep_accumulator.keys())/1e6:.1f}-{max(self._sweep_accumulator.keys())/1e6:.1f} MHz")
+            
             # Проверяем покрытие
             if self._check_coverage():
                 print(f"[MasterSourceAdapter] Coverage complete, emitting accumulated sweep")
@@ -112,18 +128,26 @@ class MasterSourceAdapter(SourceBackend):
     def _check_coverage(self):
         """Проверяет, покрыт ли весь ожидаемый диапазон."""
         if not self._expected_range or not self._sweep_accumulator:
+            print(f"[MasterSourceAdapter] Coverage check failed: expected_range={self._expected_range}, "
+                  f"accumulator_size={len(self._sweep_accumulator)}")
             return False
         
         freqs = sorted(self._sweep_accumulator.keys())
         if not freqs:
+            print(f"[MasterSourceAdapter] Coverage check failed: no frequencies in accumulator")
             return False
             
         coverage = (freqs[-1] - freqs[0]) / (self._expected_range[1] - self._expected_range[0])
+        print(f"[MasterSourceAdapter] Coverage check: {coverage:.2%} "
+              f"({freqs[0]/1e6:.1f}-{freqs[-1]/1e6:.1f} MHz of "
+              f"{self._expected_range[0]/1e6:.1f}-{self._expected_range[1]/1e6:.1f} MHz)")
+        
         return coverage >= 0.95
 
     def _emit_accumulated_sweep(self):
         """Эмитит накопленный полный sweep."""
         if not self._sweep_accumulator:
+            print(f"[MasterSourceAdapter] Cannot emit sweep: accumulator is empty")
             return
             
         freqs = sorted(self._sweep_accumulator.keys())
@@ -134,8 +158,16 @@ class MasterSourceAdapter(SourceBackend):
         
         print(f"[MasterAdapter] Emitting full sweep: {len(freqs)} points, "
               f"range {freqs[0]/1e6:.1f}-{freqs[-1]/1e6:.1f} MHz")
+        print(f"[MasterAdapter] Frequency array shape: {freqs_array.shape}, dtype: {freqs_array.dtype}")
+        print(f"[MasterAdapter] Power array shape: {powers_array.shape}, dtype: {powers_array.dtype}")
+        print(f"[MasterAdapter] Power range: [{min(powers):.1f}, {max(powers):.1f}] dBm")
+        
+        # Проверяем подключенные приемники
+        receivers_count = self.fullSweepReady.receivers()
+        print(f"[MasterAdapter] fullSweepReady signal has {receivers_count} receivers")
         
         self.fullSweepReady.emit(freqs_array, powers_array)
+        print(f"[MasterAdapter] Sweep data emitted successfully")
 
     @QtCore.pyqtSlot(str)
     def _on_error(self, msg: str):

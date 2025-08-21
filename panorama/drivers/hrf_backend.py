@@ -17,6 +17,94 @@ try:
 except Exception:
     C_LIB_AVAILABLE = False
 
+class HackRFMasterDataReader:
+    """Класс для получения данных от HackRF Master без использования callback."""
+    
+    def __init__(self, hackrf_master: "HackRFMaster"):
+        self.hackrf_master = hackrf_master
+        self.last_sweep_tile = None
+        self.last_peak = None
+        self.last_error_message = None
+        
+    def get_last_sweep_tile(self):
+        """Получает последний sweep tile от C библиотеки."""
+        try:
+            # Создаем структуру для получения данных
+            tile = self.hackrf_master.ffi.new("sweep_tile_t*")
+            
+            # Вызываем C функцию
+            result = self.hackrf_master.lib.hackrf_master_get_last_sweep_tile(tile)
+            
+            if result == 0:
+                # Данные получены успешно
+                tile_data = {
+                    'f_start': float(tile.f_start),
+                    'bin_hz': float(tile.bin_hz),
+                    'count': int(tile.count),
+                    'power': [float(tile.power[i]) for i in range(tile.count)] if tile.power else [],
+                    't0': float(tile.t0)
+                }
+                self.last_sweep_tile = tile_data
+                return tile_data
+            else:
+                # Нет новых данных
+                return None
+                
+        except Exception as e:
+            print(f"DEBUG: Error getting sweep tile: {e}")
+            return None
+    
+    def get_last_peak(self):
+        """Получает последний обнаруженный пик от C библиотеки."""
+        try:
+            # Создаем структуру для получения данных
+            peak = self.hackrf_master.ffi.new("detected_peak_t*")
+            
+            # Вызываем C функцию
+            result = self.hackrf_master.lib.hackrf_master_get_last_peak(peak)
+            
+            if result == 0:
+                # Данные получены успешно
+                peak_data = {
+                    'f_peak': float(peak.f_peak),
+                    'snr_db': float(peak.snr_db),
+                    'bin_hz': float(peak.bin_hz),
+                    't0': float(peak.t0),
+                    'status': int(peak.status)
+                }
+                self.last_peak = peak_data
+                return peak_data
+            else:
+                # Нет новых данных
+                return None
+                
+        except Exception as e:
+            print(f"DEBUG: Error getting peak: {e}")
+            return None
+    
+    def get_last_error_message(self):
+        """Получает последнее сообщение об ошибке от C библиотеки."""
+        try:
+            # Создаем буфер для сообщения
+            message_buffer = self.hackrf_master.ffi.new("char[]", 256)
+            
+            # Вызываем C функцию
+            result = self.hackrf_master.lib.hackrf_master_get_last_error_message(message_buffer, 256)
+            
+            if result == 0:
+                # Данные получены успешно
+                message = self.hackrf_master.ffi.string(message_buffer).decode('utf-8')
+                self.last_error_message = message
+                return message
+            else:
+                # Нет новых данных
+                return None
+                
+        except Exception as e:
+            print(f"DEBUG: Error getting error message: {e}")
+            return None
+
+
 class HackRFMaster:
     """Wrapper for libhackrf_master.so via CFFI."""
     
@@ -73,6 +161,11 @@ class HackRFMaster:
             int hackrf_master_enumerate(void* out_list, int max_count);
             void hackrf_master_set_serial(const char* serial);
             int hackrf_master_probe(void);
+            
+            // Функции получения данных (вместо callback)
+            int hackrf_master_get_last_sweep_tile(sweep_tile_t* tile_out);
+            int hackrf_master_get_last_peak(detected_peak_t* peak_out);
+            int hackrf_master_get_last_error_message(char* message_out, int max_len);
         """, override=True)
         
         # Загружаем библиотеку
@@ -80,11 +173,14 @@ class HackRFMaster:
         lib_path = current_dir / "hackrf_master" / "build" / "libhackrf_master.so"
         self.lib = self.ffi.dlopen(str(lib_path))
         
-        # Callback функции
-        self._sweep_callback: Optional[Callable] = None
-        self._peak_callback: Optional[Callable] = None
-        self._error_callback: Optional[Callable] = None
+        # Callback функции (больше не используем)
+        # self._sweep_callback: Optional[Callable] = None
+        # self._peak_callback: Optional[Callable] = None
+        # self._error_callback: Optional[Callable] = None
         self._is_initialized = False
+        
+        # Data reader для получения данных без callback
+        self.data_reader = None
         
         # НЕ инициализируем SDR здесь - только загружаем библиотеку
         # self._is_initialized = False  # Уже установлено выше
@@ -100,6 +196,11 @@ class HackRFMaster:
                 raise RuntimeError(f"Failed to initialize HackRF Master, return code: {rc}")
             
             self._is_initialized = True
+            
+            # Инициализируем data reader
+            self.data_reader = HackRFMasterDataReader(self)
+            print("DEBUG: Data reader initialized successfully")
+            
             return True
         except Exception as e:
             raise RuntimeError(f"Failed to initialize HackRF Master: {e}")
@@ -142,9 +243,6 @@ class HackRFMaster:
         # Проверяем не запущен ли уже sweep
         if self.is_running():
             raise RuntimeError("Sweep already running. Stop it first.")
-        
-        if not self._sweep_callback:
-            self._setup_callbacks()
         
         # Создаем структуру конфигурации
         cfg = self.ffi.new("sweep_config_t*")
@@ -307,7 +405,7 @@ class HackRFMaster:
             
         @self.ffi.callback("void(const sweep_tile_t*)")
         def _sweep_cb(tile):
-            if self._sweep_callback:
+            if self.data_reader: # Use self.data_reader here
                 data = {
                     "f_start": tile.f_start,
                     "bin_hz": tile.bin_hz,
@@ -315,17 +413,17 @@ class HackRFMaster:
                     "power": [tile.power[i] for i in range(tile.count)],
                     "t0": tile.t0,
                 }
-                self._sweep_callback(data)
+                self.data_reader.last_sweep_tile = data # Update data reader
 
         @self.ffi.callback("void(const detected_peak_t*)")
         def _peak_cb(peak):
-            if self._peak_callback:
-                self._peak_callback({"f_peak": peak.f_peak, "snr_db": peak.snr_db, "bin_hz": peak.bin_hz, "t0": peak.t0, "status": peak.status})
+            if self.data_reader: # Use self.data_reader here
+                self.data_reader.last_peak = {"f_peak": peak.f_peak, "snr_db": peak.snr_db, "bin_hz": peak.bin_hz, "t0": peak.t0, "status": peak.status} # Update data reader
 
         @self.ffi.callback("void(const char*)")
         def _err_cb(msg):
-            if self._error_callback:
-                self._error_callback(self.ffi.string(msg).decode("utf-8"))
+            if self.data_reader: # Use self.data_reader here
+                self.data_reader.last_error_message = self.ffi.string(msg).decode("utf-8") # Update data reader
 
         self.lib.hackrf_master_set_sweep_callback(_sweep_cb)
         self.lib.hackrf_master_set_peak_callback(_peak_cb)
@@ -334,14 +432,53 @@ class HackRFMaster:
         self._peak_callback_handle = _peak_cb
         self._error_callback_handle = _err_cb
 
-    def set_sweep_callback(self, cb: Callable):
-        self._sweep_callback = cb
+    def set_sweep_callback(self, callback):
+        """Устанавливает callback для sweep данных."""
+        print(f"DEBUG: Python set_sweep_callback called with: {callback}")
+        print(f"DEBUG: Callback type: {type(callback)}")
+        print(f"DEBUG: Callback callable: {callable(callback)}")
+        
+        try:
+            # This method is no longer used for callbacks, but kept for compatibility
+            # The actual data reading is handled by the data_reader
+            print(f"DEBUG: set_sweep_callback: This method is deprecated. Use data_reader.get_last_sweep_tile() instead.")
+        except Exception as e:
+            print(f"DEBUG: Error setting sweep callback: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
     def set_peak_callback(self, cb: Callable):
-        self._peak_callback = cb
+        """Устанавливает callback для peak данных."""
+        print(f"DEBUG: Python set_peak_callback called with: {cb}")
+        print(f"DEBUG: Callback type: {type(cb)}")
+        print(f"DEBUG: Callback callable: {callable(cb)}")
+        
+        try:
+            # This method is no longer used for callbacks, but kept for compatibility
+            # The actual data reading is handled by the data_reader
+            print(f"DEBUG: set_peak_callback: This method is deprecated. Use data_reader.get_last_peak() instead.")
+        except Exception as e:
+            print(f"DEBUG: Error setting peak callback: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
     def set_error_callback(self, cb: Callable):
-        self._error_callback = cb
+        """Устанавливает callback для error сообщений."""
+        print(f"DEBUG: Python set_error_callback called with: {cb}")
+        print(f"DEBUG: Callback type: {type(cb)}")
+        print(f"DEBUG: Callback callable: {callable(cb)}")
+        
+        try:
+            # This method is no longer used for callbacks, but kept for compatibility
+            # The actual data reading is handled by the data_reader
+            print(f"DEBUG: set_error_callback: This method is deprecated. Use data_reader.get_last_error_message() instead.")
+        except Exception as e:
+            print(f"DEBUG: Error setting error callback: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
 
 __all__ = ["HackRFMaster"]

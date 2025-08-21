@@ -8,11 +8,16 @@ import os
 import logging
 from pathlib import Path
 
+# ОТКЛЮЧАЕМ AVAHI В SOAPYSDR ДО ВСЕХ ИМПОРТОВ
+# Это предотвращает ошибки "avahi_service_browser_new() failed: Bad state"
+os.environ['SOAPY_SDR_DISABLE_AVAHI'] = '1'
+
 # Добавляем корневую директорию в путь
 sys.path.insert(0, str(Path(__file__).parent))
 
 def setup_environment():
     """Настраивает окружение для запуска."""
+    
     # Проверяем наличие необходимых переменных окружения
     if 'PYTHONPATH' not in os.environ:
         os.environ['PYTHONPATH'] = str(Path(__file__).parent)

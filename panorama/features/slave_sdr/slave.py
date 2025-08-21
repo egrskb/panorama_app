@@ -3,6 +3,11 @@ Slave SDR controller for RSSI measurements and band power analysis.
 Supports various SDR devices through SoapySDR interface.
 """
 
+import os
+# ОТКЛЮЧАЕМ AVAHI В SOAPYSDR ДО ВСЕХ ИМПОРТОВ
+# Это предотвращает ошибки "avahi_service_browser_new() failed: Bad state"
+os.environ['SOAPY_SDR_DISABLE_AVAHI'] = '1'
+
 import time
 import logging
 import numpy as np
@@ -508,11 +513,36 @@ class SlaveManager(QObject):
         if not SOAPY_AVAILABLE:
             return devices
         try:
+            # Отключаем Avahi для предотвращения ошибок при поиске сетевых устройств
+            import os
+            old_env = os.environ.get('SOAPY_SDR_DISABLE_AVAHI')
+            os.environ['SOAPY_SDR_DISABLE_AVAHI'] = '1'
+            
             results = SoapySDR.Device.enumerate()
+            
+            # Восстанавливаем старое значение
+            if old_env is not None:
+                os.environ['SOAPY_SDR_DISABLE_AVAHI'] = old_env
+            else:
+                del os.environ['SOAPY_SDR_DISABLE_AVAHI']
+            
             for info in results:
                 drv = info.get('driver', '') if hasattr(info, 'get') else ''
                 ser = info.get('serial', '') if hasattr(info, 'get') else ''
                 label = info.get('label', '') if hasattr(info, 'get') else ''
+                
+                # Пропускаем пустые или некорректные устройства
+                if not drv or drv == '':
+                    continue
+                
+                # Пропускаем аудио устройства (не SDR)
+                if drv.lower() in ['audio', 'pulse', 'alsa', 'jack']:
+                    continue
+                
+                # НЕ пропускаем устройства без серийного номера - HackRF может не иметь серийника в некоторых случаях
+                # if not ser:
+                #     continue
+                
                 # Сформируем URI/args строку
                 parts = []
                 if drv:
@@ -520,13 +550,15 @@ class SlaveManager(QObject):
                 if ser:
                     parts.append(f"serial={ser}")
                 uri = ",".join(parts) if parts else drv
+                
                 devices.append({
                     'driver': drv,
                     'serial': ser,
                     'label': label,
                     'uri': uri or (f"driver={drv}" if drv else ''),
                 })
-        except Exception:
+        except Exception as e:
+            print(f"Error enumerating SoapySDR devices: {e}")
             return devices
         return devices
     
