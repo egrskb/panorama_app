@@ -1,6 +1,6 @@
 """
-Master sweep controller for real-time spectrum analysis and peak detection.
-Uses HackRFQSABackend (from example.c) for real HackRF sweep operations.
+Master sweep controller для управления полным сканированием спектра.
+Работает с переработанным HackRFQSABackend.
 """
 
 import time
@@ -9,9 +9,8 @@ import numpy as np
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 from PyQt5.QtCore import QObject, pyqtSignal, QTimer
-from pathlib import Path
 
-# Импортируем новый backend
+# Импортируем переработанный backend
 try:
     from panorama.drivers.hrf_backend import HackRFQSABackend
     C_LIB_AVAILABLE = True
@@ -22,20 +21,11 @@ except ImportError:
 
 
 @dataclass
-class SweepTile:
-    """Структура для передачи данных sweep плитки."""
-    f_start: float  # Начальная частота (Гц)
-    bin_hz: float   # Ширина бина (Гц)
-    count: int      # Количество бинов
-    power: List[float]  # Массив мощностей (дБм)
-    t0: float      # Временная метка
-
-
-@dataclass
 class DetectedPeak:
     """Обнаруженный пик сигнала."""
     id: str
     f_peak: float      # Центральная частота пика (Гц)
+    power_dbm: float   # Мощность пика
     snr_db: float      # SNR в дБ
     bin_hz: float      # Ширина бина
     t0: float          # Время обнаружения
@@ -44,45 +34,55 @@ class DetectedPeak:
     status: str        # Статус: ACTIVE, QUIET, EXPIRED
 
 
-class PeakDetector:
-    """Детектор пиков с подавлением боковых лепестков."""
+class SimplePeakDetector:
+    """Упрощенный детектор пиков для полного спектра."""
     
-    def __init__(self, min_snr_db: float = 10.0, min_peak_distance_bins: int = 2):
+    def __init__(self, min_snr_db: float = 15.0, min_peak_distance_mhz: float = 1.0):
         self.min_snr_db = min_snr_db
-        self.min_peak_distance_bins = min_peak_distance_bins
-        self.last_spectrum = None
+        self.min_peak_distance_hz = min_peak_distance_mhz * 1e6
         
-    def detect_peaks_in_spectrum(self, freqs_hz: np.ndarray, powers_dbm: np.ndarray) -> List[DetectedPeak]:
-        """Обнаруживает пики в спектре."""
+    def detect_peaks(self, freqs_hz: np.ndarray, powers_dbm: np.ndarray) -> List[DetectedPeak]:
+        """Обнаруживает пики в полном спектре."""
         peaks = []
         
-        if len(powers_dbm) < 3:
+        if len(powers_dbm) < 10:
             return peaks
         
-        # Сохраняем для последующего анализа
-        self.last_spectrum = (freqs_hz, powers_dbm)
+        # Оцениваем шумовой пол как медиану нижних 30% значений
+        sorted_powers = np.sort(powers_dbm)
+        noise_floor = np.median(sorted_powers[:len(sorted_powers)//3])
         
-        # Находим локальные максимумы
-        for i in range(1, len(powers_dbm) - 1):
-            if powers_dbm[i] > powers_dbm[i-1] and powers_dbm[i] > powers_dbm[i+1]:
-                # Оцениваем шум
-                noise_level = self._estimate_noise_level(powers_dbm, i)
-                snr_db = powers_dbm[i] - noise_level
+        # Находим локальные максимумы с использованием скользящего окна
+        window_size = 21  # Нечетное число для симметричного окна
+        half_window = window_size // 2
+        
+        for i in range(half_window, len(powers_dbm) - half_window):
+            # Проверяем, является ли точка локальным максимумом
+            window = powers_dbm[i-half_window:i+half_window+1]
+            if powers_dbm[i] == np.max(window):
+                # Вычисляем SNR
+                snr = powers_dbm[i] - noise_floor
                 
-                if snr_db >= self.min_snr_db:
+                if snr >= self.min_snr_db:
                     # Проверяем расстояние до других пиков
+                    freq = freqs_hz[i]
                     too_close = False
+                    
                     for peak in peaks:
-                        freq_diff = abs(freqs_hz[i] - peak.f_peak)
-                        if freq_diff < (freqs_hz[1] - freqs_hz[0]) * self.min_peak_distance_bins:
-                            too_close = True
+                        if abs(freq - peak.f_peak) < self.min_peak_distance_hz:
+                            # Если новый пик сильнее, заменяем старый
+                            if powers_dbm[i] > peak.power_dbm:
+                                peaks.remove(peak)
+                            else:
+                                too_close = True
                             break
                     
                     if not too_close:
                         peaks.append(DetectedPeak(
-                            id=f"peak_{freqs_hz[i]:.0f}",
-                            f_peak=freqs_hz[i],
-                            snr_db=snr_db,
+                            id=f"peak_{freq:.0f}",
+                            f_peak=freq,
+                            power_dbm=powers_dbm[i],
+                            snr_db=snr,
                             bin_hz=freqs_hz[1] - freqs_hz[0] if len(freqs_hz) > 1 else 200e3,
                             t0=time.time(),
                             last_seen=time.time(),
@@ -90,32 +90,20 @@ class PeakDetector:
                             status="ACTIVE"
                         ))
         
+        # Сортируем по мощности (сильные сигналы первыми)
+        peaks.sort(key=lambda p: p.power_dbm, reverse=True)
+        
         return peaks
-    
-    def _estimate_noise_level(self, powers: np.ndarray, peak_idx: int) -> float:
-        """Оценивает уровень шума вокруг пика."""
-        # Исключаем область пика
-        start_idx = max(0, peak_idx - 5)
-        end_idx = min(len(powers), peak_idx + 6)
-        
-        noise_powers = []
-        for i in range(len(powers)):
-            if i < start_idx or i >= end_idx:
-                noise_powers.append(powers[i])
-        
-        if noise_powers:
-            return np.median(noise_powers)
-        return np.mean(powers)
 
 
 class MasterSweepController(QObject):
-    """Контроллер Master sweep для управления HackRF и детекции пиков."""
+    """Контроллер Master sweep для полного сканирования спектра."""
     
     # Сигналы
-    sweep_tile_received = pyqtSignal(object)  # SweepTile
-    peak_detected = pyqtSignal(object)        # DetectedPeak
-    sweep_error = pyqtSignal(str)             # Ошибка sweep
     full_sweep_ready = pyqtSignal(object, object)  # (freqs_hz, power_dbm)
+    peak_detected = pyqtSignal(object)             # DetectedPeak
+    sweep_error = pyqtSignal(str)                  # Ошибка sweep
+    sweep_progress = pyqtSignal(float)             # Прогресс покрытия (0-100%)
     
     def __init__(self, logger: logging.Logger):
         super().__init__()
@@ -126,29 +114,33 @@ class MasterSweepController(QObject):
             self.log.error("HackRFQSABackend not available")
             self.sweep_source = None
         else:
-            self.sweep_source = None  # Будет создан при необходимости
+            self.sweep_source = None
             self.log.info("HackRFQSABackend available")
         
-        self.peak_detector = PeakDetector()
+        self.peak_detector = SimplePeakDetector()
         self.is_running = False
         self._sdr_initialized = False
         
-        # Параметры sweep
-        self.start_hz = 24e6      # 24 МГц
-        self.stop_hz = 6e9        # 6 ГГц
+        # Параметры sweep по умолчанию (полный диапазон)
+        self.start_hz = 50e6      # 50 МГц
+        self.stop_hz = 6000e6     # 6 ГГц  
         self.bin_hz = 200e3       # 200 кГц
-        self.dwell_ms = 100       # 100 мс
         
         # Таймер для обновления детекции пиков
         self.peak_detection_timer = QTimer()
-        self.peak_detection_timer.timeout.connect(self._update_peak_detection)
-        self.peak_detection_timer.start(1000)  # Каждую секунду
+        self.peak_detection_timer.timeout.connect(self._detect_peaks)
+        self.peak_detection_timer.setInterval(2000)  # Каждые 2 секунды
         
-        # Буфер для watchlist
+        # Хранилище для watchlist
         self.watchlist: Dict[str, DetectedPeak] = {}
         
-        # Для хранения последнего спектра
+        # Последний полный спектр
+        self.last_freqs = None
         self.last_spectrum = None
+        
+        # Статистика
+        self.sweep_count = 0
+        self.start_time = None
     
     def initialize_sdr(self):
         """Инициализирует SDR устройство."""
@@ -199,8 +191,8 @@ class MasterSweepController(QObject):
             self.log.error(f"Error deinitializing SDR: {e}")
     
     def start_sweep(self, start_hz: float = None, stop_hz: float = None, 
-                    bin_hz: float = None, dwell_ms: float = None):
-        """Запускает sweep с заданными параметрами."""
+                    bin_hz: float = None):
+        """Запускает полное сканирование спектра."""
         if not C_LIB_AVAILABLE:
             error_msg = "HackRFQSABackend not available"
             self.log.error(error_msg)
@@ -220,7 +212,7 @@ class MasterSweepController(QObject):
         if self.is_running:
             self.log.warning("Sweep already running. Stopping first...")
             self.stop_sweep()
-            time.sleep(0.1)
+            time.sleep(0.5)
         
         # Обновляем параметры
         if start_hz is not None:
@@ -229,10 +221,8 @@ class MasterSweepController(QObject):
             self.stop_hz = stop_hz
         if bin_hz is not None:
             self.bin_hz = bin_hz
-        if dwell_ms is not None:
-            self.dwell_ms = dwell_ms
             
-        self.log.info(f"Starting sweep: {self.start_hz/1e6:.1f}-{self.stop_hz/1e6:.1f} MHz, "
+        self.log.info(f"Starting full spectrum sweep: {self.start_hz/1e6:.1f}-{self.stop_hz/1e6:.1f} MHz, "
                      f"bin: {self.bin_hz/1e3:.0f} kHz")
         
         try:
@@ -247,9 +237,17 @@ class MasterSweepController(QObject):
                 amp_on=False
             )
             
+            # Сбрасываем статистику
+            self.sweep_count = 0
+            self.start_time = time.time()
+            self.watchlist.clear()
+            
             # Запускаем через backend
             self.sweep_source.start(config)
             self.is_running = True
+            
+            # Запускаем детектор пиков
+            self.peak_detection_timer.start()
             
             self.log.info("Master sweep started successfully")
             
@@ -265,6 +263,7 @@ class MasterSweepController(QObject):
             return
         
         try:
+            self.peak_detection_timer.stop()
             self.sweep_source.stop()
             self.is_running = False
             self.log.info("Master sweep stopped")
@@ -274,34 +273,83 @@ class MasterSweepController(QObject):
             self.is_running = False
     
     def _on_full_sweep(self, freqs_hz, power_dbm):
-        """Обрабатывает полный sweep от backend."""
+        """Обрабатывает полный спектр от backend."""
         try:
-            self.log.info(f"Received full sweep: {len(freqs_hz)} points, "
-                         f"range {freqs_hz[0]/1e6:.1f}-{freqs_hz[-1]/1e6:.1f} MHz")
+            self.sweep_count += 1
             
             # Сохраняем последний спектр
-            self.last_spectrum = (freqs_hz, power_dbm)
+            self.last_freqs = freqs_hz
+            self.last_spectrum = power_dbm
             
-            # Эмитим для GUI (только один раз!)
+            # Вычисляем покрытие (процент не-NaN значений)
+            valid_data = power_dbm[power_dbm > -119]  # Значения выше шумового пола
+            coverage = (len(valid_data) / len(power_dbm)) * 100 if len(power_dbm) > 0 else 0
+            
+            # Эмитим прогресс
+            self.sweep_progress.emit(coverage)
+            
+            # Логируем статистику
+            if self.sweep_count % 10 == 0:
+                elapsed = time.time() - self.start_time if self.start_time else 0
+                rate = self.sweep_count / elapsed if elapsed > 0 else 0
+                self.log.info(f"Sweep #{self.sweep_count}: coverage={coverage:.1f}%, "
+                             f"rate={rate:.1f} sweeps/s, "
+                             f"range={freqs_hz[0]/1e6:.1f}-{freqs_hz[-1]/1e6:.1f} MHz")
+            
+            # Эмитим полный спектр для GUI
             self.full_sweep_ready.emit(freqs_hz, power_dbm)
-            
-            # Детектируем пики
-            peaks = self.peak_detector.detect_peaks_in_spectrum(freqs_hz, power_dbm)
-            for peak in peaks:
-                # Обновляем watchlist
-                if peak.id not in self.watchlist:
-                    self.watchlist[peak.id] = peak
-                    self.peak_detected.emit(peak)
-                    self.log.info(f"New peak detected: {peak.f_peak/1e6:.1f} MHz, SNR: {peak.snr_db:.1f} dB")
-                else:
-                    # Обновляем существующий пик
-                    self.watchlist[peak.id].last_seen = time.time()
-                    self.watchlist[peak.id].snr_db = peak.snr_db
             
         except Exception as e:
             self.log.error(f"Error processing full sweep: {e}")
             import traceback
             self.log.error(f"Traceback: {traceback.format_exc()}")
+    
+    def _detect_peaks(self):
+        """Детектирует пики в последнем спектре."""
+        if not self.is_running or self.last_freqs is None or self.last_spectrum is None:
+            return
+        
+        try:
+            # Детектируем пики
+            peaks = self.peak_detector.detect_peaks(self.last_freqs, self.last_spectrum)
+            
+            current_time = time.time()
+            
+            # Обновляем watchlist
+            new_peaks = []
+            for peak in peaks[:20]:  # Ограничиваем топ-20 пиками
+                if peak.id not in self.watchlist:
+                    self.watchlist[peak.id] = peak
+                    new_peaks.append(peak)
+                    self.peak_detected.emit(peak)
+                else:
+                    # Обновляем существующий пик
+                    self.watchlist[peak.id].last_seen = current_time
+                    self.watchlist[peak.id].power_dbm = peak.power_dbm
+                    self.watchlist[peak.id].snr_db = peak.snr_db
+            
+            # Удаляем устаревшие пики (не видели более 30 секунд)
+            expired_peaks = []
+            for peak_id, peak in self.watchlist.items():
+                if current_time - peak.last_seen > 30.0:
+                    expired_peaks.append(peak_id)
+                    peak.status = "EXPIRED"
+                elif current_time - peak.last_seen > 10.0:
+                    peak.status = "QUIET"
+                else:
+                    peak.status = "ACTIVE"
+            
+            for peak_id in expired_peaks:
+                del self.watchlist[peak_id]
+            
+            # Логируем новые пики
+            if new_peaks:
+                self.log.info(f"Detected {len(new_peaks)} new peaks:")
+                for peak in new_peaks[:5]:  # Логируем топ-5
+                    self.log.info(f"  - {peak.f_peak/1e6:.1f} MHz: {peak.power_dbm:.1f} dBm (SNR: {peak.snr_db:.1f} dB)")
+                
+        except Exception as e:
+            self.log.error(f"Error in peak detection: {e}")
     
     def _on_error(self, msg):
         """Обрабатывает ошибку от backend."""
@@ -316,31 +364,7 @@ class MasterSweepController(QObject):
         """Обрабатывает сигнал завершения от backend."""
         self.log.info(f"Backend finished with code: {code}")
         self.is_running = False
-    
-    def _update_peak_detection(self):
-        """Обновляет детекцию пиков."""
-        if not self.is_running or not self.last_spectrum:
-            return
-            
-        try:
-            current_time = time.time()
-            
-            # Удаляем устаревшие пики (старше 30 секунд)
-            expired_peaks = []
-            for peak_id, peak in self.watchlist.items():
-                if current_time - peak.last_seen > 30.0:
-                    expired_peaks.append(peak_id)
-                    peak.status = "EXPIRED"
-                elif current_time - peak.last_seen > 5.0:
-                    peak.status = "QUIET"
-                else:
-                    peak.status = "ACTIVE"
-            
-            for peak_id in expired_peaks:
-                del self.watchlist[peak_id]
-                
-        except Exception as e:
-            self.log.error(f"Error in peak detection update: {e}")
+        self.peak_detection_timer.stop()
     
     def get_watchlist(self) -> List[DetectedPeak]:
         """Возвращает текущий watchlist."""
@@ -348,12 +372,16 @@ class MasterSweepController(QObject):
     
     def get_sweep_status(self) -> Dict:
         """Возвращает статус sweep."""
+        elapsed = time.time() - self.start_time if self.start_time else 0
+        rate = self.sweep_count / elapsed if elapsed > 0 else 0
+        
         return {
             'is_running': self.is_running,
             'start_hz': self.start_hz,
             'stop_hz': self.stop_hz,
             'bin_hz': self.bin_hz,
-            'dwell_ms': self.dwell_ms,
+            'sweep_count': self.sweep_count,
+            'sweep_rate': rate,
             'watchlist_count': len(self.watchlist),
             'active_peaks': len([p for p in self.watchlist.values() if p.status == "ACTIVE"]),
             'c_library_available': C_LIB_AVAILABLE

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-HackRF Master backend (CFFI) для панорамы RSSI.
+HackRF Master backend (CFFI) для панорамы RSSI - THROTTLED VERSION.
 
 - Экспортирует класс HackRFMaster (как и ожидает менеджер устройств).
 - Экспортирует enumerate_devices() на уровне модуля.
 - Внутри использует CFFI-обёртку к libhackrf_qsa.so и индексную склейку свипов
   через SweepAssembler (центры бинов, глобальная сетка).
+- THROTTLED: ограничивает частоту обновлений до 5 FPS максимум,
+  автоматически сбрасывает цикл каждые 2 секунды,
+  эмитит обновления только после накопления 100 сегментов.
 """
 
 from __future__ import annotations
@@ -74,18 +77,19 @@ def _load_lib():
 
 
 # ------------------------------------------------------------
-# ОСНОВНОЙ БЭКЕНД (QSA)
+# ОСНОВНОЙ БЭКЕНД (QSA) - THROTTLED VERSION
 # ------------------------------------------------------------
 
 class HackRFQSABackend(SourceBackend):
-    """Работа с HackRF через libhackrf_qsa.so, отдаёт полные свипы в GUI."""
+    """Работа с HackRF через libhackrf_qsa.so, отдаёт полные свипы в GUI с throttling."""
 
     def __init__(self, serial_suffix: Optional[str] = None, parent=None):
         super().__init__(parent)
         self._ffi, self._lib = _load_lib()
         self._serial = (serial_suffix or "").strip()
         self._worker: Optional[_Worker] = None
-        self._assembler = SweepAssembler()
+        # ПОРОГ ПОКРЫТИЯ — 0.95 (устойчиво к микрозазорам)
+        self._assembler = SweepAssembler(coverage_threshold=0.95, wrap_guard_hz=15e6)
 
     # ---------- управление ----------
     def start(self, config: SweepConfig):
@@ -98,15 +102,13 @@ class HackRFQSABackend(SourceBackend):
         self._worker = _Worker(self, self._ffi, self._lib, config, self._serial, self._assembler)
         self._worker.finished_sig.connect(self._on_finished)
         self._worker.start()
+
         self.started.emit()
 
     def stop(self):
         if not self.is_running():
             return
-        try:
-            self._lib.hq_stop()
-        except Exception:
-            pass
+
         if self._worker:
             self._worker.stop()
             self._worker.wait(2000)
@@ -124,38 +126,39 @@ class HackRFQSABackend(SourceBackend):
     # ---------- перечисление устройств ----------
     @staticmethod
     def enumerate_devices() -> List[str]:
+        """Возвращает список серийников HackRF."""
         try:
-            ffi, lib = _load_lib()
-            n = int(lib.hq_device_count())
-            out: List[str] = []
-            for i in range(n):
-                buf = ffi.new("char[128]")
-                rc = int(lib.hq_get_device_serial(i, buf, 127))
-                if rc == 0:
-                    s = ffi.string(buf).decode(errors="ignore").strip()
-                    # фильтруем мусор
-                    if s and s != "0000000000000000":
-                        out.append(s)
-            return out
-        except Exception as e:
-            print(f"[HackRF] enumerate_devices failed: {e}")
+            ffi = FFI()
+            ffi.cdef(r"""
+                int  hq_device_count(void);
+                int  hq_get_device_serial(int idx, char* out, int cap);
+            """)
+            try:
+                lib = ffi.dlopen("libhackrf_qsa.so")
+                n = lib.hq_device_count()
+                devices: List[str] = []
+                for i in range(int(n)):
+                    buf = ffi.new("char[128]")
+                    ok = lib.hq_get_device_serial(i, buf, 127)
+                    if int(ok) == 0:
+                        serial = ffi.string(buf).decode(errors="ignore")
+                        if serial and serial != "0000000000000000":
+                            devices.append(serial)
+                return devices
+            except Exception as e:
+                print(f"[HackRFQSA] enumerate_devices failed: {e}")
+                return []
+        except Exception:
             return []
 
 
 # ------------------------------------------------------------
-# СОВМЕСТИМОСТЬ С СТАРЫМ ИМЕНЕМ
-# ------------------------------------------------------------
-
-class HackRFMaster(HackRFQSABackend):
-    """Старое ожидаемое именование бэкенда — оставлено для совместимости."""
-    pass
-
-
-# ------------------------------------------------------------
-# ВНУТРЕННИЙ РАБОЧИЙ ПОТОК
+# ВНУТРЕННИЙ РАБОЧИЙ ПОТОК - THROTTLED VERSION
 # ------------------------------------------------------------
 
 class _Worker(QtCore.QThread):
+    """Рабочий поток: открывает/конфигурирует устройство и обрабатывает callback-и с throttling."""
+
     finished_sig = QtCore.pyqtSignal(int, str)
 
     def __init__(self, backend: HackRFQSABackend, ffi: FFI, lib, config: SweepConfig,
@@ -168,6 +171,14 @@ class _Worker(QtCore.QThread):
         self._serial = serial
         self._assembler = assembler
         self._stop_event = threading.Event()
+        
+        # THROTTLING: ограничиваем частоту обновлений
+        self._last_emit_time = 0.0
+        self._min_emit_interval = 0.2  # 5 FPS максимум
+        self._segment_counter = 0
+        self._max_segments_before_emit = 100  # эмитим только после 100 сегментов
+        self._last_reset_time = time.time()
+        self._reset_interval = 2.0  # сбрасываем цикл каждые 2 секунды
 
         @self._ffi.callback("void(const double*, const float*, int, double, uint64_t, uint64_t, void*)")
         def _cb(freqs_ptr, pwr_ptr, n_bins, fft_bin_width_hz, f_low_hz, f_high_hz, user):
@@ -182,20 +193,45 @@ class _Worker(QtCore.QThread):
                 if np.all(np.isnan(power)) or np.all(power == 0):
                     return
 
+                # Кладём сегмент по freq-координатам (надежнее при Fs/N != bin_hz)
                 row, coverage = self._assembler.feed({
                     "freqs_hz": freqs,
                     "data_dbm": power,
                     "hz_low": float(f_low_hz),
                 })
-                if row is not None:
+
+                # THROTTLING: увеличиваем счетчик сегментов
+                self._segment_counter += 1
+                current_time = time.time()
+
+                # Проверяем, нужно ли сбросить цикл
+                if current_time - self._last_reset_time > self._reset_interval:
+                    self._assembler.reset_pass()
+                    self._last_reset_time = current_time
+                    self._segment_counter = 0
+                    print(f"[HackRF] Auto-reset cycle after {self._reset_interval}s")
+
+                # Эмитим только при выполнении условий throttling
+                if (row is not None and 
+                    self._segment_counter >= self._max_segments_before_emit and
+                    current_time - self._last_emit_time >= self._min_emit_interval):
+                    
                     nb = self._assembler.nbins
                     f0 = self._assembler.f0
                     b  = self._assembler.bin_hz
                     full_freqs = (f0 + (np.arange(nb, dtype=np.float64) + 0.5) * b).astype(np.float64)
-                    full_power = row.astype(np.float32)
+                    full_power = row.astype(np.float32, copy=False)
+                    
                     self._backend.fullSweepReady.emit(full_freqs, full_power)
-                    # чуть притормозим, чтобы UI не задыхался
-                    time.sleep(0.003)
+                    
+                    # Сбрасываем счетчики после эмита
+                    self._last_emit_time = current_time
+                    self._segment_counter = 0
+                    
+                    print(f"[HackRF] Throttled sweep ready: N={len(full_freqs)}, "
+                          f"{full_freqs[0]/1e6:.3f}-{full_freqs[-1]/1e6:.3f} MHz, "
+                          f"coverage={coverage:.3f}, segments={self._segment_counter}")
+
             except Exception as e:
                 print(f"[HackRF] callback error: {e}")
 
@@ -250,37 +286,36 @@ class _Worker(QtCore.QThread):
 
             # --- КОНФИГУРАЦИЯ ---
             cfg = self._config
-            r = int(self._lib.hq_configure(
-                float(cfg.freq_start_hz) / 1e6,
-                float(cfg.freq_end_hz) / 1e6,
+            r = self._lib.hq_configure(
+                float(cfg.freq_start_hz / 1e6),
+                float(cfg.freq_end_hz / 1e6),
                 float(cfg.bin_hz),
                 int(cfg.lna_db),
                 int(cfg.vga_db),
-                int(1 if cfg.amp_on else 0),
-            ))
-            if r != 0:
-                last = self._lib.hq_last_error()
-                last_msg = self._ffi.string(last).decode(errors="ignore") if last != self._ffi.NULL else ""
-                msg = f"hq_configure failed ({r}); {last_msg}"
+                int(1 if cfg.amp_on else 0)
+            )
+            if int(r) != 0:
+                msg = f"hq_configure failed ({int(r)})"
                 self._lib.hq_close()
                 self.finished_sig.emit(2, msg)
                 return
 
-            # --- СТАРТ ---
-            r = int(self._lib.hq_start(self._cb, self._ffi.NULL))
-            if r != 0:
-                last = self._lib.hq_last_error()
-                last_msg = self._ffi.string(last).decode(errors="ignore") if last != self._ffi.NULL else ""
-                msg = f"hq_start failed ({r}); {last_msg}"
+            # --- ЗАПУСК SWEEP ---
+            r = self._lib.hq_start(self._cb, self._ffi.NULL)
+            if int(r) != 0:
+                msg = f"hq_start failed ({int(r)})"
                 self._lib.hq_close()
                 self.finished_sig.emit(3, msg)
                 return
 
-            # --- ЦИКЛ ---
-            while not self._stop_event.is_set():
-                time.sleep(0.05)
+            print(f"[HackRF] Started sweep: {cfg.freq_start_hz/1e6:.1f}-{cfg.freq_end_hz/1e6:.1f} MHz, "
+                  f"bin={cfg.bin_hz:.0f} Hz, throttled to 5 FPS max")
 
-            # --- СТОП ---
+            # --- РАБОЧИЙ ЦИКЛ ---
+            while not self._stop_event.is_set():
+                time.sleep(0.1)  # проверяем остановку каждые 100ms
+
+            # --- ОСТАНОВКА ---
             self._lib.hq_stop()
             self._lib.hq_close()
             self.finished_sig.emit(0, "")
@@ -288,10 +323,12 @@ class _Worker(QtCore.QThread):
         except Exception as e:
             try:
                 last = self._lib.hq_last_error()
-                last_msg = self._ffi.string(last).decode(errors="ignore") if last != self._ffi.NULL else ""
+                if last != self._ffi.NULL:
+                    msg = self._ffi.string(last).decode(errors="ignore")
+                else:
+                    msg = str(e)
             except Exception:
-                last_msg = ""
-            msg = last_msg or str(e)
+                msg = str(e)
             code = 4
             try:
                 self._lib.hq_stop()
@@ -305,9 +342,21 @@ class _Worker(QtCore.QThread):
 
 
 # ------------------------------------------------------------
-# МОДУЛЬНЫЙ API, КОТОРЫЙ ЖДЁТ МЕНЕДЖЕР УСТРОЙСТВ
+# СОВМЕСТИМОСТЬ
+# ------------------------------------------------------------
+
+class HackRFMaster(HackRFQSABackend):
+    """Старое ожидаемое именование бэкенда — оставлено для совместимости."""
+    pass
+
+
+# ------------------------------------------------------------
+# МОДУЛЬНЫЙ API
 # ------------------------------------------------------------
 
 def enumerate_devices() -> List[str]:
-    """Публичная функция, которую импортирует Device Manager."""
+    """
+    ВАЖНО: публичный API, который импортирует менеджер устройств.
+    Возвращает список серийников HackRF.
+    """
     return HackRFQSABackend.enumerate_devices()

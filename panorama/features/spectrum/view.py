@@ -45,9 +45,9 @@ class SpectrumView(QtWidgets.QWidget):
 
         # --- верхняя панель параметров ---
         self.start_mhz = QtWidgets.QDoubleSpinBox()
-        self._cfg_dsb(self.start_mhz, 50, 6000, 3, 2400.000, " МГц")
+        self._cfg_dsb(self.start_mhz, 24, 7000, 1, 50.0, " МГц")  # ИЗМЕНЕНО: начало 50 МГц
         self.stop_mhz = QtWidgets.QDoubleSpinBox()
-        self._cfg_dsb(self.stop_mhz, 50, 6000, 3, 2483.500, " МГц")
+        self._cfg_dsb(self.stop_mhz, 25, 7000, 1, 6000.0, " МГц")  # ИЗМЕНЕНО: конец 6000 МГц
         self.bin_khz = QtWidgets.QDoubleSpinBox()
         self._cfg_dsb(self.bin_khz, 1, 5000, 0, 200, " кГц")
         self.lna_db = QtWidgets.QSpinBox()
@@ -451,6 +451,7 @@ class SpectrumView(QtWidgets.QWidget):
 
     def _on_reset_view(self):
         self.plot.setYRange(-110.0, -20.0, padding=0)
+        self._water_view = None   # → следующая полная строка заново проинициализирует водопад
 
     # ---------- обработка ПОЛНОГО свипа (анти-мерцание) ----------
     def _on_full_sweep(self, freqs_hz: np.ndarray, power_dbm: np.ndarray):
@@ -463,19 +464,18 @@ class SpectrumView(QtWidgets.QWidget):
               f"power_range=[{power_dbm.min():.1f}, {power_dbm.max():.1f}] dBm")
         
         if freqs_hz is None or power_dbm is None:
-            print("[SpectrumView] None data received")
             return
         if freqs_hz.size == 0 or power_dbm.size == 0 or freqs_hz.size != power_dbm.size:
-            print(f"[SpectrumView] Invalid data: freqs={freqs_hz.size}, power={power_dbm.size}")
             return
 
-        # Нужно ли переинициализировать сетку и водопад
-        first_or_size_changed = (
+        # ВАЖНО: инициализируем не только при смене размера, но и если _water_view ещё нет.
+        first_or_need_init = (
             self._model.freqs_hz is None
             or self._model.freqs_hz.size != freqs_hz.size
+            or self._water_view is None
         )
 
-        if first_or_size_changed:
+        if first_or_need_init:
             print(f"[SpectrumView] Initializing display grid: freqs={freqs_hz.size}")
             # Полная сетка (храним для экспорта/курсора и т.д.)
             self._model.freqs_hz = freqs_hz.astype(np.float64, copy=True)
@@ -493,11 +493,10 @@ class SpectrumView(QtWidgets.QWidget):
             self.water_plot.setXRange(x0, x1, padding=0.0)
             self.water_plot.setYRange(0, self._model.rows, padding=0)
 
-            # --- СТАБИЛЬНЫЙ буфер водопада (даунсемплированный по колонкам) ---
+            # --- даунсемплирование колонок водопада под дисплей ---
+            x_mhz = self._model.freqs_hz.astype(np.float64) / 1e6
             self._wf_max_cols = 4096
-            self._wf_ds_factor = int(np.ceil(n / self._wf_max_cols))
-            if self._wf_ds_factor < 1:
-                self._wf_ds_factor = 1
+            self._wf_ds_factor = int(np.ceil(n / self._wf_max_cols)) or 1
             self._wf_cols_ds = int(np.ceil(n / self._wf_ds_factor))
 
             # X-ось для отображения (усредняем группы)
@@ -524,7 +523,7 @@ class SpectrumView(QtWidgets.QWidget):
             self._maxhold = None
             self._ema_last = None
 
-        # Храним полную строку и обновляем полноразмерный водопад (для экспорта/аналитики)
+        # Храним полную строку в модели (для экспорта/аналитики)
         self._model.append_row(power_dbm.astype(np.float32, copy=False))
 
         # FPS/счётчик
@@ -540,8 +539,8 @@ class SpectrumView(QtWidgets.QWidget):
         # Линии спектра
         self._refresh_spectrum()
 
-        # ---- Обновляем СТАБИЛЬНЫЙ буфер водопада (без смены LUT/rect) ----
-        if getattr(self, "_water_view", None) is not None:
+        # ---- Обновляем СТАБИЛЬНЫЙ буфер водопада ----
+        if self._water_view is not None:
             last_row = self._model.last_row
             row_ds = self._downsample_cols_fixed(last_row, self._wf_ds_factor, agg="max").astype(np.float32, copy=False)
             if row_ds.size != self._wf_cols_ds:
@@ -550,23 +549,23 @@ class SpectrumView(QtWidgets.QWidget):
                 else:
                     row_ds = np.pad(row_ds, (0, self._wf_cols_ds - row_ds.size), mode='edge')
             
-            # Сдвигаем водопад вниз и добавляем новую строку
+            # Сдвигаем вниз и пишем свежую строку в самый низ
             self._water_view = np.roll(self._water_view, -1, axis=0)
             self._water_view[-1, :] = row_ds
             self.water_img.setImage(self._water_view, autoLevels=False)
-            
-            print(f"[SpectrumView] Updated waterfall: rows={self._water_view.shape[0]}, cols={self._water_view.shape[1]}")
         else:
             print(f"[SpectrumView] Waterfall view not initialized yet")
             
-        # Коалессация обновлений через таймер (необязательно, но пусть будет)
+        # Когерентная перерисовка (таймер)
         self._pending_water_update = True
         if not self._update_timer.isActive():
             self._update_timer.start()
+
+        # Немного автоматики по уровням после первых кадров
         if self._sweep_count == 5:
             self._auto_levels()
-            
-        # Эмитим сигнал для автопиков и детектора
+
+        # Сигнал для внешних обработчиков (пики и т.п.)
         self.newRowReady.emit(freqs_hz, power_dbm)
     # ---------- сглаживания ----------
     def _smooth_freq(self, y: np.ndarray) -> np.ndarray:
@@ -905,10 +904,10 @@ class SpectrumView(QtWidgets.QWidget):
     # ---------- настройки ----------
     def restore_settings(self, settings, defaults: dict):
         d = (defaults or {}).get("spectrum", {})
-        # Поддерживаем оба формата дефолтов: *_mhz и freq_*_hz
-        start_default_mhz = float(d.get("start_mhz", (float(d.get("freq_start_hz", 50_000_000)) / 1e6)))
-        stop_default_mhz  = float(d.get("stop_mhz",  (float(d.get("freq_end_hz",   6_000_000_000)) / 1e6)))
-        bin_default_khz   = float(d.get("bin_khz",   (float(d.get("bin_hz",        200_000)) / 1e3)))
+        # Дефолтные значения 50-6000 МГц
+        start_default_mhz = float(d.get("start_mhz", 50.0))
+        stop_default_mhz  = float(d.get("stop_mhz", 6000.0))
+        bin_default_khz   = float(d.get("bin_khz", 200.0))
 
         settings.beginGroup("spectrum")
         try:
