@@ -1,10 +1,10 @@
 #!/bin/bash
-# Скрипт сборки HackRF Master C библиотеки для Python CFFI
+# Скрипт сборки HackRF QSA C библиотеки для Python CFFI
 
 set -e  # Останавливаемся при ошибке
 
-echo "🔧 Сборка HackRF Master C библиотеки"
-echo "======================================"
+echo "🔧 Сборка HackRF QSA C библиотеки"
+echo "=================================="
 
 # Проверяем наличие необходимых инструментов
 check_dependencies() {
@@ -43,6 +43,14 @@ check_dependencies() {
     fi
     echo "✓ libhackrf найден: $(pkg-config --modversion libhackrf)"
     
+    # Проверяем FFTW3
+    if ! pkg-config --exists fftw3f; then
+        echo "❌ FFTW3 не найден. Установите:"
+        echo "   sudo apt-get install libfftw3-dev"
+        exit 1
+    fi
+    echo "✓ FFTW3 найден: $(pkg-config --modversion fftw3f)"
+    
     # Проверяем Python и CFFI
     if ! python3 -c "import cffi" 2>/dev/null; then
         echo "❌ Python CFFI не найден. Установите:"
@@ -68,29 +76,11 @@ build_c_library() {
     make all
     
     # Проверяем результат
-    if [ -f "build/libhackrf_master.so" ]; then
+    if [ -f "build/libhackrf_qsa.so" ]; then
         echo "✓ C библиотека успешно собрана"
         ls -la build/
     else
         echo "❌ Ошибка сборки C библиотеки"
-        exit 1
-    fi
-    
-    cd ../../..
-}
-
-# Создание Python CFFI интерфейса
-build_python_interface() {
-    echo ""
-    echo "🐍 Создание Python CFFI интерфейса..."
-    
-    cd panorama/drivers/hackrf_master
-    
-    # Запускаем CFFI build script
-    if python3 cffi_build.py; then
-        echo "✓ Python CFFI интерфейс создан"
-    else
-        echo "❌ Ошибка создания Python интерфейса"
         exit 1
     fi
     
@@ -104,8 +94,8 @@ test_build() {
     
     # Проверяем наличие всех файлов
     required_files=(
-        "panorama/drivers/hackrf_master/build/libhackrf_master.so"
-        "panorama/drivers/hackrf_master/hackrf_master_wrapper.py"
+        "panorama/drivers/hackrf_master/build/libhackrf_qsa.so"
+        "panorama/drivers/hrf_backend.py"
     )
     
     for file in "${required_files[@]}"; do
@@ -123,7 +113,7 @@ test_build() {
 import sys
 sys.path.insert(0, '.')
 try:
-    from panorama.drivers.hackrf_master.hackrf_master_wrapper import HackRFMaster
+    from panorama.drivers.hrf_backend import HackRFQSABackend
     print('✓ Python импорт успешен')
 except Exception as e:
     print(f'❌ Ошибка импорта: {e}')
@@ -156,7 +146,7 @@ install_library() {
 
 # Основная функция
 main() {
-    echo "Начинаем сборку HackRF Master C библиотеки..."
+    echo "Начинаем сборку HackRF QSA C библиотеки..."
     echo ""
     
     # Проверяем зависимости
@@ -164,9 +154,6 @@ main() {
     
     # Собираем C библиотеку
     build_c_library
-    
-    # Создаем Python интерфейс
-    build_python_interface
     
     # Тестируем сборку
     test_build
@@ -177,15 +164,21 @@ main() {
     echo ""
     echo "🎉 Сборка завершена успешно!"
     echo ""
-    echo "Теперь вы можете использовать HackRF Master в Python:"
-    echo "  from panorama.drivers.hackrf_master.hackrf_master_wrapper import HackRFMaster"
+    echo "Теперь вы можете использовать HackRF QSA в Python:"
+    echo "  from panorama.drivers.hrf_backend import HackRFQSABackend"
     echo ""
     echo "Файлы:"
-    echo "  - C библиотека: panorama/drivers/hackrf_master/build/libhackrf_master.so"
-    echo "  - Python wrapper: panorama/drivers/hackrf_master/hackrf_master_wrapper.py"
+    echo "  - C библиотека: panorama/drivers/hackrf_master/build/libhackrf_qsa.so"
+    echo "  - Python backend: panorama/drivers/hrf_backend.py"
     echo ""
     echo "Для запуска приложения:"
     echo "  python3 run_rssi_panorama.py"
+    echo ""
+    echo "Новые возможности:"
+    echo "  - 4 квартальных сегмента (A, B, C, D) для полного покрытия"
+    echo "  - Модульная индексация FFT для устранения 'дырок'"
+    echo "  - Поддержка калибровки из CSV файлов"
+    echo "  - Встроенные FFI определения (без генерации кода)"
 }
 
 # Обработка ошибок

@@ -385,10 +385,10 @@ class SpectrumView(QtWidgets.QWidget):
         self._running = True
         print("[Spectrum] started")
 
-    def _on_finished(self) -> None:
+    def _on_finished(self, code: int) -> None:
         self._set_controls_enabled(True)
         self._running = False
-        print("[Spectrum] finished")
+        print(f"[Spectrum] finished, code={code}")
 
     # ---------- кнопки ----------
     def _on_start_clicked(self):

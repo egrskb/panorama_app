@@ -8,38 +8,31 @@ from panorama.features.master_sweep.master import MasterSweepController
 
 
 class MasterSourceAdapter(SourceBackend):
+    """Адаптер для использования MasterSweepController как источника данных для спектра."""
+    
     def __init__(self, master: MasterSweepController):
         super().__init__()
         self._master = master
         self._running = False
         
-        # Буфер для накопления плиток
-        self._sweep_accumulator = {}  # freq -> power
-        self._expected_range = None
-        self._last_freq = None
+        # Подключаемся к новому сигналу full_sweep_ready
+        if hasattr(master, 'full_sweep_ready'):
+            master.full_sweep_ready.connect(self._on_full_sweep)
+            print("[MasterSourceAdapter] Using new full_sweep_ready signal")
+        else:
+            # Fallback на старый способ через tile
+            master.sweep_tile_received.connect(self._on_tile)
+            print("[MasterSourceAdapter] Using fallback sweep_tile_received signal")
         
-        master.sweep_tile_received.connect(self._on_tile)
         master.sweep_error.connect(self._on_error)
 
     def start(self, config: SweepConfig):
+        """Запуск источника."""
         if self._running:
             return
         
-        self._expected_range = (config.freq_start_hz, config.freq_end_hz)
-        self._sweep_accumulator.clear()
-        self._last_freq = None
-        
         try:
-            print(f"[MasterSourceAdapter] Starting sweep: {config.freq_start_hz/1e6:.1f}-{config.freq_end_hz/1e6:.1f} MHz, bin={config.bin_hz/1e3:.0f} kHz")
-            print(f"[MasterSourceAdapter] Master controller: {self._master}")
-            print(f"[MasterSourceAdapter] Master controller type: {type(self._master)}")
-            print(f"[MasterSourceAdapter] Master controller methods: {[m for m in dir(self._master) if not m.startswith('_')]}")
-            
-            # Проверяем состояние Master контроллера
-            if hasattr(self._master, 'is_running'):
-                print(f"[MasterSourceAdapter] Master is_running: {self._master.is_running}")
-            if hasattr(self._master, '_sdr_initialized'):
-                print(f"[MasterSourceAdapter] Master _sdr_initialized: {self._master._sdr_initialized}")
+            print(f"[MasterSourceAdapter] Starting sweep: {config.freq_start_hz/1e6:.1f}-{config.freq_end_hz/1e6:.1f} MHz")
             
             self._master.start_sweep(
                 start_hz=config.freq_start_hz,
@@ -47,6 +40,7 @@ class MasterSourceAdapter(SourceBackend):
                 bin_hz=config.bin_hz,
                 dwell_ms=100,
             )
+            
             self._running = True
             self.started.emit()
             self.status.emit("Master sweep running")
@@ -59,6 +53,7 @@ class MasterSourceAdapter(SourceBackend):
             self.error.emit(str(e))
 
     def stop(self):
+        """Остановка источника."""
         if not self._running:
             return
         try:
@@ -69,108 +64,58 @@ class MasterSourceAdapter(SourceBackend):
         self.finished.emit(0)
 
     def is_running(self) -> bool:
+        """Проверка состояния."""
         return self._running
+
+    @QtCore.pyqtSlot(object, object)
+    def _on_full_sweep(self, freqs_hz, power_dbm):
+        """Обрабатываем полный sweep напрямую."""
+        try:
+            # Преобразуем в numpy массивы если нужно
+            if not isinstance(freqs_hz, np.ndarray):
+                freqs_hz = np.array(freqs_hz, dtype=np.float64)
+            if not isinstance(power_dbm, np.ndarray):
+                power_dbm = np.array(power_dbm, dtype=np.float32)
+            
+            print(f"[MasterSourceAdapter] Received full sweep: {len(freqs_hz)} points")
+            
+            # Эмитим для спектра
+            self.fullSweepReady.emit(freqs_hz, power_dbm)
+            print(f"[MasterSourceAdapter] Full sweep emitted to spectrum")
+            
+        except Exception as e:
+            print(f"[MasterSourceAdapter] Error processing full sweep: {e}")
+            import traceback
+            print(f"[MasterSourceAdapter] Traceback: {traceback.format_exc()}")
+            self.error.emit(f"Full sweep processing error: {e}")
 
     @QtCore.pyqtSlot(object)
     def _on_tile(self, tile):
-        """Накапливаем плитки и эмитим полный sweep при завершении прохода."""
+        """Fallback обработчик для старого формата через tiles."""
         try:
-            print(f"[MasterSourceAdapter] Received tile: type={type(tile)}")
-            print(f"[MasterSourceAdapter] Tile attributes: {dir(tile)}")
-            print(f"[MasterSourceAdapter] Tile content: {tile}")
+            print(f"[MasterSourceAdapter] Received tile (fallback mode)")
             
-            # Проверяем что это SweepTile
-            if not hasattr(tile, 'f_start') or not hasattr(tile, 'power'):
-                print(f"[MasterSourceAdapter] Invalid tile object: missing required attributes")
-                print(f"[MasterSourceAdapter] Available attributes: {[attr for attr in dir(tile) if not attr.startswith('_')]}")
-                return
+            if hasattr(tile, 'power') and hasattr(tile, 'f_start'):
+                # Создаем массивы частот и мощностей из tile
+                f_start = float(tile.f_start)
+                bin_hz = float(tile.bin_hz)
+                count = int(tile.count)
                 
-            print(f"[MasterSourceAdapter] Tile data: f_start={tile.f_start/1e6:.1f} MHz, "
-                  f"count={tile.count}, power_range=[{min(tile.power):.1f}, {max(tile.power):.1f}] dBm")
-            
-            f_start = float(tile.f_start)
-            bin_hz = float(tile.bin_hz)
-            count = int(tile.count)
-            
-            if count <= 0 or bin_hz <= 0:
-                print(f"[MasterSourceAdapter] Invalid tile data: count={count}, bin_hz={bin_hz}")
-                return
-            
-            # Детектируем wrap (начало нового прохода)
-            if self._last_freq is not None and f_start < self._last_freq - 10e6:
-                print(f"[MasterSourceAdapter] Detected wrap: f_start={f_start/1e6:.1f} < last_freq={self._last_freq/1e6:.1f}")
-                # Эмитим накопленный sweep
-                self._emit_accumulated_sweep()
-                self._sweep_accumulator.clear()
-            
-            # Добавляем текущую плитку
-            for i in range(count):
-                freq = f_start + i * bin_hz
-                self._sweep_accumulator[freq] = tile.power[i]
-            
-            self._last_freq = f_start
-            
-            print(f"[MasterSourceAdapter] Added tile to accumulator: {len(self._sweep_accumulator)} points, "
-                  f"range: {min(self._sweep_accumulator.keys())/1e6:.1f}-{max(self._sweep_accumulator.keys())/1e6:.1f} MHz")
-            
-            # Проверяем покрытие
-            if self._check_coverage():
-                print(f"[MasterSourceAdapter] Coverage complete, emitting accumulated sweep")
-                self._emit_accumulated_sweep()
-                self._sweep_accumulator.clear()
+                freqs_hz = np.arange(count, dtype=np.float64) * bin_hz + f_start
+                power_dbm = np.array(tile.power, dtype=np.float32)
+                
+                self.fullSweepReady.emit(freqs_hz, power_dbm)
+                print(f"[MasterSourceAdapter] Tile converted and emitted")
+            else:
+                print(f"[MasterSourceAdapter] Invalid tile object: missing required attributes")
                 
         except Exception as e:
             print(f"[MasterSourceAdapter] Error processing tile: {e}")
             import traceback
             print(f"[MasterSourceAdapter] Traceback: {traceback.format_exc()}")
-            self.error.emit(f"Adapter tile error: {e}")
-
-    def _check_coverage(self):
-        """Проверяет, покрыт ли весь ожидаемый диапазон."""
-        if not self._expected_range or not self._sweep_accumulator:
-            print(f"[MasterSourceAdapter] Coverage check failed: expected_range={self._expected_range}, "
-                  f"accumulator_size={len(self._sweep_accumulator)}")
-            return False
-        
-        freqs = sorted(self._sweep_accumulator.keys())
-        if not freqs:
-            print(f"[MasterSourceAdapter] Coverage check failed: no frequencies in accumulator")
-            return False
-            
-        coverage = (freqs[-1] - freqs[0]) / (self._expected_range[1] - self._expected_range[0])
-        print(f"[MasterSourceAdapter] Coverage check: {coverage:.2%} "
-              f"({freqs[0]/1e6:.1f}-{freqs[-1]/1e6:.1f} MHz of "
-              f"{self._expected_range[0]/1e6:.1f}-{self._expected_range[1]/1e6:.1f} MHz)")
-        
-        return coverage >= 0.95
-
-    def _emit_accumulated_sweep(self):
-        """Эмитит накопленный полный sweep."""
-        if not self._sweep_accumulator:
-            print(f"[MasterSourceAdapter] Cannot emit sweep: accumulator is empty")
-            return
-            
-        freqs = sorted(self._sweep_accumulator.keys())
-        powers = [self._sweep_accumulator[f] for f in freqs]
-        
-        freqs_array = np.array(freqs, dtype=np.float64)
-        powers_array = np.array(powers, dtype=np.float32)
-        
-        print(f"[MasterAdapter] Emitting full sweep: {len(freqs)} points, "
-              f"range {freqs[0]/1e6:.1f}-{freqs[-1]/1e6:.1f} MHz")
-        print(f"[MasterAdapter] Frequency array shape: {freqs_array.shape}, dtype: {freqs_array.dtype}")
-        print(f"[MasterAdapter] Power array shape: {powers_array.shape}, dtype: {powers_array.dtype}")
-        print(f"[MasterAdapter] Power range: [{min(powers):.1f}, {max(powers):.1f}] dBm")
-        
-        # Проверяем подключенные приемники
-        receivers_count = self.fullSweepReady.receivers()
-        print(f"[MasterAdapter] fullSweepReady signal has {receivers_count} receivers")
-        
-        self.fullSweepReady.emit(freqs_array, powers_array)
-        print(f"[MasterAdapter] Sweep data emitted successfully")
+            self.error.emit(f"Tile processing error: {e}")
 
     @QtCore.pyqtSlot(str)
     def _on_error(self, msg: str):
+        """Обработка ошибок."""
         self.error.emit(msg)
-
-
