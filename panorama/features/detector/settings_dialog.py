@@ -30,13 +30,14 @@ class DetectorSettings:
     min_peak_distance_bins: int = 5  # Минимальное расстояние между пиками
     
     # Параметры для Slave watchlist
-    watchlist_span_mhz: float = 2.0  # Ширина полосы для измерения RSSI
+    watchlist_span_mhz: float = 5.0  # Ширина полосы для измерения RSSI (увеличено до 5 МГц)
     watchlist_dwell_ms: int = 150  # Время измерения
     max_watchlist_size: int = 20  # Максимальный размер списка
     
     # Временные параметры
     peak_timeout_sec: float = 5.0  # Таймаут для удаления неактивных пиков
     measurement_interval_sec: float = 1.0  # Интервал между измерениями
+    min_confirmation_sweeps: int = 3  # Минимум свипов для подтверждения пика
     
     # Фильтры частот
     frequency_ranges: List[Tuple[float, float]] = None  # Список (start_mhz, stop_mhz)
@@ -63,13 +64,14 @@ class DetectorSettings:
             'max_watchlist_size': self.max_watchlist_size,
             'peak_timeout_sec': self.peak_timeout_sec,
             'measurement_interval_sec': self.measurement_interval_sec,
+            'min_confirmation_sweeps': self.min_confirmation_sweeps,
             'frequency_ranges': self.frequency_ranges,
             'exclude_ranges': self.exclude_ranges
         }
     
     @classmethod
     def from_dict(cls, data: dict):
-        return cls(**data)
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
 class DetectorSettingsDialog(QtWidgets.QDialog):
@@ -177,6 +179,12 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         self.spin_measurement_interval.setToolTip("Интервал между измерениями RSSI")
         layout.addRow("Интервал измерений:", self.spin_measurement_interval)
         
+        self.spin_confirmation_sweeps = QtWidgets.QSpinBox()
+        self.spin_confirmation_sweeps.setRange(1, 10)
+        self.spin_confirmation_sweeps.setValue(self.settings.min_confirmation_sweeps)
+        self.spin_confirmation_sweeps.setToolTip("Минимум свипов для подтверждения пика")
+        layout.addRow("Подтверждение:", self.spin_confirmation_sweeps)
+        
         # Информация
         info_label = QtWidgets.QLabel(
             "<i>Детектор автоматически обнаруживает пики в спектре от Master sweep "
@@ -221,7 +229,8 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         
         adaptive_info = QtWidgets.QLabel(
             "<i>Baseline вычисляется как медиана последних N свипов. "
-            "Рекомендуемое значение: 15-25 дБ</i>"
+            "Рекомендуемое значение: 15-25 дБ для обычных условий, "
+            "10-15 дБ для слабых сигналов.</i>"
         )
         adaptive_info.setWordWrap(True)
         adaptive_layout.addRow(adaptive_info)
@@ -286,7 +295,7 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         self.spin_watchlist_span.setRange(0.1, 20.0)
         self.spin_watchlist_span.setValue(self.settings.watchlist_span_mhz)
         self.spin_watchlist_span.setSuffix(" МГц")
-        self.spin_watchlist_span.setToolTip("Ширина полосы для измерения RSSI на Slave")
+        self.spin_watchlist_span.setToolTip("Ширина полосы для измерения RSSI на Slave (рекомендуется 2-5 МГц)")
         watchlist_layout.addRow("Span для RSSI:", self.spin_watchlist_span)
         
         self.spin_watchlist_dwell = QtWidgets.QSpinBox()
@@ -308,18 +317,16 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         viz_group = QtWidgets.QGroupBox("Визуализация")
         viz_layout = QtWidgets.QVBoxLayout(viz_group)
         
-        # График примера (как подсказка)
+        # График примера
         self.example_plot = QtWidgets.QLabel()
         self.example_plot.setMinimumHeight(200)
-        self.example_plot.setStyleSheet(
-            """
+        self.example_plot.setStyleSheet("""
             QLabel {
                 background-color: #2b2b2b;
                 border: 1px solid #555;
                 border-radius: 4px;
             }
-            """
-        )
+        """)
         self.example_plot.setAlignment(QtCore.Qt.AlignCenter)
         self._update_example_plot()
         viz_layout.addWidget(self.example_plot)
@@ -329,7 +336,8 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         # Информация
         info_label = QtWidgets.QLabel(
             "<i>Когда Master обнаруживает пик, его частота добавляется в watchlist. "
-            "Каждый Slave измеряет RSSI в указанной полосе вокруг пика для трилатерации.</i>"
+            "Каждый Slave измеряет RSSI в указанной полосе вокруг пика для трилатерации. "
+            "Ширина окна определяет диапазон (пик ± span/2) для измерения среднеквадратичного RSSI.</i>"
         )
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
@@ -424,10 +432,11 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         text = (
             "<div style='color: #ffffff; padding: 20px;'>"
             "<h3>Пример измерения RSSI</h3>"
-            f"<p>Центральная частота: 2450.0 МГц</p>"
-            f"<p>Полоса: ±{span/2:.1f} МГц</p>"
-            f"<p>Диапазон: {left:.1f} - {right:.1f} МГц</p>"
+            f"<p>Центральная частота пика: 2450.0 МГц</p>"
+            f"<p>Ширина окна: ±{span/2:.1f} МГц</p>"
+            f"<p>Диапазон измерения: {left:.1f} - {right:.1f} МГц</p>"
             f"<p>Время накопления: {dwell} мс</p>"
+            "<p><b>Slave измеряют среднеквадратичный RSSI в этом диапазоне</b></p>"
             "</div>"
         )
         self.example_plot.setText(text)
@@ -440,17 +449,11 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
             table.setItem(r, c, it)
         btn = QtWidgets.QPushButton("🗑")
         def _rem():
-            row = btn.property("row_index")
-            if row is None:
-                # fallback: search
-                for i in range(table.rowCount()):
-                    if table.cellWidget(i, 2) is btn:
-                        row = i
-                        break
-            if row is not None and 0 <= row < table.rowCount():
-                table.removeRow(int(row))
+            for i in range(table.rowCount()):
+                if table.cellWidget(i, 2) is btn:
+                    table.removeRow(i)
+                    break
         btn.clicked.connect(_rem)
-        btn.setProperty("row_index", r)
         table.setCellWidget(r, 2, btn)
     
     def _get_ranges_from_table(self, table: QtWidgets.QTableWidget) -> List[Tuple[float, float]]:
@@ -482,17 +485,39 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
             self.exclude_table.item(r, 1).setText(f"{rng[1]:.3f}")
     
     def _preset_ism(self):
-        # 433/868/915/2400
-        self.settings.frequency_ranges = [(433.0, 434.0), (868.0, 870.0), (902.0, 928.0), (2400.0, 2483.5)]
+        # ISM диапазоны
+        self.settings.frequency_ranges = [
+            (433.0, 434.8),     # 433 МГц ISM
+            (868.0, 870.0),     # 868 МГц EU
+            (902.0, 928.0),     # 915 МГц US
+            (2400.0, 2483.5),   # 2.4 ГГц
+            (5725.0, 5875.0)    # 5.8 ГГц
+        ]
         self._load_filters()
     
     def _preset_wifi(self):
-        self.settings.frequency_ranges = [(2400.0, 2483.5), (5150.0, 5350.0), (5470.0, 5725.0), (5725.0, 5875.0)]
+        self.settings.frequency_ranges = [
+            (2400.0, 2483.5),   # 2.4 ГГц
+            (5150.0, 5350.0),   # 5 ГГц UNII-1/2
+            (5470.0, 5725.0),   # 5 ГГц UNII-2e/3
+            (5725.0, 5875.0)    # 5 ГГц UNII-4
+        ]
         self._load_filters()
     
     def _preset_cellular(self):
-        # Простейшие заглушки по сотовым диапазонам
-        self.settings.frequency_ranges = [(700.0, 900.0), (1700.0, 2200.0)]
+        # Основные сотовые диапазоны
+        self.settings.frequency_ranges = [
+            (791.0, 821.0),     # LTE Band 20
+            (832.0, 862.0),     # LTE Band 20
+            (880.0, 915.0),     # GSM 900
+            (925.0, 960.0),     # GSM 900
+            (1710.0, 1785.0),   # GSM 1800
+            (1805.0, 1880.0),   # GSM 1800
+            (1920.0, 1980.0),   # UMTS
+            (2110.0, 2170.0),   # UMTS
+            (2500.0, 2570.0),   # LTE Band 7
+            (2620.0, 2690.0)    # LTE Band 7
+        ]
         self._load_filters()
     
     def _load_preset(self, preset_name: str):
@@ -504,10 +529,11 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
             self.settings.min_snr_db = 5.0
             self.settings.min_peak_width_bins = 2
             self.settings.min_peak_distance_bins = 3
-            self.settings.watchlist_span_mhz = 1.0
+            self.settings.watchlist_span_mhz = 2.0
             self.settings.watchlist_dwell_ms = 100
             self.settings.peak_timeout_sec = 3.0
             self.settings.measurement_interval_sec = 0.5
+            self.settings.min_confirmation_sweeps = 2
         elif preset_name == "normal":
             # Нормальный режим - сбалансированные настройки
             self.settings.threshold_mode = "adaptive"
@@ -515,10 +541,11 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
             self.settings.min_snr_db = 10.0
             self.settings.min_peak_width_bins = 3
             self.settings.min_peak_distance_bins = 5
-            self.settings.watchlist_span_mhz = 2.0
+            self.settings.watchlist_span_mhz = 5.0
             self.settings.watchlist_dwell_ms = 150
             self.settings.peak_timeout_sec = 5.0
             self.settings.measurement_interval_sec = 1.0
+            self.settings.min_confirmation_sweeps = 3
         elif preset_name == "robust":
             # Устойчивый режим - высокие пороги, медленные измерения
             self.settings.threshold_mode = "fixed"
@@ -526,18 +553,22 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
             self.settings.min_snr_db = 15.0
             self.settings.min_peak_width_bins = 5
             self.settings.min_peak_distance_bins = 8
-            self.settings.watchlist_span_mhz = 3.0
+            self.settings.watchlist_span_mhz = 10.0
             self.settings.watchlist_dwell_ms = 200
             self.settings.peak_timeout_sec = 10.0
             self.settings.measurement_interval_sec = 2.0
+            self.settings.min_confirmation_sweeps = 3
         
         # Применяем настройки к UI
         self._load_settings()
     
     def _load_settings(self):
-        # Проставляем значения в виджеты
+        """Загружает настройки в UI виджеты."""
+        # Основные
         self.chk_enabled.setChecked(self.settings.enabled)
         self.chk_auto_start.setChecked(self.settings.auto_start)
+        
+        # Пороги
         if self.settings.threshold_mode == "adaptive":
             self.radio_adaptive.setChecked(True)
         else:
@@ -547,15 +578,25 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         self.spin_min_snr.setValue(self.settings.min_snr_db)
         self.spin_min_width.setValue(self.settings.min_peak_width_bins)
         self.spin_min_distance.setValue(self.settings.min_peak_distance_bins)
+        
+        # Watchlist
         self.spin_watchlist_span.setValue(self.settings.watchlist_span_mhz)
         self.spin_watchlist_dwell.setValue(self.settings.watchlist_dwell_ms)
         self.spin_max_watchlist.setValue(self.settings.max_watchlist_size)
+        
+        # Временные параметры
         self.spin_peak_timeout.setValue(self.settings.peak_timeout_sec)
         self.spin_measurement_interval.setValue(self.settings.measurement_interval_sec)
+        self.spin_confirmation_sweeps.setValue(self.settings.min_confirmation_sweeps)
+        
+        # Фильтры
         self._load_filters()
+        
+        # Обновляем визуализацию
         self._update_example_plot()
     
     def _gather_settings(self) -> DetectorSettings:
+        """Собирает настройки из UI."""
         s = DetectorSettings(
             enabled=self.chk_enabled.isChecked(),
             auto_start=self.chk_auto_start.isChecked(),
@@ -570,21 +611,25 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
             max_watchlist_size=int(self.spin_max_watchlist.value()),
             peak_timeout_sec=self.spin_peak_timeout.value(),
             measurement_interval_sec=self.spin_measurement_interval.value(),
+            min_confirmation_sweeps=int(self.spin_confirmation_sweeps.value()),
             frequency_ranges=self._get_ranges_from_table(self.include_table),
             exclude_ranges=self._get_ranges_from_table(self.exclude_table),
         )
         return s
     
     def _apply_settings(self):
+        """Применяет настройки."""
         self.settings = self._gather_settings()
         self._save_to_disk(self.settings)
         self.settingsChanged.emit(self.settings)
     
     def _save_and_close(self):
+        """Сохраняет и закрывает диалог."""
         self._apply_settings()
         self.accept()
     
     def _load_from_disk(self) -> Optional[DetectorSettings]:
+        """Загружает настройки с диска."""
         try:
             if self._settings_path.exists():
                 data = json.loads(self._settings_path.read_text(encoding="utf-8"))
@@ -594,10 +639,51 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         return None
     
     def _save_to_disk(self, s: DetectorSettings) -> None:
+        """Сохраняет настройки на диск."""
         try:
             self._settings_path.parent.mkdir(exist_ok=True)
-            self._settings_path.write_text(json.dumps(s.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
+            self._settings_path.write_text(
+                json.dumps(s.to_dict(), indent=2, ensure_ascii=False), 
+                encoding="utf-8"
+            )
         except Exception:
             pass
 
 
+# Вспомогательная функция для интеграции с PeakWatchlistManager
+def load_detector_settings() -> Optional[DetectorSettings]:
+    """Загружает настройки детектора из файла."""
+    settings_path = Path.home() / ".panorama" / "detector_settings.json"
+    try:
+        if settings_path.exists():
+            data = json.loads(settings_path.read_text(encoding="utf-8"))
+            return DetectorSettings.from_dict(data)
+    except Exception:
+        pass
+    return None
+
+
+def apply_settings_to_watchlist_manager(settings: DetectorSettings, manager):
+    """Применяет настройки к PeakWatchlistManager."""
+    if not settings or not manager:
+        return
+    
+    # Основные параметры
+    manager.threshold_mode = settings.threshold_mode
+    manager.baseline_offset_db = settings.baseline_offset_db
+    manager.threshold_dbm = settings.fixed_threshold_dbm
+    manager.min_snr_db = settings.min_snr_db
+    manager.min_peak_width_bins = settings.min_peak_width_bins
+    manager.min_peak_distance_bins = settings.min_peak_distance_bins
+    
+    # Параметры watchlist
+    manager.watchlist_span_hz = settings.watchlist_span_mhz * 1e6
+    manager.max_watchlist_size = settings.max_watchlist_size
+    manager.peak_timeout_sec = settings.peak_timeout_sec
+    manager.min_confirmation_sweeps = settings.min_confirmation_sweeps
+    
+    print(f"[DetectorSettings] Applied settings to watchlist manager: "
+          f"mode={manager.threshold_mode}, "
+          f"offset={manager.baseline_offset_db} dB, "
+          f"span={manager.watchlist_span_hz/1e6} MHz, "
+          f"confirmations={manager.min_confirmation_sweeps}")

@@ -554,7 +554,8 @@ class SpectrumView(QtWidgets.QWidget):
             print(f"[SpectrumView] Initializing display grid: freqs={freqs_hz.size}")
             # Полная сетка (храним для экспорта/курсора и т.д.)
             self._model.freqs_hz = freqs_hz.astype(np.float64, copy=True)
-            self._model.last_row = power_dbm.astype(np.float32, copy=True)
+            # Используем правильный метод для обновления last_row
+            self._model.update_full_sweep(freqs_hz.astype(np.float32, copy=True), power_dbm.astype(np.float32, copy=True))
             n = int(freqs_hz.size)
             self._model.water = np.full((self._model.rows, n), -120.0, dtype=np.float32)
 
@@ -599,7 +600,7 @@ class SpectrumView(QtWidgets.QWidget):
             self._ema_last = None
 
         # Храним полную строку в модели (для экспорта/аналитики)
-        self._model.append_row(power_dbm.astype(np.float32, copy=False))
+        self._model.push_waterfall_row(power_dbm.astype(np.float32, copy=False))
 
         # FPS/счётчик
         t = time.time()

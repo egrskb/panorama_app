@@ -387,6 +387,17 @@ class RSSIPanoramaMainWindow(QMainWindow):
         
         return left_widget
     
+    def _show_detector_settings(self):
+        """Показывает диалог настроек детектора."""
+        from panorama.features.detector.settings_dialog import DetectorSettingsDialog
+        dlg = DetectorSettingsDialog(self)
+        dlg.settingsChanged.connect(lambda s: self.watchlist_manager.set_parameters(
+            span_hz=s.watchlist_span_mhz * 1e6,
+            max_size=s.max_watchlist_size,
+            threshold_offset=s.baseline_offset_db
+        ))
+        dlg.exec_()
+        
     def _create_right_panel(self):
         """Создает правую панель с картой и спектром."""
         right_widget = QWidget()
