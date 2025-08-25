@@ -13,6 +13,7 @@ from PyQt5 import QtCore
 
 from panorama.drivers.base import SourceBackend, SweepConfig
 from panorama.features.spectrum.service import SweepAssembler
+from panorama.features.settings.storage import get_coverage_threshold
 
 
 def _qt_parent(parent):
@@ -125,7 +126,9 @@ class HackRFQSABackend(SourceBackend):
             self.finished.emit(1)
             return
 
-        self._assembler = SweepAssembler()
+        # Получаем coverage_threshold из настроек детектора
+        coverage_threshold = get_coverage_threshold()
+        self._assembler = SweepAssembler(coverage_threshold=coverage_threshold)
         self._assembler.configure(cfg.freq_start_hz,
                                   cfg.freq_end_hz,
                                   cfg.bin_hz)

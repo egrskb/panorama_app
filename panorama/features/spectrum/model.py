@@ -18,6 +18,9 @@ except Exception:  # pragma: no cover
         return None
     QObject = _Dummy  # type: ignore
 
+# --- Настройки детектора ---
+from panorama.features.settings.storage import load_detector_settings
+
 
 # ---------- Типы данных ----------
 
@@ -138,6 +141,10 @@ class PeakDetector:
             peak_band_hz=self.peak_band_hz,
         )
 
+    def detect_peaks(self, freqs_hz: np.ndarray, power_dbm: np.ndarray) -> List[DetectedPeak]:
+        """Совместимый метод для обратной совместимости."""
+        return self.detect(freqs_hz, power_dbm)
+
 
 # ---------- Модель спектра (для UI + хранение водопада) ----------
 
@@ -167,11 +174,12 @@ class SpectrumModel(QObject if _HAS_QT else object):
         self.waterfall: deque[np.ndarray] = deque(maxlen=self._rows_limit)
         self._last_row: Optional[np.ndarray] = None
 
-        # Параметры детектора (как в PeakDetector)
-        self.snr_threshold_db: float = 10.0
-        self.min_peak_bins: int = 3
-        self.min_peak_distance_bins: int = 5
-        self.peak_band_hz: float = 5e6
+        # Загружаем параметры детектора из настроек
+        detector_settings = load_detector_settings()
+        self.snr_threshold_db: float = float(detector_settings.get("snr_threshold_db", 10.0))
+        self.min_peak_bins: int = int(detector_settings.get("min_peak_bins", 3))
+        self.min_peak_distance_bins: int = int(detector_settings.get("min_peak_distance_bins", 5))
+        self.peak_band_hz: float = float(detector_settings.get("peak_band_hz", 5e6))
 
     # ----- Совместимость с view.py -----
 
@@ -243,6 +251,15 @@ class SpectrumModel(QObject if _HAS_QT else object):
             self.min_peak_distance_bins = int(min_peak_distance_bins)
         if peak_band_hz is not None:
             self.peak_band_hz = float(peak_band_hz)
+
+    def reload_detector_settings(self) -> None:
+        """Перезагружает настройки детектора из файла."""
+        detector_settings = load_detector_settings()
+        self.snr_threshold_db = float(detector_settings.get("snr_threshold_db", 10.0))
+        self.min_peak_bins = int(detector_settings.get("min_peak_bins", 3))
+        self.min_peak_distance_bins = int(detector_settings.get("min_peak_distance_bins", 5))
+        self.peak_band_hz = float(detector_settings.get("peak_band_hz", 5e6))
+        self._emit_status("Настройки детектора перезагружены")
 
     def update_full_sweep(self, freqs_hz: np.ndarray, power_dbm: np.ndarray) -> None:
         if freqs_hz is None or power_dbm is None:

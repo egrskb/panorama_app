@@ -90,7 +90,7 @@ class SweepAssembler:
             if (low < self._last_high - self.wrap_guard_hz) and (low < self.f0 + 50e6):
                 cov_before = float(self.mask.mean())
                 if cov_before >= self.threshold:
-                    out = np.where(np.isnan(self.row), self._nan_fill_value, self.row).astype(np.float32)
+                    out = self._interpolate_row()
                     self.reset_pass()
                     print(f"[SweepAssembler] Full pass ready: coverage={cov_before:.3f}, reason=wrap, time={time.time()-self._start_time:.1f}s")
                     return out.copy(), cov_before
@@ -127,12 +127,66 @@ class SweepAssembler:
             print(f"[SweepAssembler] Segment #{self._segment_count}: coverage={cov:.3f} ({nset}/{self.nbins} bins), time={time.time()-self._start_time:.1f}s, freq_range={self._last_low/1e6:.1f}-{self._last_high/1e6:.1f} MHz")
 
         if cov >= self.threshold:
-            out = np.where(np.isnan(self.row), self._nan_fill_value, self.row).astype(np.float32)
+            out = self._interpolate_row()
             print(f"[SweepAssembler] Full pass ready: coverage={cov:.3f}, time={time.time()-self._start_time:.1f}s")
             self.reset_pass()
             return out.copy(), cov
 
         return None, cov
+
+    def _interpolate_row(self) -> np.ndarray:
+        """
+        Интерполирует пропуски в строке спектра для устранения ступенчатости.
+        Использует линейную интерполяцию между известными точками.
+        """
+        if self.row is None:
+            return np.array([], dtype=np.float32)
+        
+        # Копируем строку для интерполяции
+        interpolated = self.row.copy()
+        
+        # Находим индексы известных и неизвестных значений
+        known_mask = ~np.isnan(self.row)
+        unknown_mask = np.isnan(self.row)
+        
+        if not np.any(unknown_mask):
+            # Нет пропусков - возвращаем как есть
+            return interpolated.astype(np.float32)
+        
+        if not np.any(known_mask):
+            # Нет известных значений - заполняем значением по умолчанию
+            return np.full_like(interpolated, self._nan_fill_value, dtype=np.float32)
+        
+        # Находим границы известных участков
+        known_indices = np.where(known_mask)[0]
+        
+        # Интерполируем пропуски
+        for i in range(len(known_indices) - 1):
+            start_idx = known_indices[i]
+            end_idx = known_indices[i + 1]
+            
+            if end_idx - start_idx > 1:  # Есть пропуски между известными точками
+                start_val = self.row[start_idx]
+                end_val = self.row[end_idx]
+                
+                # Линейная интерполяция
+                for j in range(start_idx + 1, end_idx):
+                    alpha = (j - start_idx) / (end_idx - start_idx)
+                    interpolated[j] = start_val + alpha * (end_val - start_val)
+        
+        # Обрабатываем края (если есть пропуски в начале или конце)
+        if known_indices[0] > 0:
+            # Заполняем начало последним известным значением
+            interpolated[:known_indices[0]] = self.row[known_indices[0]]
+        
+        if known_indices[-1] < len(interpolated) - 1:
+            # Заполняем конец последним известным значением
+            interpolated[known_indices[-1] + 1:] = self.row[known_indices[-1]]
+        
+        # Заменяем оставшиеся NaN на значение по умолчанию
+        interpolated = np.where(np.isnan(interpolated), self._nan_fill_value, interpolated)
+        
+        return interpolated.astype(np.float32)
 
 
 def _get(d: Any, key: str, default=None):

@@ -10,6 +10,7 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 from panorama.drivers.base import SweepConfig, SourceBackend
 from panorama.features.spectrum.model import SpectrumModel
 from panorama.shared.palettes import get_colormap
+from panorama.features.settings.storage import load_detector_settings
 
 MAX_DISPLAY_COLS = 4096   # максимум колонок на экране (≈4k)
 WATER_ROWS_TARGET = 200   # число строк водопада по вертикали
@@ -190,6 +191,9 @@ class SpectrumView(QtWidgets.QWidget):
         # стартовый вид
         self._on_reset_view()
         self._apply_visibility()
+        
+        # Загружаем настройки сглаживания из файла
+        self._load_smoothing_settings()
 
     # ----- правая панель -----
     def _build_right_panel(self) -> QtWidgets.QWidget:
@@ -645,6 +649,38 @@ class SpectrumView(QtWidgets.QWidget):
 
         # Сигнал для внешних обработчиков (пики и т.п.)
         self.newRowReady.emit(freqs_hz, power_dbm)
+
+    def reload_detector_settings(self):
+        """Перезагружает настройки детектора из файла."""
+        self._model.reload_detector_settings()
+        print("[SpectrumView] Настройки детектора перезагружены")
+
+    def _load_smoothing_settings(self):
+        """Загружает настройки сглаживания из файла детектора."""
+        try:
+            detector_settings = load_detector_settings()
+            
+            # Применяем настройки сглаживания
+            if detector_settings.get("smoothing_enabled", False):
+                self.chk_smooth.setChecked(True)
+                print("[SpectrumView] Сглаживание по частоте включено")
+            
+            if detector_settings.get("ema_enabled", False):
+                self.chk_ema.setChecked(True)
+                print("[SpectrumView] EMA по времени включено")
+            
+            # Устанавливаем значения параметров
+            smoothing_window = detector_settings.get("smoothing_window", 7)
+            self.smooth_win.setValue(smoothing_window)
+            
+            ema_alpha = detector_settings.get("ema_alpha", 0.3)
+            self.alpha.setValue(ema_alpha)
+            
+            print(f"[SpectrumView] Загружены настройки сглаживания: окно={smoothing_window}, α={ema_alpha}")
+            
+        except Exception as e:
+            print(f"[SpectrumView] Ошибка загрузки настроек сглаживания: {e}")
+
     # ---------- сглаживания ----------
     def _smooth_freq(self, y: np.ndarray) -> np.ndarray:
         if not self.chk_smooth.isChecked() or y.size < 3:

@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Dict, Any
 
 SETTINGS_PATH = Path.home() / ".panorama" / "sdr_settings.json"
+DETECTOR_SETTINGS_PATH = Path.home() / ".panorama" / "detector_settings.json"
 
 
 def load_sdr_settings() -> Dict[str, Any]:
@@ -46,3 +47,39 @@ def save_sdr_settings(data: Dict[str, Any]) -> None:
         SETTINGS_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
+
+
+def load_detector_settings() -> Dict[str, Any]:
+    """Загружает настройки детектора из файла."""
+    try:
+        if DETECTOR_SETTINGS_PATH.exists():
+            data = json.loads(DETECTOR_SETTINGS_PATH.read_text(encoding="utf-8"))
+            print(f"DEBUG: Loaded detector settings: {json.dumps(data, indent=2)}")
+            return data
+    except Exception as e:
+        print(f"DEBUG: Error loading detector settings: {e}")
+    
+    # Возвращаем дефолтные настройки детектора
+    return {
+        "coverage_threshold": 0.95,
+        "snr_threshold_db": 10.0,
+        "min_peak_bins": 3,
+        "min_peak_distance_bins": 5,
+        "peak_band_hz": 5e6
+    }
+
+
+def save_detector_settings(data: Dict[str, Any]) -> None:
+    """Сохраняет настройки детектора в файл."""
+    try:
+        DETECTOR_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        DETECTOR_SETTINGS_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"DEBUG: Saved detector settings: {json.dumps(data, indent=2)}")
+    except Exception as e:
+        print(f"DEBUG: Error saving detector settings: {e}")
+
+
+def get_coverage_threshold() -> float:
+    """Получает значение coverage_threshold из настроек детектора."""
+    settings = load_detector_settings()
+    return float(settings.get("coverage_threshold", 0.95))
