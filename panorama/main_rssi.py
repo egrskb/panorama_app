@@ -32,6 +32,7 @@ from panorama.features.settings.manager_improved import ImprovedDeviceManagerDia
 from panorama.features.settings.storage import load_sdr_settings, save_sdr_settings
 from panorama.features.spectrum.master_adapter import MasterSourceAdapter
 from panorama.features.detector.settings_dialog import DetectorSettingsDialog, DetectorSettings
+from panorama.features.watchlist import WatchlistView
 
 
 class RSSIPanoramaMainWindow(QMainWindow):
@@ -433,6 +434,10 @@ class RSSIPanoramaMainWindow(QMainWindow):
         orch_widget = self._create_orchestrator_widget()
         tab_widget.addTab(orch_widget, "Контроль")
         
+        # Вкладка Watchlist
+        self.watchlist_view = WatchlistView(orchestrator=self.orchestrator)
+        tab_widget.addTab(self.watchlist_view, "Watchlist")
+        
         layout.addWidget(tab_widget)
         
         return right_widget
@@ -574,6 +579,12 @@ class RSSIPanoramaMainWindow(QMainWindow):
             # Сигналы slave
             if self.slave_manager:
                 self.slave_manager.measurement_error.connect(self._on_measurement_error)
+                
+            # Сигналы WatchlistView
+            if hasattr(self, 'watchlist_view') and self.watchlist_view:
+                self.watchlist_view.task_cancelled.connect(self._on_task_cancelled)
+                self.watchlist_view.task_retried.connect(self._on_task_retried)
+                
             self.log.info("All signals connected successfully")
         except Exception as e:
             self.log.error(f"Error connecting signals: {e}")
@@ -894,6 +905,36 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def _on_measurement_error(self, error_msg):
         """Обрабатывает ошибку измерения."""
         self.log.info(f"Ошибка измерения: {error_msg}")
+    
+    def _on_task_cancelled(self, task_id: str):
+        """Обрабатывает отмену задачи."""
+        try:
+            self.log.info(f"Задача отменена: {task_id}")
+            # Обновляем статус задачи в оркестраторе
+            if self.orchestrator and task_id in self.orchestrator.tasks:
+                self.orchestrator.tasks[task_id].status = "CANCELLED"
+                self._update_tasks_table()
+                
+        except Exception as e:
+            self.log.error(f"Error handling task cancelled: {e}")
+    
+    def _on_task_retried(self, task_id: str):
+        """Обрабатывает повторение задачи."""
+        try:
+            self.log.info(f"Задача повторяется: {task_id}")
+            # Создаем новую задачу на основе старой
+            if self.orchestrator and task_id in self.orchestrator.tasks:
+                old_task = self.orchestrator.tasks[task_id]
+                # Создаем новую задачу с теми же параметрами
+                self.orchestrator._enqueue_task(
+                    old_task.peak, 
+                    old_task.window.span, 
+                    old_task.window.dwell_ms
+                )
+                self._update_tasks_table()
+                
+        except Exception as e:
+            self.log.error(f"Error handling task retry: {e}")
     
     def _update_tasks_table(self):
         """Обновляет таблицу задач."""

@@ -318,6 +318,12 @@ class Orchestrator(QObject):
             "queue_len": len(self.queue),
             "tasks_total": len(self.tasks),
         }
+    
+    def get_active_tasks(self) -> List[MeasurementTask]:
+        """
+        Возвращает список активных задач для отображения в UI.
+        """
+        return list(self.tasks.values())
 
     def _emit_status(self):
         try:

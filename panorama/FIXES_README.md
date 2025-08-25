@@ -198,3 +198,26 @@ peak_snr = best_peak.snr_db
 **Файлы**: `panorama/features/spectrum/master.py`
 
 **Статус**: ✅ Исправлено
+
+### Добавление WatchlistView для отслеживания задач
+
+**Новая функциональность**: Создан виджет для мониторинга и управления задачами watchlist в реальном времени.
+
+**Возможности**:
+- Отображение всех задач с их статусом и параметрами
+- Фильтрация по статусу и частоте
+- Детальная информация о выбранной задаче
+- Управление задачами (отмена, повтор)
+- Статистика в реальном времени
+
+**Файлы**:
+- `panorama/features/watchlist/view.py` - основной виджет
+- `panorama/features/watchlist/__init__.py` - экспорт модуля
+- `panorama/main_rssi.py` - интеграция в главное окно
+- `panorama/features/orchestrator/core.py` - добавлен метод `get_active_tasks()`
+
+**Статус**: ✅ Реализовано и интегрировано
+
+**Исправления**:
+- Исправлена ошибка `'QHeaderView' object has no attribute 'setSectionResMode'` → `setSectionResizeMode`
+- Все тесты синтаксиса пройдены успешно
