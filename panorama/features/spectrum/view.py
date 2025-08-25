@@ -222,8 +222,17 @@ class SpectrumView(QtWidgets.QWidget):
         self.smooth_win.valueChanged.connect(self._ensure_odd_window)
         self.chk_ema = QtWidgets.QCheckBox("EMA по времени"); self.chk_ema.setChecked(False)
         self.alpha = QtWidgets.QDoubleSpinBox(); self.alpha.setRange(0.01, 1.00); self.alpha.setSingleStep(0.05); self.alpha.setValue(0.30)
+        self.chk_interpolation = QtWidgets.QCheckBox("Интерполяция"); self.chk_interpolation.setChecked(True)
         gs.addRow(self.chk_smooth); gs.addRow("Окно:", self.smooth_win)
         gs.addRow(self.chk_ema);    gs.addRow("α:", self.alpha)
+        gs.addRow(self.chk_interpolation)
+        
+        # Подключаем сигналы для автоматического сохранения настроек
+        self.chk_smooth.toggled.connect(self._save_smoothing_settings)
+        self.chk_ema.toggled.connect(self._save_smoothing_settings)
+        self.chk_interpolation.toggled.connect(self._save_smoothing_settings)
+        self.smooth_win.valueChanged.connect(self._save_smoothing_settings)
+        self.alpha.valueChanged.connect(self._save_smoothing_settings)
 
         # Водопад
         grp_wf = QtWidgets.QGroupBox("Водопад")
@@ -669,6 +678,10 @@ class SpectrumView(QtWidgets.QWidget):
                 self.chk_ema.setChecked(True)
                 print("[SpectrumView] EMA по времени включено")
             
+            if detector_settings.get("interpolation_enabled", True):
+                self.chk_interpolation.setChecked(True)
+                print("[SpectrumView] Интерполяция включена")
+            
             # Устанавливаем значения параметров
             smoothing_window = detector_settings.get("smoothing_window", 7)
             self.smooth_win.setValue(smoothing_window)
@@ -680,6 +693,28 @@ class SpectrumView(QtWidgets.QWidget):
             
         except Exception as e:
             print(f"[SpectrumView] Ошибка загрузки настроек сглаживания: {e}")
+
+    def _save_smoothing_settings(self):
+        """Сохраняет настройки сглаживания в файл детектора."""
+        try:
+            from panorama.features.settings.storage import load_detector_settings, save_detector_settings
+            
+            # Загружаем текущие настройки
+            detector_settings = load_detector_settings()
+            
+            # Обновляем настройки сглаживания
+            detector_settings["smoothing_enabled"] = self.chk_smooth.isChecked()
+            detector_settings["smoothing_window"] = self.smooth_win.value()
+            detector_settings["ema_enabled"] = self.chk_ema.isChecked()
+            detector_settings["ema_alpha"] = self.alpha.value()
+            detector_settings["interpolation_enabled"] = self.chk_interpolation.isChecked()
+            
+            # Сохраняем обновленные настройки
+            save_detector_settings(detector_settings)
+            print("[SpectrumView] Настройки сглаживания сохранены")
+            
+        except Exception as e:
+            print(f"[SpectrumView] Ошибка сохранения настроек сглаживания: {e}")
 
     # ---------- сглаживания ----------
     def _smooth_freq(self, y: np.ndarray) -> np.ndarray:

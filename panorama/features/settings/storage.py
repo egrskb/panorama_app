@@ -65,7 +65,12 @@ def load_detector_settings() -> Dict[str, Any]:
         "snr_threshold_db": 10.0,
         "min_peak_bins": 3,
         "min_peak_distance_bins": 5,
-        "peak_band_hz": 5e6
+        "peak_band_hz": 5e6,
+        "smoothing_enabled": False,
+        "smoothing_window": 7,
+        "ema_enabled": False,
+        "ema_alpha": 0.3,
+        "interpolation_enabled": True
     }
 
 
@@ -83,3 +88,9 @@ def get_coverage_threshold() -> float:
     """Получает значение coverage_threshold из настроек детектора."""
     settings = load_detector_settings()
     return float(settings.get("coverage_threshold", 0.95))
+
+
+def get_interpolation_enabled() -> bool:
+    """Получает значение interpolation_enabled из настроек детектора."""
+    settings = load_detector_settings()
+    return bool(settings.get("interpolation_enabled", True))

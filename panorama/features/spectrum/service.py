@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Optional, Any, Tuple
 import numpy as np
 import time
+from panorama.features.settings.storage import get_coverage_threshold, get_interpolation_enabled
 
 
 class SweepAssembler:
@@ -10,9 +11,12 @@ class SweepAssembler:
     Собирает одну полную строку спектра из sweep-сегментов (четверти окна).
     """
 
-    def __init__(self, coverage_threshold: float = 0.45, wrap_guard_hz: float = 100e6):
+    def __init__(self, coverage_threshold: float = None, wrap_guard_hz: float = 100e6):
+        if coverage_threshold is None:
+            coverage_threshold = get_coverage_threshold()
         self.threshold = float(coverage_threshold)
         self.wrap_guard_hz = float(wrap_guard_hz)
+        self.interpolation_enabled = get_interpolation_enabled()
 
         # сетка
         self.f0: float = 0.0
@@ -90,7 +94,10 @@ class SweepAssembler:
             if (low < self._last_high - self.wrap_guard_hz) and (low < self.f0 + 50e6):
                 cov_before = float(self.mask.mean())
                 if cov_before >= self.threshold:
-                    out = self._interpolate_row()
+                    if self.interpolation_enabled:
+                        out = self._interpolate_row()
+                    else:
+                        out = self._finalize_row_no_interpolation()
                     self.reset_pass()
                     print(f"[SweepAssembler] Full pass ready: coverage={cov_before:.3f}, reason=wrap, time={time.time()-self._start_time:.1f}s")
                     return out.copy(), cov_before
@@ -127,7 +134,10 @@ class SweepAssembler:
             print(f"[SweepAssembler] Segment #{self._segment_count}: coverage={cov:.3f} ({nset}/{self.nbins} bins), time={time.time()-self._start_time:.1f}s, freq_range={self._last_low/1e6:.1f}-{self._last_high/1e6:.1f} MHz")
 
         if cov >= self.threshold:
-            out = self._interpolate_row()
+            if self.interpolation_enabled:
+                out = self._interpolate_row()
+            else:
+                out = self._finalize_row_no_interpolation()
             print(f"[SweepAssembler] Full pass ready: coverage={cov:.3f}, time={time.time()-self._start_time:.1f}s")
             self.reset_pass()
             return out.copy(), cov
@@ -187,6 +197,20 @@ class SweepAssembler:
         interpolated = np.where(np.isnan(interpolated), self._nan_fill_value, interpolated)
         
         return interpolated.astype(np.float32)
+
+    def _finalize_row_no_interpolation(self) -> np.ndarray:
+        """
+        Финализирует строку спектра без интерполяции.
+        Просто заменяет NaN на значение по умолчанию.
+        """
+        if self.row is None:
+            return np.array([], dtype=np.float32)
+        
+        # Копируем строку и заменяем NaN на значение по умолчанию
+        finalized = self.row.copy()
+        finalized = np.where(np.isnan(finalized), self._nan_fill_value, finalized)
+        
+        return finalized.astype(np.float32)
 
 
 def _get(d: Any, key: str, default=None):
