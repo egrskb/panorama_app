@@ -22,13 +22,14 @@ class SpectrumView(QtWidgets.QWidget):
     rangeSelected  = QtCore.pyqtSignal(float, float)
     configChanged  = QtCore.pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, orchestrator=None):
         super().__init__(parent)
 
         # ---- данные / состояние ----
         self._model = SpectrumModel(rows=WATER_ROWS_TARGET)
         self._source: Optional[SourceBackend] = None
         self._current_cfg: Optional[SweepConfig] = None
+        self._orchestrator = orchestrator
 
         # стабильный «видимый» буфер водопада (даунсемпленный по колонкам)
         self._water_view: Optional[np.ndarray] = None
@@ -55,6 +56,18 @@ class SpectrumView(QtWidgets.QWidget):
         self.vga_db = QtWidgets.QSpinBox()
         self.vga_db.setRange(0, 62); self.vga_db.setSingleStep(2); self.vga_db.setValue(20)
         self.amp_on = QtWidgets.QCheckBox("AMP")
+        
+        # Параметры для оркестратора
+        self.spanSpin = QtWidgets.QDoubleSpinBox()
+        self.spanSpin.setRange(1, 1000)
+        self.spanSpin.setValue(5)
+        self.spanSpin.setSuffix(" МГц")
+        
+        self.dwellSpin = QtWidgets.QSpinBox()
+        self.dwellSpin.setRange(100, 10000)
+        self.dwellSpin.setValue(1000)
+        self.dwellSpin.setSuffix(" мс")
+        
         self.btn_start = QtWidgets.QPushButton("Старт")
         self.btn_stop  = QtWidgets.QPushButton("Стоп"); self.btn_stop.setEnabled(False)
         self.btn_reset = QtWidgets.QPushButton("Сброс вида")
@@ -71,7 +84,13 @@ class SpectrumView(QtWidgets.QWidget):
             (self.vga_db,    "VGA"),
         ]:
             top.addLayout(col(lab, w))
-        top.addWidget(self.amp_on); top.addStretch(1)
+        top.addWidget(self.amp_on)
+        
+        # Добавляем параметры оркестратора
+        top.addLayout(col("Span (МГц)", self.spanSpin))
+        top.addLayout(col("Dwell (мс)", self.dwellSpin))
+        
+        top.addStretch(1)
         top.addWidget(self.btn_start); top.addWidget(self.btn_stop); top.addWidget(self.btn_reset)
 
         # --------- левый блок: графики ----------
@@ -359,6 +378,29 @@ class SpectrumView(QtWidgets.QWidget):
         self._source.started.connect(self._on_started)
         self._source.finished.connect(self._on_finished)
 
+    def _check_sdr_master_configured(self) -> bool:
+        """Проверяет, что SDR master настроен в sdr_settings.json."""
+        try:
+            from panorama.features.settings.storage import load_sdr_settings
+            sdr_settings = load_sdr_settings()
+            
+            if not sdr_settings or 'master' not in sdr_settings:
+                return False
+            
+            master_config = sdr_settings['master']
+            if not master_config or 'serial' not in master_config:
+                return False
+            
+            master_serial = master_config['serial']
+            if not master_serial or len(master_serial) < 16:
+                return False
+            
+            return True
+            
+        except Exception as e:
+            print(f"[SpectrumView] Error checking SDR master: {e}")
+            return False
+
     # ---------- сигналы источника ----------
     def _on_status(self, msg: object) -> None:
         try:
@@ -396,6 +438,13 @@ class SpectrumView(QtWidgets.QWidget):
             QtWidgets.QMessageBox.information(self, "Источник", "Источник данных не подключён")
             return
 
+        # Проверяем, что SDR master настроен
+        if not self._check_sdr_master_configured():
+            QtWidgets.QMessageBox.critical(self, "SDR Master не настроен", 
+                "Для запуска спектра необходимо настроить SDR Master устройство.\n\n"
+                "Перейдите в Настройки → Диспетчер устройств и выберите HackRF устройство как Master.")
+            return
+
         f0, f1, bw = self._snap_bounds(
             self.start_mhz.value(),
             self.stop_mhz.value(),
@@ -404,6 +453,18 @@ class SpectrumView(QtWidgets.QWidget):
         self.start_mhz.setValue(f0 / 1e6)
         self.stop_mhz.setValue(f1 / 1e6)
 
+        # Получаем серийный номер master из настроек
+        master_serial = None
+        try:
+            from panorama.features.settings.storage import load_sdr_settings
+            sdr_settings = load_sdr_settings()
+            if sdr_settings and 'master' in sdr_settings:
+                master_config = sdr_settings['master']
+                if master_config and 'serial' in master_config:
+                    master_serial = master_config['serial']
+        except Exception:
+            pass
+        
         cfg = SweepConfig(
             freq_start_hz=int(f0),
             freq_end_hz=int(f1),
@@ -411,6 +472,7 @@ class SpectrumView(QtWidgets.QWidget):
             lna_db=int(self.lna_db.value()),
             vga_db=int(self.vga_db.value()),
             amp_on=bool(self.amp_on.isChecked()),
+            serial=master_serial,  # Передаем серийный номер
         )
         self._current_cfg = cfg
 
@@ -438,6 +500,12 @@ class SpectrumView(QtWidgets.QWidget):
             self.water_img.setLookupTable(self._lut)
             self.water_img.setLevels(self._wf_levels)
 
+        # Пробрасываем параметры в оркестратор (есть публичный API)
+        if self._orchestrator:
+            span_mhz = float(self.spanSpin.value())
+            dwell_ms = int(self.dwellSpin.value())
+            self._orchestrator.set_global_parameters(span_hz=span_mhz * 1e6, dwell_ms=dwell_ms)
+
         self._source.start(cfg)
         self.configChanged.emit()
         self._set_controls_enabled(False)
@@ -462,6 +530,13 @@ class SpectrumView(QtWidgets.QWidget):
         print(f"[SpectrumView] Received full sweep: freqs={freqs_hz.size}, power={power_dbm.size}, "
               f"freq_range=[{freqs_hz[0]/1e6:.1f}, {freqs_hz[-1]/1e6:.1f}] MHz, "
               f"power_range=[{power_dbm.min():.1f}, {power_dbm.max():.1f}] dBm")
+        
+        # Дополнительная отладка
+        print(f"[SpectrumView] Data types: freqs={type(freqs_hz)}, power={type(power_dbm)}")
+        print(f"[SpectrumView] Data shapes: freqs={freqs_hz.shape}, power={power_dbm.shape}")
+        print(f"[SpectrumView] Power range: min={power_dbm.min():.2f}, max={power_dbm.max():.2f}")
+        print(f"[SpectrumView] Has NaN: freqs={np.any(np.isnan(freqs_hz))}, power={np.any(np.isnan(power_dbm))}")
+        print(f"[SpectrumView] Has Inf: freqs={np.any(np.isinf(freqs_hz))}, power={np.any(np.isinf(power_dbm))}")
         
         if freqs_hz is None or power_dbm is None:
             return
@@ -537,7 +612,9 @@ class SpectrumView(QtWidgets.QWidget):
         self.lbl_sweep.setText(f"Свипов: {self._sweep_count}{fps_text}")
 
         # Линии спектра
+        print(f"[SpectrumView] Calling _refresh_spectrum...")
         self._refresh_spectrum()
+        print(f"[SpectrumView] _refresh_spectrum completed")
 
         # ---- Обновляем СТАБИЛЬНЫЙ буфер водопада ----
         if self._water_view is not None:
@@ -1025,7 +1102,13 @@ class SpectrumView(QtWidgets.QWidget):
         """
         freqs = self._model.freqs_hz
         row   = self._model.last_row
+        
+        # Отладка
+        print(f"[SpectrumView] _refresh_spectrum: freqs={freqs is not None}, row={row is not None}, "
+              f"freqs_size={freqs.size if freqs is not None else 'None'}")
+        
         if freqs is None or row is None or not freqs.size:
+            print(f"[SpectrumView] _refresh_spectrum: early return - no data")
             return
 
         x_mhz = freqs.astype(np.float64) / 1e6

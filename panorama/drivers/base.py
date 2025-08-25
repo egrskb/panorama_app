@@ -9,16 +9,15 @@ class SweepConfig:
     """Конфигурация для свипа."""
     freq_start_hz: int
     freq_end_hz: int
-    bin_hz: int = 800_000  # ОПТИМИЗАЦИЯ: увеличено с 200_000 до 800_000 для лучшей производительности
+    bin_hz: int = 800_000  # ОПТИМИЗАЦИЯ: крупнее бин — быстрее UI
     lna_db: int = 24
     vga_db: int = 20
     amp_on: bool = False
-    serial: Optional[str] = None  # Серийник устройства
+    serial: Optional[str] = None  # Серийник устройства обязателен для HackRF QSA
     extra: Optional[list[str]] = None
 
     def to_args(self) -> list[str]:
-        """Преобразует в аргументы командной строки для hackrf_sweep."""
-        # hackrf_sweep принимает -f в МЕГАгерцах!
+        """Аргументы в стиле hackrf_sweep (если пригодятся)."""
         f_start_mhz = int(round(self.freq_start_hz / 1e6))
         f_end_mhz   = int(round(self.freq_end_hz   / 1e6))
 
@@ -44,8 +43,6 @@ class SourceBackend(QtCore.QObject):
     Базовый класс для источников данных.
     Эмитит как отдельные сегменты (sweepLine), так и полные проходы (fullSweepReady).
     """
-    
-    # Сигналы
     sweepLine = QtCore.pyqtSignal(object)       # payload: panorama.shared.parsing.SweepLine
     fullSweepReady = QtCore.pyqtSignal(object, object)  # (freqs_hz, power_dbm) - полный проход
     status = QtCore.pyqtSignal(str)
@@ -56,15 +53,11 @@ class SourceBackend(QtCore.QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-    # Методы для переопределения в подклассах
     def start(self, config: SweepConfig):
-        """Запускает источник с заданной конфигурацией."""
         raise NotImplementedError
 
     def stop(self):
-        """Останавливает источник."""
         raise NotImplementedError
 
     def is_running(self) -> bool:
-        """Проверяет, работает ли источник."""
         raise NotImplementedError

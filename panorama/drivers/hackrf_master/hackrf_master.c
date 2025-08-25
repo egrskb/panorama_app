@@ -1,4 +1,7 @@
-#define _GNU_SOURCE
+// hackrf_master.c - sweep backend для Panorama (API hackrf 0.9 / 2024.02.x)
+// Работает как hackrf_sweep: hackrf_init_sweep + hackrf_start_rx_sweep,
+// в rx_callback парсим 0x7f 0x7f + center_freq и отдаём 1/4 окна через hq_segment_cb.
+
 #include "hackrf_master.h"
 #include <libhackrf/hackrf.h>
 #include <fftw3.h>
@@ -6,390 +9,248 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <pthread.h>
-#include <ctype.h>
 
-/* -------- Константы (как в hackrf_sweep) -------- */
-#define DEFAULT_SAMPLE_RATE_HZ            (20000000u)   /* 20 MHz */
-#define DEFAULT_BASEBAND_FILTER_BANDWIDTH (15000000u)   /* 15 MHz */
-#define TUNE_STEP_MHZ                     (20u)
-#define OFFSET_HZ                         (7500000u)
-#define BLOCKS_PER_TRANSFER               16
+#define DEFAULT_SAMPLE_RATE_HZ 20000000
+#define DEFAULT_FFT_SIZE       8192
+#define OFFSET                 7500000          // 7.5 MHz
+#define TUNE_STEP_MHZ          20               // шаг тюнинга (МГц)
+#define FREQ_ONE_MHZ           (1000000U)
+#define SWEEP_STYLE_INTERLEAVED 0               // соответствует HACKRF_SWEEP_STYLE_INTERLEAVED
 
-/* -------- Глобалы устройства/состояния -------- */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 static hackrf_device* dev = NULL;
 static volatile int running = 0;
 static hq_segment_cb g_cb = NULL;
-static void*         g_user = NULL;
+static void* g_user = NULL;
 static char g_err[256] = {0};
 
-/* -------- FFT/окно -------- */
-static int fftSize = 0;
-static double fft_bin_width = 0.0;
-static fftwf_complex* fftwIn = NULL;
-static fftwf_complex* fftwOut = NULL;
-static fftwf_plan fftwPlan = NULL;
-static float* pwr = NULL;
+static fftwf_complex* fft_in = NULL;
+static fftwf_complex* fft_out = NULL;
+static fftwf_plan fft_plan;
 static float* window = NULL;
+static float* pwr = NULL;
+static int fft_size = DEFAULT_FFT_SIZE;
+static double fft_bin_width = 0.0;
 
-/* -------- Sweep config -------- */
-static uint16_t freq_ranges[2] = {0,0};
-static uint32_t step_count = 0;
+static double g_bin_hz = 0.0;
 
-/* -------- Текущие усиления -------- */
-static int s_lna_db = 0;
-static int s_vga_db = 0;
-static int s_amp_on = 0;
+// ---- утилиты ошибок ----
+const char* hq_last_error(void) { return g_err; }
+static void set_err(const char* s) { snprintf(g_err, sizeof(g_err), "%s", s); }
+static void set_errf(const char* fmt, const char* a) { snprintf(g_err, sizeof(g_err), fmt, a); }
 
-/* -------- Коррекции окна -------- */
-static float s_corr_window_power_db = 0.0f;
-static float s_corr_enbw_db = 0.0f;
-
-/* =========================================================
- *             Калибровка LUT (CSV)
- * ========================================================= */
-
-typedef struct {
-    float f_mhz;
-    float k_db;
-} kpt_t;
-
-typedef struct {
-    int   lna, vga, amp;
-    kpt_t* pts;
-    int   n;
-    int   cap;
-} kprof_t;
-
-static kprof_t* s_profiles = NULL;
-static int      s_profiles_n = 0;
-static int      s_cal_enabled = 0;
-
-static void cal_clear(void) {
-    if (s_profiles) {
-        for (int i=0;i<s_profiles_n;++i) {
-            free(s_profiles[i].pts);
-        }
-        free(s_profiles);
-    }
-    s_profiles = NULL;
-    s_profiles_n = s_cal_enabled = 0;
-}
-
-static int cal_find_profile(int lna, int vga, int amp) {
-    for (int i=0;i<s_profiles_n;++i) {
-        if (s_profiles[i].lna==lna && s_profiles[i].vga==vga && s_profiles[i].amp==amp)
-            return i;
-    }
-    return -1;
-}
-
-float cal_lookup_db(float f_mhz, int lna, int vga, int amp) {
-    if (!s_cal_enabled || s_profiles_n == 0) return 0.0f;
-    int idx = cal_find_profile(lna, vga, amp);
-    if (idx < 0) return 0.0f;
-    kprof_t* p = &s_profiles[idx];
-    if (p->n <= 0) return 0.0f;
-    if (f_mhz <= p->pts[0].f_mhz)   return p->pts[0].k_db;
-    if (f_mhz >= p->pts[p->n-1].f_mhz) return p->pts[p->n-1].k_db;
-    for (int j=0;j<p->n-1;++j) {
-        float f0 = p->pts[j].f_mhz;
-        float f1 = p->pts[j+1].f_mhz;
-        if (f_mhz >= f0 && f_mhz <= f1) {
-            float t = (f_mhz - f0) / (f1 - f0);
-            return p->pts[j].k_db + t * (p->pts[j+1].k_db - p->pts[j].k_db);
-        }
-    }
+// ---- калибровка (плейсхолдер) ----
+static float cal_lookup_db(float freq_mhz, int lna_db, int vga_db, int amp_on) {
+    (void)freq_mhz; (void)lna_db; (void)vga_db; (void)amp_on;
     return 0.0f;
 }
 
-/* =========================================================
- *                    Утилиты
- * ========================================================= */
-static inline float logPower(fftwf_complex in, float scale) {
-    float re = in[0] * scale;
-    float im = in[1] * scale;
-    float magsq = re*re + im*im;
-    return (float)(10.0f * log10f(magsq));
-}
-
-static void set_err(const char* fmt, int code) {
-    snprintf(g_err, sizeof(g_err), fmt, code);
-}
-
-const char* hq_last_error(void) { return g_err; }
-
-/* =========================================================
- *                    API
- * ========================================================= */
-
-int hq_open(const char* serial_suffix) {
-    int r = hackrf_init();
-    if (r) { set_err("hackrf_init failed: %d", r); return r; }
-    if (serial_suffix && serial_suffix[0]) {
-        r = hackrf_open_by_serial(serial_suffix, &dev);
-    } else {
-        r = hackrf_open(&dev);
-    }
-    if (r) { set_err("hackrf_open failed: %d", r); hackrf_exit(); return r; }
-    r = hackrf_set_sample_rate(dev, DEFAULT_SAMPLE_RATE_HZ);
-    if (r) { set_err("hackrf_set_sample_rate failed: %d", r); return r; }
-    uint32_t bw = hackrf_compute_baseband_filter_bw(DEFAULT_BASEBAND_FILTER_BANDWIDTH);
-    r = hackrf_set_baseband_filter_bandwidth(dev, bw);
-    if (r) { set_err("hackrf_set_baseband_filter_bandwidth failed: %d", r); return r; }
-    return 0;
-}
-
-int hq_configure(double f_start_mhz, double f_stop_mhz,
-                 double requested_bin_hz,
-                 int lna_db, int vga_db, int amp_enable)
-{
-    if (!dev) return -1;
-    if (lna_db < 0) lna_db = 0; if (lna_db > 40) lna_db = 40; lna_db -= (lna_db % 8);
-    if (vga_db < 0) vga_db = 0; if (vga_db > 62) vga_db = 62; vga_db -= (vga_db % 2);
-
-    hackrf_set_lna_gain(dev, lna_db);
-    hackrf_set_vga_gain(dev, vga_db);
-    hackrf_set_amp_enable(dev, amp_enable ? 1 : 0);
-    s_lna_db = lna_db; s_vga_db = vga_db; s_amp_on = amp_enable ? 1 : 0;
-
-    if (requested_bin_hz < 2445.0) requested_bin_hz = 2445.0;
-    if (requested_bin_hz > 5e6)    requested_bin_hz = 5e6;
-    int N = (int)floor((double)DEFAULT_SAMPLE_RATE_HZ / requested_bin_hz);
-    if (N < 4) N = 4; if (N > 8180) N = 8180;
-    while ((N + 4) % 8) N++;
-    fftSize = N;
-    fft_bin_width = (double)DEFAULT_SAMPLE_RATE_HZ / (double)fftSize;
-
-    if (fftwIn) { fftwf_free(fftwIn); fftwIn=NULL; }
-    if (fftwOut){ fftwf_free(fftwOut); fftwOut=NULL; }
-    if (pwr)    { fftwf_free(pwr);    pwr=NULL; }
-    if (window) { fftwf_free(window); window=NULL; }
-    if (fftwPlan){ fftwf_destroy_plan(fftwPlan); fftwPlan=NULL; }
-
-    fftwIn  = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex)*fftSize);
-    fftwOut = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex)*fftSize);
-    pwr     = (float*)fftwf_malloc(sizeof(float)*fftSize);
-    window  = (float*)fftwf_malloc(sizeof(float)*fftSize);
-
-    for (int i=0;i<fftSize;i++)
-        window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / (fftSize - 1)));
-    fftwPlan = fftwf_plan_dft_1d(fftSize, fftwIn, fftwOut, FFTW_FORWARD, FFTW_ESTIMATE);
-
-    s_corr_window_power_db = 10.0f * log10f(4.0f);
-    s_corr_enbw_db         = 10.0f * log10f(1.5f);
-
-    // Диапазон sweep (целые МГц)
-    if (f_stop_mhz <= f_start_mhz) return -3;
-    if (f_start_mhz < 0) f_start_mhz = 0;
-    if (f_stop_mhz > 7250) f_stop_mhz = 7250;  // HackRF поддерживает до 7.25 ГГц
-    
-    freq_ranges[0] = (uint16_t)floor(f_start_mhz);
-    freq_ranges[1] = (uint16_t)ceil(f_stop_mhz);
-    
-    // Важно: step_count должен покрывать весь диапазон
-    step_count = (uint32_t)((freq_ranges[1] - freq_ranges[0]) / TUNE_STEP_MHZ);
-    if (step_count < 1) step_count = 1;
-    
-    printf("[hackrf_master] Configured for %u-%u MHz, %u steps\n", 
-           freq_ranges[0], freq_ranges[1], step_count);
-
-    return 0;
-}
-
-static int rx_callback(hackrf_transfer* transfer)
-{
-    if (!running || !g_cb) return 0;
-
-    // Добавляем счетчик для отладки
-    static int block_counter = 0;
-    block_counter++;
-
-    int8_t* buf = (int8_t*)transfer->buffer;
-    for (int j=0; j<BLOCKS_PER_TRANSFER; ++j) {
-        uint8_t* ubuf = (uint8_t*)buf;
-        if (!(ubuf[0]==0x7F && ubuf[1]==0x7F)) { buf += BYTES_PER_BLOCK; continue; }
-
-        uint64_t frequency =
-            ((uint64_t)ubuf[9] << 56) | ((uint64_t)ubuf[8] << 48) |
-            ((uint64_t)ubuf[7] << 40) | ((uint64_t)ubuf[6] << 32) |
-            ((uint64_t)ubuf[5] << 24) | ((uint64_t)ubuf[4] << 16) |
-            ((uint64_t)ubuf[3] << 8)  | (uint64_t)ubuf[2];
-
-        /* последние fftSize I/Q с конца блока */
-        buf += BYTES_PER_BLOCK - (fftSize*2);
-        for (int i=0;i<fftSize;i++){
-            fftwIn[i][0] = buf[i*2]   * window[i] * (1.0f/128.0f);
-            fftwIn[i][1] = buf[i*2+1] * window[i] * (1.0f/128.0f);
-        }
-        buf += fftSize*2;
-
-        fftwf_execute(fftwPlan);
-        for (int i=0;i<fftSize;i++) pwr[i] = logPower(fftwOut[i], 1.0f/fftSize);
-
-        const int q = fftSize/4;
-
-        /* сегмент A: [f, f+Fs/4], берем бины начиная с 1+(5/8*N) */
-        {
-            double* freqs = (double*)malloc(sizeof(double)*q);
-            float*  data  = (float*) malloc(sizeof(float )*q);
-            if (!freqs || !data) { if(freqs)free(freqs); if(data)free(data); return 0; }
-
-            uint64_t hz_low  = frequency;
-            uint64_t hz_high = frequency + DEFAULT_SAMPLE_RATE_HZ/4;
-            for (int i=0;i<q;i++){
-                float   raw_db = pwr[i + 1 + (fftSize*5)/8];
-                double  f_hz   = (double)hz_low + (i + 0.5) * fft_bin_width;
-                float   f_mhz  = (float)(f_hz / 1.0e6);
-                float   k_db   = cal_lookup_db(f_mhz, s_lna_db, s_vga_db, s_amp_on);
-                data[i]  = raw_db + s_corr_window_power_db + s_corr_enbw_db + k_db;
-                freqs[i] = f_hz;
-            }
-            g_cb(freqs, data, q, fft_bin_width, hz_low, hz_high, g_user);
-            free(freqs); free(data);
-        }
-        /* сегмент B: [f+Fs/2, f+3/4*Fs], берем бины начиная с 1+(1/8*N) */
-        {
-            double* freqs = (double*)malloc(sizeof(double)*q);
-            float*  data  = (float*) malloc(sizeof(float )*q);
-            if (!freqs || !data) { if(freqs)free(freqs); if(data)free(data); return 0; }
-
-            uint64_t hz_low  = frequency + DEFAULT_SAMPLE_RATE_HZ/2;
-            uint64_t hz_high = frequency + (DEFAULT_SAMPLE_RATE_HZ*3)/4;
-            for (int i=0;i<q;i++){
-                float   raw_db = pwr[i + 1 + (fftSize/8)];
-                double  f_hz   = (double)hz_low + (i + 0.5) * fft_bin_width;
-                float   f_mhz  = (float)(f_hz / 1.0e6);
-                float   k_db   = cal_lookup_db(f_mhz, s_lna_db, s_vga_db, s_amp_on);
-                data[i]  = raw_db + s_corr_window_power_db + s_corr_enbw_db + k_db;
-                freqs[i] = f_hz;
-            }
-            g_cb(freqs, data, q, fft_bin_width, hz_low, hz_high, g_user);
-            free(freqs); free(data);
-        }
-
-        /* сегмент C: [f+Fs/4, f+Fs/2] (с модульной индексацией по FFT) */
-        {
-            double* freqs = (double*)malloc(sizeof(double)*q);
-            float*  data  = (float*) malloc(sizeof(float )*q);
-            if (!freqs || !data) { if(freqs)free(freqs); if(data)free(data); return 0; }
-
-            uint64_t hz_low  = frequency + DEFAULT_SAMPLE_RATE_HZ/4;
-            uint64_t hz_high = frequency + DEFAULT_SAMPLE_RATE_HZ/2;
-            int base = 1 + (fftSize*7)/8; /* смещение, затем wrap по модулю */
-            for (int i=0;i<q;i++){
-                int idx   = (base + i) % fftSize;
-                float raw_db = pwr[idx];
-                double  f_hz   = (double)hz_low + (i + 0.5) * fft_bin_width;
-                float   f_mhz  = (float)(f_hz / 1.0e6);
-                float   k_db   = cal_lookup_db(f_mhz, s_lna_db, s_vga_db, s_amp_on);
-                data[i]  = raw_db + s_corr_window_power_db + s_corr_enbw_db + k_db;
-                freqs[i] = f_hz;
-            }
-            g_cb(freqs, data, q, fft_bin_width, hz_low, hz_high, g_user);
-            free(freqs); free(data);
-        }
-
-        /* сегмент D: [f+3/4*Fs, f+Fs] (с модульной индексацией по FFT) */
-        {
-            double* freqs = (double*)malloc(sizeof(double)*q);
-            float*  data  = (float*) malloc(sizeof(float )*q);
-            if (!freqs || !data) { if(freqs)free(freqs); if(data)free(data); return 0; }
-
-            uint64_t hz_low  = frequency + (DEFAULT_SAMPLE_RATE_HZ*3)/4;
-            uint64_t hz_high = frequency + DEFAULT_SAMPLE_RATE_HZ;
-            int base = 1 + (fftSize*3)/8; /* смещение, затем wrap по модулю */
-            for (int i=0;i<q;i++){
-                int idx   = (base + i) % fftSize;
-                float raw_db = pwr[idx];
-                double  f_hz   = (double)hz_low + (i + 0.5) * fft_bin_width;
-                float   f_mhz  = (float)(f_hz / 1.0e6);
-                float   k_db   = cal_lookup_db(f_mhz, s_lna_db, s_vga_db, s_amp_on);
-                data[i]  = raw_db + s_corr_window_power_db + s_corr_enbw_db + k_db;
-                freqs[i] = f_hz;
-            }
-            g_cb(freqs, data, q, fft_bin_width, hz_low, hz_high, g_user);
-            free(freqs); free(data);
-        }
-    }
-
-    // Периодический отладочный вывод
-    if (block_counter % 100 == 0) {
-        printf("[hackrf_master] Processed %d blocks\n", block_counter);
-    }
-
-    return 0;
-}
-
-int hq_start(hq_segment_cb cb, void* user)
-{
-    if (!dev) return -1;
-    g_cb = cb; g_user = user;
-    running = 1;
-
-    int r = hackrf_init_sweep(
-        dev,
-        freq_ranges,
-        1,
-        BYTES_PER_BLOCK,
-        TUNE_STEP_MHZ * 1000000u,
-        OFFSET_HZ,
-        HQ_INTERLEAVED
-    );
-    if (r) { set_err("hackrf_init_sweep failed: %d", r); running=0; return r; }
-
-    r = hackrf_start_rx_sweep(dev, rx_callback, NULL);
-    if (r) { set_err("hackrf_start_rx_sweep failed: %d", r); running=0; return r; }
-    return 0;
-}
-
-int hq_device_count(void)
-{
-    int r = hackrf_init();
-    if (r) { set_err("hackrf_init failed: %d", r); return 0; }
-    hackrf_device_list_t* lst = hackrf_device_list();
+// ---- перечисление устройств ----
+int hq_device_count(void) {
+    struct hackrf_device_list* lst = hackrf_device_list();
     if (!lst) return 0;
     int n = lst->devicecount;
     hackrf_device_list_free(lst);
     return n;
 }
 
-int hq_get_device_serial(int idx, char* buf, int buf_len)
-{
-    if (!buf || buf_len <= 0) return -1;
-    int r = hackrf_init();
-    if (r) { set_err("hackrf_init failed: %d", r); return r; }
-    hackrf_device_list_t* lst = hackrf_device_list();
+int hq_get_device_serial(int idx, char* out, int cap) {
+    if (!out || cap <= 0) return -1;
+    struct hackrf_device_list* lst = hackrf_device_list();
     if (!lst) return -2;
-    int n = lst->devicecount;
-    if (idx < 0 || idx >= n) { hackrf_device_list_free(lst); return -3; }
+    if (idx < 0 || idx >= lst->devicecount) {
+        hackrf_device_list_free(lst);
+        return -3;
+    }
     const char* s = lst->serial_numbers[idx];
     if (!s) s = "";
-    snprintf(buf, buf_len, "%s", s);
+    snprintf(out, cap, "%s", s);
     hackrf_device_list_free(lst);
     return 0;
 }
 
-int hq_stop(void)
-{
-    if (!dev) return 0;
-    running = 0;
-    hackrf_stop_rx(dev);
+// ---- открытие/закрытие ----
+int hq_open(const char* serial_suffix) {
+    int r = hackrf_init();
+    if (r) { set_err("hackrf_init failed"); return r; }
+
+    if (!serial_suffix || !serial_suffix[0]) {
+        set_err("Serial is required (no fallback to first device)");
+        return -100; // специально наш код ошибки
+    }
+
+    // Поддержка «суффикса»: ищем устройство, серийник которого оканчивается на заданную строку
+    struct hackrf_device_list* lst = hackrf_device_list();
+    if (!lst) { set_err("hackrf_device_list failed"); return -101; }
+
+    int found = -1;
+    size_t want_len = strlen(serial_suffix);
+    for (int i = 0; i < lst->devicecount; ++i) {
+        const char* s = lst->serial_numbers[i] ? lst->serial_numbers[i] : "";
+        size_t sl = strlen(s);
+        if (sl >= want_len) {
+            if (strcmp(s + (sl - want_len), serial_suffix) == 0) {
+                found = i; break;
+            }
+        }
+    }
+
+    if (found < 0) {
+        hackrf_device_list_free(lst);
+        set_errf("Device with serial suffix not found: %s", serial_suffix);
+        return -102;
+    }
+
+    r = hackrf_device_list_open(lst, found, &dev);
+    hackrf_device_list_free(lst);
+    if (r) { set_err("hackrf_open (by list index) failed"); return r; }
+
+    // Ставим sample rate — используется при FFT
+    hackrf_set_sample_rate(dev, DEFAULT_SAMPLE_RATE_HZ);
     return 0;
 }
 
-void hq_close(void)
-{
-    if (dev) {
-        hackrf_close(dev);
-        dev = NULL;
-        hackrf_exit();
+void hq_close(void) {
+    running = 0;
+    if (dev) { hackrf_close(dev); dev = NULL; }
+    hackrf_exit();
+
+    if (fft_in)      { fftwf_free(fft_in);  fft_in = NULL; }
+    if (fft_out)     { fftwf_free(fft_out); fft_out = NULL; }
+    if (pwr)         { free(pwr);           pwr = NULL; }
+    if (window)      { free(window);        window = NULL; }
+    if (fft_plan)    { fftwf_destroy_plan(fft_plan); fft_plan = NULL; }
+}
+
+// ---- конфигурация свипа ----
+int hq_configure(double f_start_mhz, double f_stop_mhz, double bin_hz,
+                 int lna_db, int vga_db, int amp_on) {
+    if (!dev) { set_err("device not opened"); return -1; }
+    g_bin_hz = bin_hz;
+
+    // Усиления
+    hackrf_set_lna_gain(dev, lna_db);
+    hackrf_set_vga_gain(dev, vga_db);
+    hackrf_set_amp_enable(dev, amp_on);
+
+    // FFT init
+    fft_size = (int)(DEFAULT_SAMPLE_RATE_HZ / bin_hz);
+    if (fft_size > 8192) fft_size = 8192;
+    if (fft_size < 256)  fft_size = 256;
+    fft_bin_width = (double)DEFAULT_SAMPLE_RATE_HZ / (double)fft_size;
+
+    if (fft_in)  { fftwf_free(fft_in);  fft_in = NULL; }
+    if (fft_out) { fftwf_free(fft_out); fft_out = NULL; }
+    if (pwr)     { free(pwr);           pwr = NULL; }
+    if (window)  { free(window);        window = NULL; }
+
+    fft_in  = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * fft_size);
+    fft_out = (fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex) * fft_size);
+    pwr     = (float*)malloc(sizeof(float) * fft_size);
+    window  = (float*)malloc(sizeof(float) * fft_size);
+    for (int i = 0; i < fft_size; i++) {
+        window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / (fft_size - 1)));
     }
-    if (fftwPlan) { fftwf_destroy_plan(fftwPlan); fftwPlan=NULL; }
-    if (fftwIn)   { fftwf_free(fftwIn); fftwIn=NULL; }
-    if (fftwOut)  { fftwf_free(fftwOut); fftwOut=NULL; }
-    if (pwr)      { fftwf_free(pwr); pwr=NULL; }
-    if (window)   { fftwf_free(window); window=NULL; }
-    cal_clear();
-    g_cb=NULL; g_user=NULL;
+    fft_plan = fftwf_plan_dft_1d(fft_size, fft_in, fft_out, FFTW_FORWARD, FFTW_ESTIMATE);
+
+    // sweep init (как в hackrf_sweep.c)
+    uint16_t freqs[2];
+    if (f_stop_mhz < f_start_mhz) {
+        double tmp = f_start_mhz; f_start_mhz = f_stop_mhz; f_stop_mhz = tmp;
+    }
+    freqs[0] = (uint16_t)floor(f_start_mhz);
+    freqs[1] = (uint16_t)ceil(f_stop_mhz);
+
+    int r = hackrf_init_sweep(
+        dev,
+        freqs, 1,
+        BYTES_PER_BLOCK,                          // размер блока из libhackrf.h
+        TUNE_STEP_MHZ * FREQ_ONE_MHZ,            // шаг 20 МГц
+        OFFSET,                                  // offset 7.5 МГц
+        SWEEP_STYLE_INTERLEAVED                  // interleaved режим (0)
+    );
+    if (r != HACKRF_SUCCESS) {
+        set_err("hackrf_init_sweep failed");
+        return r;
+    }
+    return 0;
+}
+
+// ---- обработка блока ----
+static void process_block(int8_t* buf, int valid_length, uint64_t center_hz) {
+    int count = fft_size;
+    if (valid_length/2 < count) return;
+
+    const float scale = 1.0f/128.0f;
+    for (int i = 0; i < count; i++) {
+        float I = buf[2*i]   * scale;
+        float Q = buf[2*i+1] * scale;
+        fft_in[i][0] = I * window[i];
+        fft_in[i][1] = Q * window[i];
+    }
+    fftwf_execute(fft_plan);
+
+    for (int i = 0; i < count; i++) {
+        float re = fft_out[i][0], im = fft_out[i][1];
+        float mag = re*re + im*im;
+        if (mag <= 1e-12f) mag = 1e-12f;
+        pwr[i] = 10.0f * log10f(mag) + cal_lookup_db((float)center_hz/1e6f, 0, 0, 0);
+    }
+
+    // как в hackrf_sweep — отдаём 1/4 окна (нижнюю четверть)
+    int quarter = count/4;
+
+    static double* freqs = NULL;
+    static int cap = 0;
+    if (quarter > cap) {
+        free(freqs);
+        cap = quarter;
+        freqs = (double*)malloc(sizeof(double)*cap);
+    }
+
+    double start_hz = (double)center_hz - (double)DEFAULT_SAMPLE_RATE_HZ/2.0;
+    for (int i = 0; i < quarter; i++) {
+        freqs[i] = start_hz + (i + 0.5) * fft_bin_width;
+    }
+
+    if (g_cb) {
+        g_cb(freqs, pwr, quarter, fft_bin_width,
+             (uint64_t)freqs[0], (uint64_t)freqs[quarter-1], g_user);
+    }
+}
+
+// ---- RX колбэк ----
+static int rx_callback(hackrf_transfer* transfer) {
+    if (!running) return 0;
+    uint8_t* ubuf = (uint8_t*)transfer->buffer;
+
+    // сигнатура sweep-пакета
+    if (ubuf[0]==0x7f && ubuf[1]==0x7f) {
+        uint64_t freq=0;
+        for (int i=0; i<8; i++) freq |= ((uint64_t)ubuf[2+i]) << (8*i);
+        int8_t* iq = (int8_t*)(ubuf+16);
+        process_block(iq, transfer->valid_length-16, freq);
+    }
+    return 0;
+}
+
+// ---- старт/стоп ----
+int hq_start(hq_segment_cb cb, void* user) {
+    if (!dev) { set_err("device not opened"); return -1; }
+    g_cb = cb; g_user = user; running = 1;
+    int r = hackrf_start_rx_sweep(dev, rx_callback, NULL);
+    if (r != HACKRF_SUCCESS) {
+        set_err("hackrf_start_rx_sweep failed");
+        running = 0;
+        return r;
+    }
+    return 0;
+}
+
+int hq_stop(void) {
+    running = 0;
+    return hackrf_stop_rx(dev);
 }

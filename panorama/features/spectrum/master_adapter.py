@@ -1,143 +1,172 @@
+# -*- coding: utf-8 -*-
+"""
+MasterSourceAdapter: glue between SpectrumView and Master controller + HackRF QSA backend.
+Starts/stops backend, pushes sweeps to MasterSweepController, emits status to UI.
+"""
+
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, Callable, Dict, Any
+from dataclasses import dataclass
+import logging
 import numpy as np
 from PyQt5 import QtCore
-import logging
 
-from panorama.drivers.base import SourceBackend, SweepConfig
-from panorama.features.master_sweep.master import MasterSweepController
+# наш backend
+from panorama.drivers.hrf_backend import HackRFQSABackend
+# контроллер поиска пиков (совместимый DetectedPeak уже реэкспортирован)
+from panorama.features.spectrum.master import MasterSweepController
 
-logger = logging.getLogger(__name__)
+
+@dataclass
+class SweepConfig:
+    freq_start_hz: int
+    freq_end_hz: int
+    bin_hz: int
+    lna_db: int
+    vga_db: int
+    amp_on: bool
+    serial: Optional[str] = None  # Добавляем серийный номер
+    threshold_dbm: Optional[float] = None
+    peak_span_hz: Optional[float] = None
+    dwell_ms: Optional[int] = None
 
 
-class MasterSourceAdapter(SourceBackend):
-    """
-    Адаптер для использования MasterSweepController как источника данных для спектра.
-    Теперь корректно работает с полным диапазоном спектра.
-    """
-    
-    def __init__(self, master: MasterSweepController):
+class MasterSourceAdapter(QtCore.QObject):
+    # события, которые слушает view
+    status  = QtCore.pyqtSignal(str)
+    error   = QtCore.pyqtSignal(str)
+    started = QtCore.pyqtSignal()
+    stopped = QtCore.pyqtSignal()
+
+    # прокидываем спектр в виджет
+    spectrumReady = QtCore.pyqtSignal(object, object)  # (freqs, dbm)
+
+    # прокидываем пики (старый контракт оркестратора)
+    peak_detected = QtCore.pyqtSignal(object)  # DetectedPeak
+
+    def __init__(self, logger=None):
         super().__init__()
-        self._master = master
-        self._running = False
-        self._config = None
+        # logger может быть None или не логгером - добавляем защиту
+        if logger and hasattr(logger, 'info') and callable(logger.info):
+            self.log = logger
+        else:
+            self.log = None
+        self.backend: Optional[HackRFQSABackend] = None
+        self.master: Optional[MasterSweepController] = None
+        self.running: bool = False
         
-        # Подключаемся к сигналу full_sweep_ready
-        master.full_sweep_ready.connect(self._on_full_sweep)
-        master.sweep_error.connect(self._on_error)
-        master.sweep_progress.connect(self._on_progress)
-        
-        logger.info("[MasterSourceAdapter] Initialized with full spectrum support")
-
-    def start(self, config: SweepConfig):
-        """Запуск источника."""
-        if self._running:
-            logger.warning("[MasterSourceAdapter] Already running")
-            return
-        
+        # Загружаем настройки SDR для получения серийного номера master
         try:
-            self._config = config
-            
-            logger.info(f"[MasterSourceAdapter] Starting sweep: "
-                       f"{config.freq_start_hz/1e6:.1f}-{config.freq_end_hz/1e6:.1f} MHz, "
-                       f"bin: {config.bin_hz/1e3:.1f} kHz")
-            
-            # Запускаем Master sweep с параметрами
-            self._master.start_sweep(
-                start_hz=config.freq_start_hz,
-                stop_hz=config.freq_end_hz,
-                bin_hz=config.bin_hz
-            )
-            
-            self._running = True
-            self.started.emit()
-            self.status.emit("Master sweep running - full spectrum scan")
-            
+            from panorama.features.settings.storage import load_sdr_settings
+            self.sdr_settings = load_sdr_settings()
         except Exception as e:
-            logger.error(f"[MasterSourceAdapter] Error starting sweep: {e}")
-            import traceback
-            logger.error(f"[MasterSourceAdapter] Traceback: {traceback.format_exc()}")
-            self.error.emit(str(e))
+            if self.log:
+                self.log.warning(f"Failed to load SDR settings: {e}")
+            self.sdr_settings = {}
+
+    # совместимость с проверками в UI
+    def is_running(self) -> bool:
+        return self.running
+
+    # --- lifecycle ---
+    def start(self, cfg: SweepConfig) -> bool:
+        try:
+            if self.running:
+                return True
+
+            # backend - серийный номер передается через SweepConfig
+            self.backend = HackRFQSABackend(logger=self.log)
+
+            # master controller (порог по SNR = 10 дБ, окно по умолчанию 5 МГц — корректируется UI через orchestrator)
+            self.master = MasterSweepController(self)
+            # подключения сигналов
+            self.master.spectrumReady.connect(self._on_master_spectrum)
+            self.master.peak_detected.connect(self._on_peak_detected)
+            self.master.status.connect(self._relay_status)
+            self.master.error.connect(self._relay_error)
+
+            # backend callbacks -> обновление master
+            self.backend.fullSweepReady.connect(self._on_full_sweep_from_backend)
+            self.backend.error.connect(self._relay_error)
+            self.backend.started.connect(self._on_backend_started)
+            self.backend.finished.connect(self._on_backend_stopped)
+
+            # запустить железо
+            self.backend.start(
+                cfg,
+                on_full=self._on_full_sweep_from_backend,
+                on_error=self._relay_error,
+                on_status=self._relay_status
+            )
+            self.running = True
+            self.started.emit()
+            self._relay_status("MasterSourceAdapter started")
+            return True
+        except Exception as e:
+            self._relay_error(f"Master start failed: {e}")
+            self.stop()
+            return False
 
     def stop(self):
-        """Остановка источника."""
-        if not self._running:
-            return
-            
         try:
-            self._master.stop_sweep()
-            logger.info("[MasterSourceAdapter] Sweep stopped")
+            if self.backend:
+                self.backend.stop()
+            self.running = False
+            if self.master:
+                self.master.stop()
+            self.stopped.emit()
+            self._relay_status("MasterSourceAdapter stopped")
         except Exception as e:
-            logger.error(f"[MasterSourceAdapter] Error stopping sweep: {e}")
-            
-        self._running = False
-        self.finished.emit(0)
+            self._relay_error(f"Master stop error: {e}")
 
-    def is_running(self) -> bool:
-        """Проверка состояния."""
-        return self._running
-
+    # --- internal wiring ---
     @QtCore.pyqtSlot(object, object)
-    def _on_full_sweep(self, freqs_hz, power_dbm):
-        """
-        Обрабатываем полный спектр.
-        Фильтруем только нужный диапазон если конфигурация задает подмножество.
-        """
-        try:
-            # Преобразуем в numpy массивы если нужно
-            if not isinstance(freqs_hz, np.ndarray):
-                freqs_hz = np.array(freqs_hz, dtype=np.float64)
-            if not isinstance(power_dbm, np.ndarray):
-                power_dbm = np.array(power_dbm, dtype=np.float32)
-            
-            # Если есть конфигурация с ограниченным диапазоном - фильтруем
-            if self._config:
-                f_start = self._config.freq_start_hz
-                f_stop = self._config.freq_end_hz
-                
-                # Находим индексы в пределах нужного диапазона
-                mask = (freqs_hz >= f_start) & (freqs_hz <= f_stop)
-                
-                if np.any(mask):
-                    freqs_hz = freqs_hz[mask]
-                    power_dbm = power_dbm[mask]
-                    
-                    logger.debug(f"[MasterSourceAdapter] Filtered spectrum: "
-                               f"{len(freqs_hz)} points in range "
-                               f"{f_start/1e6:.1f}-{f_stop/1e6:.1f} MHz")
-            
-            # Проверяем валидность данных
-            if len(freqs_hz) == 0 or len(power_dbm) == 0:
-                logger.warning("[MasterSourceAdapter] Empty spectrum after filtering")
-                return
-            
-            # Эмитим для спектра
-            self.fullSweepReady.emit(freqs_hz, power_dbm)
-            
-            # Логируем только каждый 10-й sweep для уменьшения спама
-            if not hasattr(self, '_emit_count'):
-                self._emit_count = 0
-            self._emit_count += 1
-            
-            if self._emit_count % 10 == 0:
-                logger.info(f"[MasterSourceAdapter] Emitted sweep #{self._emit_count}: "
-                           f"{len(freqs_hz)} points, "
-                           f"range={freqs_hz[0]/1e6:.1f}-{freqs_hz[-1]/1e6:.1f} MHz, "
-                           f"power={power_dbm.min():.1f} to {power_dbm.max():.1f} dBm")
-            
-        except Exception as e:
-            logger.error(f"[MasterSourceAdapter] Error processing full sweep: {e}")
-            import traceback
-            logger.error(f"[MasterSourceAdapter] Traceback: {traceback.format_exc()}")
-            self.error.emit(f"Full sweep processing error: {e}")
+    def _on_full_sweep_from_backend(self, freqs: np.ndarray, dbm: np.ndarray):
+        # прокидываем в Master для детекции пиков + в UI
+        print(f"[MasterSourceAdapter] Received full sweep from backend: freqs={freqs.size}, dbm={dbm.size}")
+        print(f"[MasterSourceAdapter] Emitting spectrumReady signal...")
+        
+        if self.master:
+            self.master.last_freqs = freqs
+            self.master.last_spectrum = dbm
+            # Master сам триггерит детекцию по таймеру; но разок дадим сразу
+            self.master.spectrumReady.emit(freqs, dbm)
+        
+        self.spectrumReady.emit(freqs, dbm)
+        print(f"[MasterSourceAdapter] spectrumReady signal emitted")
 
-    @QtCore.pyqtSlot(float)
-    def _on_progress(self, coverage: float):
-        """Обработка прогресса покрытия спектра."""
-        self.status.emit(f"Spectrum coverage: {coverage:.1f}%")
+    @QtCore.pyqtSlot(object)
+    def _on_master_spectrum(self, freqs: np.ndarray, dbm: np.ndarray):
+        # дублирующая прослойка на будущее
+        self.spectrumReady.emit(freqs, dbm)
 
-    @QtCore.pyqtSlot(str)
-    def _on_error(self, msg: str):
-        """Обработка ошибок."""
-        logger.error(f"[MasterSourceAdapter] Master error: {msg}")
+    @QtCore.pyqtSlot(object)
+    def _on_peak_detected(self, peak_obj):
+        # Прокинуть в оркестратор по старому контракту
+        self.peak_detected.emit(peak_obj)
+
+    def _on_backend_started(self):
+        if self.master:
+            self.master.start()
+        self._relay_status("HackRF backend created")
+
+    def _on_backend_stopped(self):
+        self._relay_status("HackRF backend stopped")
+
+    def _relay_status(self, msg: str):
+        # Проверяем, что self.log - это действительно логгер, а не Qt сигнал
+        if self.log and hasattr(self.log, 'info') and callable(self.log.info):
+            try:
+                self.log.info(f"[Spectrum] status: {msg}")
+            except Exception:
+                pass  # Игнорируем ошибки логирования
+        self.status.emit(msg)
+
+    def _relay_error(self, msg: str):
+        # Проверяем, что self.log - это действительно логгер, а не Qt сигнал
+        if self.log and hasattr(self.log, 'error') and callable(self.log.error):
+            try:
+                self.log.error(f"[Spectrum] ERROR: {msg}")
+            except Exception:
+                pass  # Игнорируем ошибки логирования
         self.error.emit(msg)

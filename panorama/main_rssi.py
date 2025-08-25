@@ -405,11 +405,11 @@ class RSSIPanoramaMainWindow(QMainWindow):
         tab_widget.addTab(self.map_view, "Карта")
         
         # Вкладка спектра
-        self.spectrum_view = SpectrumView()
+        self.spectrum_view = SpectrumView(orchestrator=self.orchestrator)
         # Привязываем источник к мастеру через адаптер, чтобы старт сразу запускал C-свип
         try:
             if self.master_controller:
-                self.spectrum_view.set_source(MasterSourceAdapter(self.master_controller))
+                self.spectrum_view.set_source(MasterSourceAdapter(self.log))
         except Exception:
             pass
         tab_widget.addTab(self.spectrum_view, "Спектр")
