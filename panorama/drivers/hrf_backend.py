@@ -24,6 +24,33 @@ def _qt_parent(parent):
 def _load_lib():
     ffi = FFI()
     ffi.cdef(r"""
+        // Константы для многосекционного режима
+        #define MAX_SEGMENTS 4
+        #define SEGMENT_A 0
+        #define SEGMENT_B 1
+        #define SEGMENT_C 2
+        #define SEGMENT_D 3
+
+        // Структура для передачи данных сегмента
+        typedef struct {
+            double* freqs_hz;
+            float*  data_dbm;
+            int     count;
+            int     segment_id;
+            uint64_t hz_low;
+            uint64_t hz_high;
+        } hq_segment_data_t;
+
+        // Новый колбэк для многосекционного режима
+        typedef void (*hq_multi_segment_cb)(
+            const hq_segment_data_t* segments,
+            int                       segment_count,
+            double                    fft_bin_width_hz,
+            uint64_t                  center_hz,
+            void*                     user
+        );
+
+        // Устаревший колбэк для обратной совместимости
         typedef void (*hq_segment_cb)(
             const double* freqs_hz,
             const float*  data_dbm,
@@ -39,8 +66,20 @@ def _load_lib():
         int  hq_configure(double f_start_mhz, double f_stop_mhz, double bin_hz,
                           int lna_db, int vga_db, int amp_on);
 
+        // Новые функции для многосекционного режима
+        int  hq_start_multi_segment(hq_multi_segment_cb cb, void* user);
         int  hq_start(hq_segment_cb cb, void* user);
+
         int  hq_stop(void);
+
+        // Функции калибровки
+        int  hq_load_calibration(const char* csv_path);
+        int  hq_enable_calibration(int enable);
+        int  hq_get_calibration_status(void);
+
+        // Функции для настройки режима
+        int  hq_set_segment_mode(int mode);
+        int  hq_get_segment_mode(void);
 
         const char* hq_last_error(void);
 
@@ -158,6 +197,66 @@ class HackRFQSABackend(SourceBackend):
     def enumerate_devices() -> list[str]:
         return _list_serials_via_lib()
 
+    def load_calibration(self, csv_path: str) -> bool:
+        """Загружает калибровочный профиль из CSV файла."""
+        try:
+            result = self._lib.hq_load_calibration(csv_path.encode('utf-8'))
+            if result == 0:
+                print(f"[HackRF] Калибровка загружена из {csv_path}")
+                return True
+            else:
+                error = self._ffi.string(self._lib.hq_last_error()).decode(errors="ignore")
+                print(f"[HackRF] Ошибка загрузки калибровки: {error}")
+                return False
+        except Exception as e:
+            print(f"[HackRF] Исключение при загрузке калибровки: {e}")
+            return False
+
+    def enable_calibration(self, enable: bool) -> bool:
+        """Включает или выключает калибровку."""
+        try:
+            result = self._lib.hq_enable_calibration(1 if enable else 0)
+            if result == 0:
+                status = "включена" if enable else "выключена"
+                print(f"[HackRF] Калибровка {status}")
+                return True
+            else:
+                error = self._ffi.string(self._lib.hq_last_error()).decode(errors="ignore")
+                print(f"[HackRF] Ошибка настройки калибровки: {error}")
+                return False
+        except Exception as e:
+            print(f"[HackRF] Исключение при настройке калибровки: {e}")
+            return False
+
+    def get_calibration_status(self) -> bool:
+        """Возвращает статус калибровки."""
+        try:
+            return bool(self._lib.hq_get_calibration_status())
+        except Exception:
+            return False
+
+    def set_segment_mode(self, mode: int) -> bool:
+        """Устанавливает режим сегментов (только 4)."""
+        try:
+            result = self._lib.hq_set_segment_mode(mode)
+            if result == 0:
+                print(f"[HackRF] Режим сегментов установлен: {mode}")
+                return True
+            else:
+                error = self._ffi.string(self._lib.hq_last_error()).decode(errors="ignore")
+                print(f"[HackRF] Ошибка установки режима сегментов: {error}")
+                return False
+        except Exception as e:
+            print(f"[HackRF] Исключение при установке режима сегментов: {e}")
+            return False
+
+    def get_segment_mode(self) -> int:
+        """Возвращает текущий режим сегментов."""
+        try:
+            return int(self._lib.hq_get_segment_mode())
+        except Exception:
+            return 4  # по умолчанию
+
 
 class _Worker(QtCore.QThread):
     finished_sig = QtCore.pyqtSignal(int, str)
@@ -173,8 +272,43 @@ class _Worker(QtCore.QThread):
         self._assembler = assembler
         self._stop = threading.Event()
 
+        # Колбэк для многосекционного режима
+        @ffi.callback("void(const hq_segment_data_t*,int,double,uint64_t,void*)")
+        def _multi_cb(segments_ptr, segment_count, bin_w, center_hz, user):
+            if self._stop.is_set():
+                return
+            try:
+                # Обрабатываем каждый сегмент
+                for i in range(segment_count):
+                    segment = segments_ptr[i]
+                    freqs = np.frombuffer(ffi.buffer(segment.freqs_hz, segment.count*8),
+                                          dtype=np.float64, count=segment.count).copy()
+                    power = np.frombuffer(ffi.buffer(segment.data_dbm, segment.count*4),
+                                          dtype=np.float32, count=segment.count).copy()
+                    
+                    print(f"[HackRF Worker] Segment {segment.segment_id}: {segment.count} bins, "
+                          f"freq_range=[{segment.hz_low/1e6:.1f}, {segment.hz_high/1e6:.1f}] MHz")
+                    
+                    row, coverage = self._assembler.feed({
+                        "freqs_hz": freqs,
+                        "data_dbm": power,
+                        "hz_low": float(segment.hz_low),
+                    })
+                    
+                    if row is not None:
+                        print(f"[HackRF Worker] Assembler returned row: size={row.size}, coverage={coverage:.3f}")
+                        freqs = self._assembler.freq_grid()
+                        print(f"[HackRF Worker] Freq grid: size={freqs.size}, range=[{freqs[0]/1e6:.1f}, {freqs[-1]/1e6:.1f}] MHz")
+                        self._backend.fullSweepReady.emit(freqs, row)
+                        self._backend.status.emit(f"Spectrum coverage: {coverage*100:.1f}%")
+                        print(f"[HackRF Worker] fullSweepReady signal emitted")
+                        
+            except Exception as e:
+                self._backend.error.emit(f"backend callback error: {e}")
+
+        # Колбэк для обратной совместимости
         @ffi.callback("void(const double*,const float*,int,double,uint64_t,uint64_t,void*)")
-        def _cb(freqs_ptr, pwr_ptr, n_bins, bin_w, low, high, user):
+        def _legacy_cb(freqs_ptr, pwr_ptr, n_bins, bin_w, low, high, user):
             if self._stop.is_set():
                 return
             try:
@@ -197,7 +331,8 @@ class _Worker(QtCore.QThread):
             except Exception as e:
                 self._backend.error.emit(f"backend callback error: {e}")
 
-        self._cb = _cb
+        self._multi_cb = _multi_cb
+        self._legacy_cb = _legacy_cb
 
     def run(self):
         code, msg = 0, ""
@@ -218,9 +353,10 @@ class _Worker(QtCore.QThread):
                 err = self._ffi.string(self._lib.hq_last_error()).decode(errors="ignore") if hasattr(self._lib, "hq_last_error") else "hq_configure failed"
                 raise RuntimeError(err or "hq_configure failed")
 
-            if self._lib.hq_start(self._cb, self._ffi.NULL) != 0:
-                err = self._ffi.string(self._lib.hq_last_error()).decode(errors="ignore") if hasattr(self._lib, "hq_last_error") else "hq_start failed"
-                raise RuntimeError(err or "hq_start failed")
+            # Используем новый многосекционный API
+            if self._lib.hq_start_multi_segment(self._multi_cb, self._ffi.NULL) != 0:
+                err = self._ffi.string(self._lib.hq_last_error()).decode(errors="ignore") if hasattr(self._lib, "hq_last_error") else "hq_start_multi_segment failed"
+                raise RuntimeError(err or "hq_start_multi_segment failed")
 
             while not self._stop.is_set():
                 self.msleep(20)

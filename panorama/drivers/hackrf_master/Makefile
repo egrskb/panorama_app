@@ -1,111 +1,111 @@
-# Makefile для HackRF QSA библиотеки
-# Сборка C библиотеки для Python CFFI
+# Makefile для hackrf_master библиотеки
+# Сборка C-библиотеки для Panorama
 
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -fPIC -std=c99
-LDFLAGS = -shared -lhackrf -lpthread -lm -lfftw3f
+LDFLAGS = -shared
+LIBS = -lhackrf -lfftw3f -lm
 
-# Директории
-SRC_DIR = .
-BUILD_DIR = build
-INSTALL_DIR = /usr/local/lib
-
-# Исходные файлы
-SOURCES = hackrf_master.c
-OBJECTS = $(SOURCES:%.c=$(BUILD_DIR)/%.o)
-
-# Целевые файлы
 TARGET = libhackrf_qsa.so
-TARGET_DEBUG = libhackrf_qsa_debug.so
+SOURCE = hackrf_master.c
+HEADER = hackrf_master.h
+OBJECT = hackrf_master.o
 
-# Проверяем наличие зависимостей
-HACKRF_CHECK := $(shell pkg-config --exists libhackrf && echo "yes" || echo "no")
-FFTW3_CHECK := $(shell pkg-config --exists fftw3f && echo "yes" || echo "no")
+# Пути установки
+PREFIX = /usr/local
+LIBDIR = $(PREFIX)/lib
+INCDIR = $(PREFIX)/include
 
-.PHONY: all clean install debug check-deps
+# Цели по умолчанию
+all: $(TARGET)
 
-all: check-deps $(BUILD_DIR)/$(TARGET)
+# Основная библиотека
+$(TARGET): $(OBJECT)
+	$(CC) $(LDFLAGS) -o $@ $< $(LIBS)
 
-debug: CFLAGS += -g -DDEBUG
-debug: $(BUILD_DIR)/$(TARGET_DEBUG)
-
-check-deps:
-ifeq ($(HACKRF_CHECK),no)
-	@echo "ОШИБКА: libhackrf не найден!"
-	@echo "Установите libhackrf-dev: sudo apt-get install libhackrf-dev"
-	@exit 1
-else
-	@echo "✓ libhackrf найден"
-	@echo "Версия: $(shell pkg-config --modversion libhackrf)"
-endif
-
-ifeq ($(FFTW3_CHECK),no)
-	@echo "ОШИБКА: FFTW3 не найден!"
-	@echo "Установите libfftw3-dev: sudo apt-get install libfftw3-dev"
-	@exit 1
-else
-	@echo "✓ FFTW3 найден"
-	@echo "Версия: $(shell pkg-config --modversion fftw3f)"
-endif
-
-$(BUILD_DIR):
-	mkdir -p $(BUILD_DIR)
-
-$(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
+# Объектный файл
+$(OBJECT): $(SOURCE) $(HEADER)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/$(TARGET): $(OBJECTS)
-	$(CC) $(OBJECTS) -o $@ $(LDFLAGS)
-	@echo "✓ Собрана библиотека: $@"
+# Установка
+install: $(TARGET)
+	install -d $(LIBDIR)
+	install -m 755 $(TARGET) $(LIBDIR)
+	install -d $(INCDIR)
+	install -m 644 $(HEADER) $(INCDIR)
+	ldconfig
 
-$(BUILD_DIR)/$(TARGET_DEBUG): $(OBJECTS)
-	$(CC) $(OBJECTS) -o $@ $(LDFLAGS)
-	@echo "✓ Собрана отладочная библиотека: $@"
+# Установка в пользовательскую директорию
+install-user: $(TARGET)
+	install -d $(HOME)/.local/lib
+	install -m 755 $(TARGET) $(HOME)/.local/lib
+	install -d $(HOME)/.local/include
+	install -m 644 $(HEADER) $(HOME)/.local/include
 
-install: $(BUILD_DIR)/$(TARGET)
-	sudo cp $(BUILD_DIR)/$(TARGET) $(INSTALL_DIR)/
-	sudo ldconfig
-	@echo "✓ Библиотека установлена в $(INSTALL_DIR)"
-
-uninstall:
-	sudo rm -f $(INSTALL_DIR)/$(TARGET)
-	sudo ldconfig
-	@echo "✓ Библиотека удалена"
-
+# Очистка
 clean:
-	rm -rf $(BUILD_DIR)
-	@echo "✓ Очищены файлы сборки"
+	rm -f $(OBJECT) $(TARGET)
 
-# Тестирование
-test: $(BUILD_DIR)/$(TARGET)
-	@echo "Запуск тестов..."
-	@echo "TODO: Добавить unit тесты"
+# Полная очистка
+distclean: clean
+	rm -f *.o *.so *.a
 
 # Проверка зависимостей
-deps:
-	@echo "Проверка зависимостей:"
-	@echo "  - libhackrf: $(HACKRF_CHECK)"
-	@echo "  - FFTW3: $(FFTW3_CHECK)"
-	@echo "  - pthread: $(shell pkg-config --exists libpthread && echo "yes" || echo "no")"
-	@echo "  - math: $(shell pkg-config --exists libm && echo "yes" || echo "no")"
+check-deps:
+	@echo "Проверка зависимостей..."
+	@pkg-config --exists libhackrf && echo "✓ libhackrf найдена" || echo "✗ libhackrf не найдена"
+	@pkg-config --exists fftw3 && echo "✓ fftw3 найдена" || echo "✗ fftw3 не найдена"
+	@echo "Проверка заголовочных файлов..."
+	@test -f /usr/include/hackrf.h && echo "✓ hackrf.h найден" || echo "✗ hackrf.h не найден"
+	@test -f /usr/include/fftw3.h && echo "✓ fftw3.h найден" || echo "✗ fftw3.h не найден"
+
+# Установка зависимостей (Ubuntu/Debian)
+install-deps:
+	@echo "Установка зависимостей..."
+	sudo apt-get update
+	sudo apt-get install -y build-essential pkg-config
+	sudo apt-get install -y libhackrf-dev libfftw3-dev
+
+# Тестирование
+test: $(TARGET)
+	@echo "Тестирование библиотеки..."
+	@echo "✓ Библиотека собрана: $(TARGET)"
+	@echo "✓ Размер: $(shell ls -lh $(TARGET) | awk '{print $$5}')"
+	@echo "✓ Зависимости:"
+	@ldd $(TARGET) | grep -E "(hackrf|fftw3)"
 
 # Информация о системе
 info:
-	@echo "Информация о системе:"
-	@echo "  - Компилятор: $(CC)"
-	@echo "  - Флаги: $(CFLAGS)"
-	@echo "  - Целевая архитектура: $(shell uname -m)"
-	@echo "  - ОС: $(shell uname -s) $(shell uname -r)"
+	@echo "=== Информация о системе ==="
+	@echo "Компилятор: $(CC)"
+	@echo "Версия GCC: $(shell $(CC) --version | head -1)"
+	@echo "Архитектура: $(shell uname -m)"
+	@echo "ОС: $(shell uname -s) $(shell uname -r)"
+	@echo "Python: $(shell python3 --version 2>/dev/null || echo "не найден")"
+	@echo "CFFI: $(shell python3 -c "import cffi; print(cffi.__version__)" 2>/dev/null || echo "не найден")"
 
 # Помощь
 help:
 	@echo "Доступные цели:"
-	@echo "  all        - Собрать библиотеку (по умолчанию)"
-	@echo "  debug      - Собрать отладочную версию"
-	@echo "  install    - Установить библиотеку"
-	@echo "  uninstall  - Удалить библиотеку"
-	@echo "  clean      - Очистить файлы сборки"
-	@echo "  test       - Запустить тесты"
-	@echo "  deps       - Проверить зависимости"
-	@echo "  info       - Информация о системе"
-	@echo "  help       - Показать эту справку"
+	@echo "  all          - собрать библиотеку (по умолчанию)"
+	@echo "  install      - установить в систему (требует sudo)"
+	@echo "  install-user - установить в пользовательскую директорию"
+	@echo "  clean        - удалить объектные файлы"
+	@echo "  distclean    - полная очистка"
+	@echo "  check-deps   - проверить зависимости"
+	@echo "  install-deps - установить зависимости (Ubuntu/Debian)"
+	@echo "  test         - протестировать сборку"
+	@echo "  info         - информация о системе"
+	@echo "  help         - показать эту справку"
+
+# Файлы для отслеживания
+.PHONY: all install install-user clean distclean check-deps install-deps test info help
+
+# Правила для автоматических зависимостей
+-include $(OBJECT:.o=.d)
+
+%.d: %.c
+	@set -e; rm -f $@; \
+	$(CC) -MM $(CFLAGS) $< > $@.$$$$; \
+	sed 's,\($*\)\.o[ :]*,\1.o $@ : ,g' < $@.$$$$ > $@; \
+	rm -f $@.$$$$

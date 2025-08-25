@@ -1,170 +1,265 @@
-# HackRF QSA Library
+# HackRF Master Driver для Panorama
 
-Библиотека для работы с HackRF через Python CFFI с улучшенным покрытием спектра.
+## Обзор
 
-## Новые возможности
+`hackrf_master` - это C-библиотека и Python-обвязка для работы с HackRF One в режиме панорамного свипа. Библиотека обеспечивает:
 
-- **4 квартальных сегмента** для полного покрытия частотного диапазона
-- **Модульная индексация FFT** для устранения "дырок" в данных
-- **Поддержка калибровки** из CSV файлов
-- **Оптимизированный сборщик** для стабильной работы
-- **Встроенные FFI определения** - без генерации кода
+- **Многосекционный режим**: 2 или 4 сегмента за проход для полного покрытия спектра
+- **Нормализация мощности**: корректный перевод dBFS в dBm с учетом потерь окна и ENBW
+- **Калибровка**: загрузка и применение калибровочных профилей
+- **Высокое качество**: интерполяция для устранения ступенчатости
 
-## Зависимости
+## Архитектура
 
-```bash
-# Системные зависимости
-sudo apt-get install build-essential pkg-config
+### Многосекционный режим
 
-# HackRF
-sudo apt-get install libhackrf-dev
+Вместо передачи только 1/4 окна FFT, библиотека теперь передает 2 или 4 сегмента:
 
-# FFTW3 (для FFT операций)
-sudo apt-get install libfftw3-dev
-
-# Python зависимости
-pip3 install cffi
-```
-
-## Сборка
-
-### Автоматическая сборка
-
-```bash
-# Из корня проекта
-./build_hackrf_master.sh
-```
-
-### Ручная сборка
-
-```bash
-cd panorama/drivers/hackrf_master
-
-# Очистка
-make clean
-
-# Сборка
-make all
-```
-
-**Примечание:** Python интерфейс уже встроен в `panorama/drivers/hrf_backend.py` и не требует генерации.
-
-## Использование
-
-```python
-from panorama.drivers.hrf_backend import HackRFQSABackend
-
-# Создание экземпляра
-hackrf = HackRFQSABackend()
-
-# Открытие устройства
-if hackrf.open():
-    print("Устройство открыто")
-    
-    # Конфигурация
-    hackrf.configure(
-        f_start_mhz=24.0,    # 24 МГц
-        f_stop_mhz=6000.0,   # 6 ГГц
-        bin_hz=200000.0,     # 200 кГц
-        lna_db=24,           # LNA усиление
-        vga_db=20,           # VGA усиление
-        amp_enable=False     # Усилитель выключен
-    )
-    
-    # Callback для получения данных
-    def on_segment(freqs, data, count, bin_width, hz_low, hz_high):
-        print(f"Сегмент: {len(freqs)} точек, диапазон {hz_low/1e6:.1f}-{hz_high/1e6:.1f} МГц")
-    
-    hackrf.set_segment_callback(on_segment)
-    
-    # Запуск sweep
-    if hackrf.start():
-        print("Sweep запущен")
-        
-        # Ожидание...
-        import time
-        time.sleep(10)
-        
-        # Остановка
-        hackrf.stop()
-    
-    # Закрытие
-    hackrf.close()
-```
-
-## Архитектура сегментов
-
-Библиотека эмитит 4 квартальных сегмента для каждого sweep:
-
-- **Сегмент A:** `[f, f+Fs/4]` - бины `1+(5/8*N)` до `1+(5/8*N)+q-1`
-- **Сегмент C:** `[f+Fs/4, f+Fs/2]` - бины `(1+(7/8*N)+i) % N` 
-- **Сегмент B:** `[f+Fs/2, f+3/4*Fs]` - бины `1+(1/8*N)` до `1+(1/8*N)+q-1`
-- **Сегмент D:** `[f+3/4*Fs, f+Fs]` - бины `(1+(3/8*N)+i) % N`
+#### 4-сегментный режим (по умолчанию)
+- **Сегмент A**: `[f-OFFSET, f-OFFSET+Fs/4]`
+- **Сегмент C**: `[f+OFFSET+Fs/4, f+OFFSET+Fs/2]`
+- **Сегмент B**: `[f+OFFSET+Fs/2, f+OFFSET+3Fs/4]`
+- **Сегмент D**: `[f+OFFSET+3Fs/4, f+OFFSET+Fs]`
 
 Где:
-- `f` - центральная частота sweep
-- `Fs` - частота дискретизации (20 МГц)
-- `N` - размер FFT
-- `q` - размер сегмента (N/4)
+- `f` - центральная частота свипа
+- `OFFSET` = 7.5 МГц (смещение LO)
+- `Fs` = 20 МГц (частота дискретизации)
+
+### Нормализация мощности
+
+Библиотека применяет следующие поправки:
+
+1. **Нормализация FFT**: `1/N` для каждого комплексного отсчета
+2. **Потери окна**: -1.76 dB для окна Хэмминга
+3. **ENBW коррекция**: +1.85 dB для эквивалентной ширины полосы
+4. **Калибровочная поправка**: из загруженного CSV профиля
+
+Итоговая формула:
+```
+power_dbm = power_dbfs + window_loss_db + enbw_corr_db + calibration_offset_db
+```
+
+## API
+
+### C API
+
+#### Инициализация
+```c
+int hq_open(const char* serial_suffix);
+int hq_configure(double f_start_mhz, double f_stop_mhz, double bin_hz,
+                 int lna_db, int vga_db, int amp_on);
+```
+
+#### Многосекционный режим
+```c
+int hq_start_multi_segment(hq_multi_segment_cb cb, void* user);
+int hq_set_segment_mode(int mode);  // 2 или 4
+int hq_get_segment_mode(void);
+```
+
+#### Калибровка
+```c
+int hq_load_calibration(const char* csv_path);
+int hq_enable_calibration(int enable);
+int hq_get_calibration_status(void);
+```
+
+#### Управление
+```c
+int hq_stop(void);
+void hq_close(void);
+const char* hq_last_error(void);
+```
+
+### Python API
+
+#### Основные методы
+```python
+backend = HackRFQSABackend(serial_suffix="c483")
+backend.start(config)
+backend.stop()
+```
+
+#### Калибровка
+```python
+# Загрузка калибровочного профиля
+backend.load_calibration("calibration.csv")
+
+# Включение/выключение калибровки
+backend.enable_calibration(True)
+
+# Проверка статуса
+status = backend.get_calibration_status()
+```
+
+#### Настройка режима
+```python
+# Установка 4-сегментного режима (по умолчанию)
+backend.set_segment_mode(4)
+
+# Получение текущего режима
+mode = backend.get_segment_mode()
+```
 
 ## Калибровка
 
-```python
-# Загрузка калибровки из CSV
-hackrf.load_calibration("calibration.csv")
+### Формат CSV файла
 
-# Включение калибровки
-hackrf.enable_calibration(True)
+Файл должен содержать заголовок и столбцы в указанном порядке:
 
-# Проверка статуса
-if hackrf.is_calibration_loaded():
-    print("Калибровка загружена")
+```csv
+freq_mhz,lna,vga,amp,offset_db
+100,24,20,1,-4.2
+500,24,20,1,-5.0
+1000,24,20,1,-5.2
+...
 ```
 
-Формат CSV файла: `freq_mhz,lna,vga,amp,offset_db`
+Где:
+- `freq_mhz` - центральная частота в МГц
+- `lna` - уровень предусилителя (0..40 дБ)
+- `vga` - уровень усилителя (0..62 дБ)
+- `amp` - бит включения усилителя (1 = включен, 0 = выключен)
+- `offset_db` - поправка для перевода dBFS в dBm
 
-## Структура файлов
+### Процедура калибровки
 
-```
-panorama/drivers/
-├── hrf_backend.py              # Основной Python backend
-└── hackrf_master/
-    ├── hackrf_master.c         # C исходный код
-    ├── hackrf_master.h         # C заголовочный файл
-    ├── Makefile                # Сборка C библиотеки
-    ├── build/                  # Скомпилированные файлы
-    │   └── libhackrf_qsa.so   # C библиотека
-    └── README.md               # Этот файл
-```
+#### Лабораторные условия
 
-## Устранение неполадок
+1. Подключите выход генератора сигналов напрямую к входу HackRF
+2. Задайте частоту (например, 100 МГц, 500 МГц, 1 ГГц)
+3. Установите уровень мощности (измеренный калиброванным анализатором)
+4. Запишите полученный уровень в приложении
+5. Повторите для комбинаций LNA/VGA/AMP
+6. Вычислите разницу между эталонным и измеренным уровнем
+7. Запишите данные в CSV
 
-### Ошибка "Could not load libhackrf_qsa.so"
-- Убедитесь что библиотека собрана: `make all`
-- Проверьте зависимости: `make deps`
+#### Полевые условия
 
-### Ошибка FFTW3
-- Установите: `sudo apt-get install libfftw3-dev`
+1. Используйте генератор или известный источник (радиостанция, навигационный передатчик)
+2. Сравните с эталонным анализатором
+3. Запишите поправки в CSV
 
-### Ошибка libhackrf
-- Установите: `sudo apt-get install libhackrf-dev`
+### Пример калибровочного файла
 
-## Тестирование
+См. `calibration_example.csv` в корне проекта.
+
+## Сборка
+
+### Требования
+
+- libhackrf-dev
+- libfftw3-dev
+- gcc/clang
+- make
+
+### Компиляция
 
 ```bash
-# Запуск тестов
-make test
-
-# Проверка зависимостей
-make deps
-
-# Информация о системе
-make info
+cd panorama/drivers/hackrf_master
+make
 ```
 
-## Преимущества новой архитектуры
+### Установка
 
-1. **Упрощенная сборка** - нет генерации Python кода
-2. **Лучшая производительность** - FFI определения встроены
-3. **Проще отладка** - весь код в одном месте
-4. **Меньше файлов** - проще поддерживать
+```bash
+sudo make install
+```
+
+## Использование
+
+### Базовый пример
+
+```python
+from panorama.drivers.hrf_backend import HackRFQSABackend
+from panorama.drivers.base import SweepConfig
+
+# Создание конфигурации
+config = SweepConfig(
+    freq_start_hz=50e6,      # 50 МГц
+    freq_end_hz=6000e6,      # 6 ГГц
+    bin_hz=800e3,            # 800 кГц
+    lna_db=24,
+    vga_db=20,
+    amp_on=False
+)
+
+# Создание и запуск бэкенда
+backend = HackRFQSABackend(serial_suffix="c483")
+
+# Загрузка калибровки
+backend.load_calibration("calibration.csv")
+backend.enable_calibration(True)
+
+# Установка 4-сегментного режима
+backend.set_segment_mode(4)
+
+# Запуск
+backend.start(config)
+```
+
+### Обработка данных
+
+```python
+def on_full_sweep(freqs, power):
+    print(f"Получен спектр: {len(freqs)} точек")
+    print(f"Диапазон: {freqs[0]/1e6:.1f} - {freqs[-1]/1e6:.1f} МГц")
+    print(f"Мощность: {power.min():.1f} - {power.max():.1f} dBm")
+
+backend.fullSweepReady.connect(on_full_sweep)
+```
+
+## Производительность
+
+### Покрытие спектра
+
+- **4 сегмента**: покрытие 20 МГц за проход
+- **Порог покрытия**: настраивается через `coverage_threshold`
+
+### Время прохода
+
+- Зависит от ширины бина и диапазона частот
+- При bin = 800 кГц: ~0.3-0.4 секунды на проход
+- При bin = 200 кГц: ~1.2-1.6 секунды на проход
+
+## Отладка
+
+### Логирование
+
+Библиотека выводит подробные логи:
+
+```
+[DEBUG] Loaded config: {...}
+[SweepAssembler] Configured: 50.0-6000.0 MHz, 7438 bins
+[HackRF Worker] Segment 0: 2048 bins, freq_range=[42.5, 47.5] MHz
+[HackRF Worker] Segment 1: 2048 bins, freq_range=[67.5, 72.5] MHz
+```
+
+### Ошибки
+
+Используйте `hq_last_error()` для получения описания ошибок:
+
+```c
+if (hq_open("c483") != 0) {
+    printf("Ошибка: %s\n", hq_last_error());
+}
+```
+
+## Совместимость
+
+### Обратная совместимость
+
+Старый API `hq_start()` продолжает работать, но использует только 1/4 окна FFT.
+
+### Миграция
+
+Для перехода на новый API:
+
+1. Замените `hq_start()` на `hq_start_multi_segment()`
+2. Обновите колбэк для работы с `hq_segment_data_t`
+3. Настройте режим сегментов через `hq_set_segment_mode()`
+
+## Лицензия
+
+См. LICENSE файл в корне проекта.
