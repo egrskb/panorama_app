@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Optional, Deque, Dict, Tuple, Any
 from collections import deque
 import time, json, os
+from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
@@ -194,6 +195,7 @@ class SpectrumView(QtWidgets.QWidget):
         
         # Загружаем настройки сглаживания из файла
         self._load_smoothing_settings()
+        self._load_calibration_if_available()
 
     # ----- правая панель -----
     def _build_right_panel(self) -> QtWidgets.QWidget:
@@ -390,6 +392,9 @@ class SpectrumView(QtWidgets.QWidget):
         self._source.error.connect(self._on_error)
         self._source.started.connect(self._on_started)
         self._source.finished.connect(self._on_finished)
+        
+        # Загружаем калибровку для нового источника
+        self._load_calibration_if_available()
 
     def _check_sdr_master_configured(self) -> bool:
         """Проверяет, что SDR master настроен в sdr_settings.json."""
@@ -693,6 +698,48 @@ class SpectrumView(QtWidgets.QWidget):
             
         except Exception as e:
             print(f"[SpectrumView] Ошибка загрузки настроек сглаживания: {e}")
+
+    def _load_calibration_if_available(self):
+        """Автоматически загружает калибровку, если доступна."""
+        if not self._source:
+            return
+            
+        try:
+            # Ищем файл калибровки в стандартных местах
+            calibration_paths = [
+                Path.home() / ".panorama" / "calibration.csv",
+                Path.home() / ".panorama" / "hackrf_cal.csv",
+                Path.cwd() / "calibration.csv",
+                Path.cwd() / "hackrf_cal.csv",
+                Path(__file__).parent.parent.parent / "drivers" / "hackrf_master" / "calibration_example.csv"
+            ]
+            
+            for cal_path in calibration_paths:
+                if cal_path.exists():
+                    print(f"[SpectrumView] Найден файл калибровки: {cal_path}")
+                    
+                    # Пытаемся загрузить калибровку
+                    if hasattr(self._source, 'load_calibration'):
+                        if self._source.load_calibration(str(cal_path)):
+                            print(f"[SpectrumView] Калибровка успешно загружена из {cal_path}")
+                            
+                            # Включаем калибровку
+                            if hasattr(self._source, 'enable_calibration'):
+                                if self._source.enable_calibration(True):
+                                    print("[SpectrumView] Калибровка включена")
+                                else:
+                                    print("[SpectrumView] Ошибка включения калибровки")
+                            break
+                        else:
+                            print(f"[SpectrumView] Ошибка загрузки калибровки из {cal_path}")
+                    else:
+                        print(f"[SpectrumView] Источник не поддерживает калибровку")
+                        break
+            else:
+                print("[SpectrumView] Файл калибровки не найден, используем значения по умолчанию")
+                
+        except Exception as e:
+            print(f"[SpectrumView] Ошибка при загрузке калибровки: {e}")
 
     def _save_smoothing_settings(self):
         """Сохраняет настройки сглаживания в файл детектора."""

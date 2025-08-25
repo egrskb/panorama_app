@@ -147,7 +147,7 @@ class SweepAssembler:
     def _interpolate_row(self) -> np.ndarray:
         """
         Интерполирует пропуски в строке спектра для устранения ступенчатости.
-        Использует линейную интерполяцию между известными точками.
+        Использует улучшенную интерполяцию с учетом соседних значений.
         """
         if self.row is None:
             return np.array([], dtype=np.float32)
@@ -170,7 +170,7 @@ class SweepAssembler:
         # Находим границы известных участков
         known_indices = np.where(known_mask)[0]
         
-        # Интерполируем пропуски
+        # Интерполируем пропуски с улучшенным алгоритмом
         for i in range(len(known_indices) - 1):
             start_idx = known_indices[i]
             end_idx = known_indices[i + 1]
@@ -179,22 +179,57 @@ class SweepAssembler:
                 start_val = self.row[start_idx]
                 end_val = self.row[end_idx]
                 
-                # Линейная интерполяция
+                # Используем кубическую интерполяцию для более гладких переходов
                 for j in range(start_idx + 1, end_idx):
-                    alpha = (j - start_idx) / (end_idx - start_idx)
-                    interpolated[j] = start_val + alpha * (end_val - start_val)
+                    # Нормализованная позиция от 0 до 1
+                    t = (j - start_idx) / (end_idx - start_idx)
+                    
+                    # Кубическая интерполяция с плавными производными на краях
+                    t2 = t * t
+                    t3 = t2 * t
+                    
+                    # Коэффициенты для плавного перехода
+                    a = 2 * t3 - 3 * t2 + 1
+                    b = -2 * t3 + 3 * t2
+                    
+                    interpolated[j] = a * start_val + b * end_val
+                    
+                    # Добавляем небольшое сглаживание для устранения шума
+                    if j > start_idx + 1 and j < end_idx - 1:
+                        # Усредняем с соседними интерполированными значениями
+                        prev_val = interpolated[j-1]
+                        if not np.isnan(prev_val):
+                            interpolated[j] = 0.7 * interpolated[j] + 0.3 * prev_val
         
-        # Обрабатываем края (если есть пропуски в начале или конце)
+        # Обрабатываем края с экстраполяцией
         if known_indices[0] > 0:
-            # Заполняем начало последним известным значением
-            interpolated[:known_indices[0]] = self.row[known_indices[0]]
+            # Экстраполируем начало с учетом тренда
+            if len(known_indices) > 1:
+                trend = self.row[known_indices[1]] - self.row[known_indices[0]]
+                for j in range(known_indices[0]):
+                    interpolated[j] = self.row[known_indices[0]] + trend * (j - known_indices[0])
+            else:
+                interpolated[:known_indices[0]] = self.row[known_indices[0]]
         
         if known_indices[-1] < len(interpolated) - 1:
-            # Заполняем конец последним известным значением
-            interpolated[known_indices[-1] + 1:] = self.row[known_indices[-1]]
+            # Экстраполируем конец с учетом тренда
+            if len(known_indices) > 1:
+                trend = self.row[known_indices[-1]] - self.row[known_indices[-2]]
+                for j in range(known_indices[-1] + 1, len(interpolated)):
+                    interpolated[j] = self.row[known_indices[-1]] + trend * (j - known_indices[-1])
+            else:
+                interpolated[known_indices[-1] + 1:] = self.row[known_indices[-1]]
         
         # Заменяем оставшиеся NaN на значение по умолчанию
         interpolated = np.where(np.isnan(interpolated), self._nan_fill_value, interpolated)
+        
+        # Финальное сглаживание для устранения возможных артефактов интерполяции
+        if len(interpolated) > 5:
+            # Применяем легкое сглаживание по 3 точкам
+            smoothed = interpolated.copy()
+            for i in range(1, len(interpolated) - 1):
+                smoothed[i] = 0.5 * interpolated[i] + 0.25 * (interpolated[i-1] + interpolated[i+1])
+            interpolated = smoothed
         
         return interpolated.astype(np.float32)
 

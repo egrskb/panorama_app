@@ -61,14 +61,14 @@ def load_detector_settings() -> Dict[str, Any]:
     
     # Возвращаем дефолтные настройки детектора
     return {
-        "coverage_threshold": 0.95,
+        "coverage_threshold": 0.85,  # Уменьшено с 0.95 для лучшего покрытия
         "snr_threshold_db": 10.0,
         "min_peak_bins": 3,
         "min_peak_distance_bins": 5,
         "peak_band_hz": 5e6,
-        "smoothing_enabled": False,
+        "smoothing_enabled": True,   # Включено по умолчанию
         "smoothing_window": 7,
-        "ema_enabled": False,
+        "ema_enabled": True,         # Включено по умолчанию
         "ema_alpha": 0.3,
         "interpolation_enabled": True
     }

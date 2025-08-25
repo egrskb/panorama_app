@@ -165,6 +165,11 @@ class HackRFQSABackend(SourceBackend):
             self.finished.emit(1)
             return
 
+        # Автоматически включаем калибровку при старте
+        if not self.get_calibration_status():
+            print("[HackRF] Автоматическое включение калибровки...")
+            self.enable_calibration(True)
+
         # Получаем coverage_threshold из настроек детектора
         coverage_threshold = get_coverage_threshold()
         self._assembler = SweepAssembler(coverage_threshold=coverage_threshold)

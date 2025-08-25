@@ -439,11 +439,24 @@ static void process_block_multi_segment(int8_t* buf, int valid_length, uint64_t 
             continue;  // пропускаем неиспользуемые сегменты
         }
         
-        // Заполняем данные сегмента
+        // Заполняем данные сегмента с правильным вычислением частот
         for (int i = 0; i < bins_per_segment; i++) {
             int src_bin = seg_start_bin + i;
             if (src_bin < count) {
-                g_segment_freqs[seg][i] = seg_start_hz + (i + 0.5) * fft_bin_width;
+                // Правильная формула для сегментов A/B/C/D согласно README
+                if (seg == SEGMENT_A) {
+                    // [f-OFFSET, f-OFFSET+Fs/4]
+                    g_segment_freqs[seg][i] = seg_start_hz + (i + 0.5) * fft_bin_width;
+                } else if (seg == SEGMENT_B) {
+                    // [f+OFFSET+Fs/2, f+OFFSET+3Fs/4]
+                    g_segment_freqs[seg][i] = seg_start_hz + (i + 0.5) * fft_bin_width;
+                } else if (seg == SEGMENT_C) {
+                    // [f+OFFSET+Fs/4, f+OFFSET+Fs/2]
+                    g_segment_freqs[seg][i] = seg_start_hz + (i + 0.5) * fft_bin_width;
+                } else if (seg == SEGMENT_D) {
+                    // [f+OFFSET+3Fs/4, f+OFFSET+Fs]
+                    g_segment_freqs[seg][i] = seg_start_hz + (i + 0.5) * fft_bin_width;
+                }
                 g_segment_pwr[seg][i] = pwr[src_bin];
             }
         }
@@ -486,11 +499,19 @@ static void process_block_legacy(int8_t* buf, int valid_length, uint64_t center_
     }
     fftwf_execute(fft_plan);
 
+    // Нормализация FFT и поправки окна и ENBW
+    const float fft_norm = 1.0f / (float)fft_size;  // 1/N нормализация
+    const float window_loss_db = -1.76f;  // Потери окна Хэмминга
+    const float enbw_corr_db = 1.85f;    // ENBW коррекция
+    
     for (int i = 0; i < count; i++) {
-        float re = fft_out[i][0], im = fft_out[i][1];
+        float re = fft_out[i][0] * fft_norm, im = fft_out[i][1] * fft_norm;
         float mag = re*re + im*im;
         if (mag <= 1e-12f) mag = 1e-12f;
-        pwr[i] = 10.0f * log10f(mag) + cal_lookup_db((float)center_hz/1e6f, g_lna_db, g_vga_db, g_amp_on);
+        
+        // Применяем все поправки: FFT нормализация, потери окна, ENBW, калибровка
+        pwr[i] = 10.0f * log10f(mag) + window_loss_db + enbw_corr_db + 
+                 cal_lookup_db((float)center_hz/1e6f, g_lna_db, g_vga_db, g_amp_on);
     }
 
     // как в hackrf_sweep — отдаём 1/4 окна (нижнюю четверть)

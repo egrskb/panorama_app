@@ -118,13 +118,15 @@ class MasterSweepController(QtCore.QObject):
             if not np.any(power > self.threshold_dbm):
                 return
 
-            # детектор пиков -> (freq, snr)
+            # детектор пиков -> список DetectedPeak
             peaks = self.peak_detector.detect_peaks(freqs, power)
             if not peaks:
                 return
 
             # берём наибольший по SNR
-            peak_freq, peak_snr = max(peaks, key=lambda t: t[1])
+            best_peak = max(peaks, key=lambda p: p.snr_db)
+            peak_freq = best_peak.freq_hz
+            peak_snr = best_peak.snr_db
             now = time.time()
             if now - self._last_emit_ts < 1.0:  # антиспам
                 return
