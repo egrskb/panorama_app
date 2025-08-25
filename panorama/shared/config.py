@@ -13,12 +13,13 @@ _DEFAULTS: Dict[str, Any] = {
     "spectrum": {
         "freq_start_hz": 2_400_000_000,
         "freq_end_hz":   2_480_000_000,
-        "bin_hz":        200_000,
+        "bin_hz":        800_000,  # ОПТИМИЗАЦИЯ: увеличено с 200_000 до 800_000 для лучшей производительности
         "lna_db":        24,
         "vga_db":        20,
         "amp_on":        False,
         "coverage_threshold": 0.95,
         "colormap": "turbo",
+        "max_display_bins": 10000,  # ОПТИМИЗАЦИЯ: максимальное количество точек для отображения
     }
 }
 

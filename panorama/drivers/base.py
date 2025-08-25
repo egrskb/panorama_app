@@ -9,7 +9,7 @@ class SweepConfig:
     """Конфигурация для свипа."""
     freq_start_hz: int
     freq_end_hz: int
-    bin_hz: int = 200_000
+    bin_hz: int = 800_000  # ОПТИМИЗАЦИЯ: увеличено с 200_000 до 800_000 для лучшей производительности
     lna_db: int = 24
     vga_db: int = 20
     amp_on: bool = False

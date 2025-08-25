@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 """
-HackRF Master backend (CFFI) для панорамы RSSI - THROTTLED VERSION.
-
-- Экспортирует класс HackRFMaster (как и ожидает менеджер устройств).
-- Экспортирует enumerate_devices() на уровне модуля.
-- Внутри использует CFFI-обёртку к libhackrf_qsa.so и индексную склейку свипов
-  через SweepAssembler (центры бинов, глобальная сетка).
-- THROTTLED: ограничивает частоту обновлений до 5 FPS максимум,
-  автоматически сбрасывает цикл каждые 2 секунды,
-  эмитит обновления только после накопления 100 сегментов.
+HackRF Master backend (CFFI) для панорамы RSSI - OPTIMIZED VERSION.
+Исправлена инициализация SweepAssembler.
 """
 
 from __future__ import annotations
@@ -57,6 +50,8 @@ def _load_lib():
 
     lib_name = "libhackrf_qsa.so"
     search_dirs = [
+        Path(__file__).resolve().parent / "hackrf_master" / "build",
+        Path(__file__).resolve().parent / "hackrf_master",
         Path(__file__).resolve().parent,
         Path(__file__).resolve().parent.parent,
         Path.cwd(),
@@ -77,26 +72,27 @@ def _load_lib():
 
 
 # ------------------------------------------------------------
-# ОСНОВНОЙ БЭКЕНД (QSA) - THROTTLED VERSION
+# ОСНОВНОЙ БЭКЕНД (QSA) - OPTIMIZED VERSION
 # ------------------------------------------------------------
 
 class HackRFQSABackend(SourceBackend):
-    """Работа с HackRF через libhackrf_qsa.so, отдаёт полные свипы в GUI с throttling."""
+    """Работа с HackRF через libhackrf_qsa.so, отдаёт полные свипы в GUI."""
 
     def __init__(self, serial_suffix: Optional[str] = None, parent=None):
         super().__init__(parent)
         self._ffi, self._lib = _load_lib()
         self._serial = (serial_suffix or "").strip()
         self._worker: Optional[_Worker] = None
-        # ПОРОГ ПОКРЫТИЯ — 0.95 (устойчиво к микрозазорам)
-        self._assembler = SweepAssembler(coverage_threshold=0.95, wrap_guard_hz=15e6)
+        # НЕ создаем SweepAssembler здесь - создадим в start() с правильными параметрами
+        self._assembler: Optional[SweepAssembler] = None
 
     # ---------- управление ----------
     def start(self, config: SweepConfig):
         if self.is_running():
             return
 
-        # Настраиваем сборщик (индексная укладка по глобальной сетке центров бинов)
+        # Создаем и настраиваем сборщик с правильными параметрами
+        self._assembler = SweepAssembler(coverage_threshold=0.45, wrap_guard_hz=100e6)
         self._assembler.configure(config.freq_start_hz, config.freq_end_hz, config.bin_hz)
 
         self._worker = _Worker(self, self._ffi, self._lib, config, self._serial, self._assembler)
@@ -153,11 +149,11 @@ class HackRFQSABackend(SourceBackend):
 
 
 # ------------------------------------------------------------
-# ВНУТРЕННИЙ РАБОЧИЙ ПОТОК - THROTTLED VERSION
+# ВНУТРЕННИЙ РАБОЧИЙ ПОТОК - OPTIMIZED VERSION
 # ------------------------------------------------------------
 
 class _Worker(QtCore.QThread):
-    """Рабочий поток: открывает/конфигурирует устройство и обрабатывает callback-и с throttling."""
+    """Рабочий поток: открывает/конфигурирует устройство и обрабатывает callback-и."""
 
     finished_sig = QtCore.pyqtSignal(int, str)
 
@@ -172,13 +168,14 @@ class _Worker(QtCore.QThread):
         self._assembler = assembler
         self._stop_event = threading.Event()
         
-        # THROTTLING: ограничиваем частоту обновлений
+        # OPTIMIZED: более мягкие настройки throttling
         self._last_emit_time = 0.0
-        self._min_emit_interval = 0.2  # 5 FPS максимум
+        self._min_emit_interval = 0.1  # 10 FPS максимум
         self._segment_counter = 0
-        self._max_segments_before_emit = 100  # эмитим только после 100 сегментов
+        self._max_segments_before_emit = 50  # эмитим после 50 сегментов
         self._last_reset_time = time.time()
-        self._reset_interval = 2.0  # сбрасываем цикл каждые 2 секунды
+        self._reset_interval = 5.0  # сбрасываем цикл каждые 5 секунд
+        self._block_counter = 0
 
         @self._ffi.callback("void(const double*, const float*, int, double, uint64_t, uint64_t, void*)")
         def _cb(freqs_ptr, pwr_ptr, n_bins, fft_bin_width_hz, f_low_hz, f_high_hz, user):
@@ -193,29 +190,31 @@ class _Worker(QtCore.QThread):
                 if np.all(np.isnan(power)) or np.all(power == 0):
                     return
 
-                # Кладём сегмент по freq-координатам (надежнее при Fs/N != bin_hz)
+                # Кладём сегмент в ассемблер
                 row, coverage = self._assembler.feed({
                     "freqs_hz": freqs,
                     "data_dbm": power,
                     "hz_low": float(f_low_hz),
                 })
 
-                # THROTTLING: увеличиваем счетчик сегментов
+                # Увеличиваем счетчики
                 self._segment_counter += 1
+                self._block_counter += 1
                 current_time = time.time()
 
-                # Проверяем, нужно ли сбросить цикл
-                if current_time - self._last_reset_time > self._reset_interval:
+                # Проверяем, нужно ли сбросить цикл по таймауту
+                if current_time - self._last_reset_time > self._reset_interval and coverage < 0.3:
                     self._assembler.reset_pass()
                     self._last_reset_time = current_time
                     self._segment_counter = 0
-                    print(f"[HackRF] Auto-reset cycle after {self._reset_interval}s")
+                    print(f"[HackRF] Auto-reset cycle after {self._reset_interval}s timeout")
 
-                # Эмитим только при выполнении условий throttling
-                if (row is not None and 
-                    self._segment_counter >= self._max_segments_before_emit and
-                    current_time - self._last_emit_time >= self._min_emit_interval):
-                    
+                # Логирование прогресса каждые 100 блоков
+                if self._block_counter % 100 == 0:
+                    print(f"[hackrf_master] Processed {self._block_counter} blocks")
+
+                # Эмитим при готовности полной строки или достаточном накоплении
+                if row is not None and current_time - self._last_emit_time >= self._min_emit_interval:
                     nb = self._assembler.nbins
                     f0 = self._assembler.f0
                     b  = self._assembler.bin_hz
@@ -224,16 +223,17 @@ class _Worker(QtCore.QThread):
                     
                     self._backend.fullSweepReady.emit(full_freqs, full_power)
                     
-                    # Сбрасываем счетчики после эмита
                     self._last_emit_time = current_time
                     self._segment_counter = 0
                     
-                    print(f"[HackRF] Throttled sweep ready: N={len(full_freqs)}, "
+                    print(f"[HackRF] Full sweep ready: N={len(full_freqs)}, "
                           f"{full_freqs[0]/1e6:.3f}-{full_freqs[-1]/1e6:.3f} MHz, "
-                          f"coverage={coverage:.3f}, segments={self._segment_counter}")
+                          f"coverage={coverage:.3f}")
 
             except Exception as e:
                 print(f"[HackRF] callback error: {e}")
+                import traceback
+                print(traceback.format_exc())
 
         self._cb = _cb
 
@@ -255,7 +255,7 @@ class _Worker(QtCore.QThread):
                 tried_serials.append(s)
                 r = _try_open(s)
                 if r != 0:
-                    # 2) пробуем суффиксы (часто прошивка ждёт suffix)
+                    # 2) пробуем суффиксы
                     for suf_len in (16, 12, 8):
                         if len(s) >= suf_len:
                             suf = s[-suf_len:]
@@ -309,7 +309,7 @@ class _Worker(QtCore.QThread):
                 return
 
             print(f"[HackRF] Started sweep: {cfg.freq_start_hz/1e6:.1f}-{cfg.freq_end_hz/1e6:.1f} MHz, "
-                  f"bin={cfg.bin_hz:.0f} Hz, throttled to 5 FPS max")
+                  f"bin={cfg.bin_hz:.0f} Hz")
 
             # --- РАБОЧИЙ ЦИКЛ ---
             while not self._stop_event.is_set():

@@ -179,9 +179,20 @@ int hq_configure(double f_start_mhz, double f_stop_mhz,
     s_corr_window_power_db = 10.0f * log10f(4.0f);
     s_corr_enbw_db         = 10.0f * log10f(1.5f);
 
+    // Диапазон sweep (целые МГц)
+    if (f_stop_mhz <= f_start_mhz) return -3;
+    if (f_start_mhz < 0) f_start_mhz = 0;
+    if (f_stop_mhz > 7250) f_stop_mhz = 7250;  // HackRF поддерживает до 7.25 ГГц
+    
     freq_ranges[0] = (uint16_t)floor(f_start_mhz);
-    freq_ranges[1] = (uint16_t)ceil (f_stop_mhz);
-    step_count = (uint32_t)((freq_ranges[1] - freq_ranges[0]) / TUNE_STEP_MHZ) + 1u;
+    freq_ranges[1] = (uint16_t)ceil(f_stop_mhz);
+    
+    // Важно: step_count должен покрывать весь диапазон
+    step_count = (uint32_t)((freq_ranges[1] - freq_ranges[0]) / TUNE_STEP_MHZ);
+    if (step_count < 1) step_count = 1;
+    
+    printf("[hackrf_master] Configured for %u-%u MHz, %u steps\n", 
+           freq_ranges[0], freq_ranges[1], step_count);
 
     return 0;
 }
@@ -189,6 +200,10 @@ int hq_configure(double f_start_mhz, double f_stop_mhz,
 static int rx_callback(hackrf_transfer* transfer)
 {
     if (!running || !g_cb) return 0;
+
+    // Добавляем счетчик для отладки
+    static int block_counter = 0;
+    block_counter++;
 
     int8_t* buf = (int8_t*)transfer->buffer;
     for (int j=0; j<BLOCKS_PER_TRANSFER; ++j) {
@@ -283,7 +298,7 @@ static int rx_callback(hackrf_transfer* transfer)
 
             uint64_t hz_low  = frequency + (DEFAULT_SAMPLE_RATE_HZ*3)/4;
             uint64_t hz_high = frequency + DEFAULT_SAMPLE_RATE_HZ;
-            int base = 1 + (fftSize*3)/8;
+            int base = 1 + (fftSize*3)/8; /* смещение, затем wrap по модулю */
             for (int i=0;i<q;i++){
                 int idx   = (base + i) % fftSize;
                 float raw_db = pwr[idx];
@@ -297,6 +312,12 @@ static int rx_callback(hackrf_transfer* transfer)
             free(freqs); free(data);
         }
     }
+
+    // Периодический отладочный вывод
+    if (block_counter % 100 == 0) {
+        printf("[hackrf_master] Processed %d blocks\n", block_counter);
+    }
+
     return 0;
 }
 

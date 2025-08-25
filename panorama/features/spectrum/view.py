@@ -49,7 +49,7 @@ class SpectrumView(QtWidgets.QWidget):
         self.stop_mhz = QtWidgets.QDoubleSpinBox()
         self._cfg_dsb(self.stop_mhz, 25, 7000, 1, 6000.0, " МГц")  # ИЗМЕНЕНО: конец 6000 МГц
         self.bin_khz = QtWidgets.QDoubleSpinBox()
-        self._cfg_dsb(self.bin_khz, 1, 5000, 0, 200, " кГц")
+        self._cfg_dsb(self.bin_khz, 1, 5000, 0, 800, " кГц")  # ОПТИМИЗАЦИЯ: увеличено с 200 до 800 для лучшей производительности
         self.lna_db = QtWidgets.QSpinBox()
         self.lna_db.setRange(0, 40); self.lna_db.setSingleStep(8); self.lna_db.setValue(24)
         self.vga_db = QtWidgets.QSpinBox()
@@ -907,7 +907,7 @@ class SpectrumView(QtWidgets.QWidget):
         # Дефолтные значения 50-6000 МГц
         start_default_mhz = float(d.get("start_mhz", 50.0))
         stop_default_mhz  = float(d.get("stop_mhz", 6000.0))
-        bin_default_khz   = float(d.get("bin_khz", 200.0))
+        bin_default_khz   = float(d.get("bin_khz", 800.0))  # ОПТИМИЗАЦИЯ: увеличено с 200.0 до 800.0 для лучшей производительности
 
         settings.beginGroup("spectrum")
         try:
