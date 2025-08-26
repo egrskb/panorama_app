@@ -34,14 +34,17 @@ def _find_library() -> str:
     return "libhackrf_master.so"
 
 
-class HackRFMasterBackend(SourceBackend):
+class HackRFQSABackend(SourceBackend):
     """
     Источник данных через полноценный C-бэкенд с расчетами спектра.
     C-код выполняет FFT, нормализацию, калибровку и выдает готовый спектр.
     """
 
-    def __init__(self, serial_suffix: Optional[str] = None, parent=None):
+    def __init__(self, serial_suffix: Optional[str] = None, logger=None, parent=None):
         super().__init__(parent)
+        
+        # Сохраняем logger
+        self.log = logger
         
         self._ffi = FFI()
         self._define_interface()
@@ -49,7 +52,7 @@ class HackRFMasterBackend(SourceBackend):
         lib_path = _find_library()
         try:
             self._lib = self._ffi.dlopen(lib_path)
-            print(f"[HackRF Master] Loaded library: {lib_path}")
+            self._emit_status(f"[HackRF Master] Loaded library: {lib_path}")
         except Exception as e:
             raise RuntimeError(f"Failed to load HackRF Master library: {e}")
         
@@ -202,7 +205,7 @@ class HackRFMasterBackend(SourceBackend):
                         serials.append(serial)
             return serials
         except Exception as e:
-            print(f"Error listing devices: {e}")
+            self._emit_error(f"Error listing devices: {e}")
             return []
     
     def load_calibration(self, csv_path: str) -> bool:
@@ -295,7 +298,7 @@ class HackRFMasterBackend(SourceBackend):
         for path in cal_paths:
             if path.exists():
                 if self.load_calibration(str(path)):
-                    print(f"[HackRF Master] Auto-loaded calibration from {path}")
+                    self._emit_status(f"[HackRF Master] Auto-loaded calibration from {path}")
                     break
     
     @QtCore.pyqtSlot(int, str)
@@ -304,6 +307,20 @@ class HackRFMasterBackend(SourceBackend):
             self.error.emit(msg)
         self._running = False
         self.finished.emit(code)
+    
+    def _emit_status(self, msg: str):
+        """Эмитит статус и логирует."""
+        if self.log:
+            self.log.info(msg)
+        print(msg)
+        self.status.emit(msg)
+    
+    def _emit_error(self, msg: str):
+        """Эмитит ошибку и логирует."""
+        if self.log:
+            self.log.error(msg)
+        print(f"ERROR: {msg}")
+        self.error.emit(msg)
 
 
 class _MasterWorker(QtCore.QThread):
@@ -311,7 +328,7 @@ class _MasterWorker(QtCore.QThread):
     
     finished_sig = QtCore.pyqtSignal(int, str)
     
-    def __init__(self, backend: HackRFMasterBackend, config: SweepConfig):
+    def __init__(self, backend: HackRFQSABackend, config: SweepConfig):
         super().__init__(backend)
         self._backend = backend
         self._config = config

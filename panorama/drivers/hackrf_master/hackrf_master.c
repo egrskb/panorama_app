@@ -1,5 +1,5 @@
+
 // hackrf_master.c - Полноценный C-бэкенд для Panorama с расчетами спектра
-// Основано на эталонных файлах hq_master.c и hq_rssi.c
 
 #include "hackrf_master.h"
 #include <libhackrf/hackrf.h>
@@ -29,12 +29,6 @@
 #endif
 
 // ================== Структуры данных ==================
-
-typedef struct {
-    double freq_hz;
-    float power_dbm;
-    float snr_db;
-} DetectedPeak;
 
 typedef struct {
     // FFT
@@ -88,8 +82,9 @@ typedef struct {
     // Калибровка
     float calibration_offset_db;
     
-    // Режим сегментов (2 или 4)
+    // Настройки
     int segment_mode;
+    int fft_size_override;  // 0 = auto, иначе фиксированный размер
     
     // Колбэки
     hq_multi_segment_cb multi_cb;
@@ -104,6 +99,17 @@ static pthread_t g_worker_thread;
 
 // Буферы для сегментов
 static hq_segment_data_t g_segments[MAX_SEGMENTS];
+
+// Калибровка
+static struct {
+    float freq_mhz[MAX_CALIBRATION_ENTRIES];
+    int lna_db[MAX_CALIBRATION_ENTRIES];
+    int vga_db[MAX_CALIBRATION_ENTRIES];
+    int amp_on[MAX_CALIBRATION_ENTRIES];
+    float offset_db[MAX_CALIBRATION_ENTRIES];
+    int count;
+    int enabled;
+} g_calibration = {0};
 
 // ================== Утилиты ==================
 
@@ -152,6 +158,27 @@ static inline float calculate_power_dbm(float re, float im, float correction) {
     return power_dbm;
 }
 
+// Получение калибровочной поправки для частоты
+static float get_calibration_offset(double freq_mhz) {
+    if (!g_calibration.enabled || g_calibration.count == 0) {
+        return 0.0f;
+    }
+    
+    // Находим ближайшую точку калибровки
+    float min_diff = 1e9;
+    float offset = 0.0f;
+    
+    for (int i = 0; i < g_calibration.count; i++) {
+        float diff = fabs(g_calibration.freq_mhz[i] - freq_mhz);
+        if (diff < min_diff) {
+            min_diff = diff;
+            offset = g_calibration.offset_db[i];
+        }
+    }
+    
+    return offset;
+}
+
 // ================== Обработка FFT ==================
 
 static ProcessingContext* create_processing_context(int fft_size, double sample_rate) {
@@ -194,6 +221,8 @@ static ProcessingContext* create_processing_context(int fft_size, double sample_
     calculate_window_corrections(ctx->window, fft_size, 
                                 &ctx->window_loss_db, &ctx->enbw_corr_db);
     
+    printf("[HackRF Master] FFT size: %d, bin width: %.1f kHz\n", 
+           fft_size, ctx->bin_width/1000);
     printf("[HackRF Master] Window corrections: loss=%.2f dB, ENBW=%.2f dB\n", 
            ctx->window_loss_db, ctx->enbw_corr_db);
     
@@ -260,8 +289,9 @@ static void process_sweep_block(MasterContext* master, uint8_t* buffer, int vali
     
     // Вычисляем мощность с правильной нормализацией
     const float fft_norm = 1.0f / proc->fft_size;
-    const float total_correction = proc->window_loss_db + proc->enbw_corr_db + 
-                                  master->calibration_offset_db;
+    const double center_mhz = center_hz / 1e6;
+    const float cal_offset = get_calibration_offset(center_mhz);
+    const float total_correction = proc->window_loss_db + proc->enbw_corr_db + cal_offset;
     
     for (int i = 0; i < proc->fft_size; i++) {
         proc->pwr_dbm[i] = calculate_power_dbm(
@@ -275,101 +305,85 @@ static void process_sweep_block(MasterContext* master, uint8_t* buffer, int vali
     pthread_mutex_lock(&master->spectrum_mutex);
     
     const int quarter = proc->fft_size / 4;
-    
     if (master->segment_mode == 4) {
-        // 4-сегментный режим (как в эталоне)
-        
-        // Сегмент A: [center - OFFSET, center - OFFSET + Fs/4]
-        uint64_t seg_a_start = center_hz - OFFSET_HZ;
-        for (int i = 0; i < quarter; i++) {
-            double freq = seg_a_start + proc->bin_offsets_hz[i];
-            if (freq >= master->freq_start_hz && freq <= master->freq_stop_hz) {
-                int idx = (int)((freq - master->freq_start_hz) / master->freq_step_hz);
-                if (idx >= 0 && idx < master->spectrum_points) {
-                    // Применяем EMA фильтрацию
-                    if (master->spectrum_counts[idx] == 0) {
-                        master->spectrum_powers[idx] = proc->pwr_dbm[i + 5*quarter/8 + 1];
-                    } else {
-                        master->spectrum_powers[idx] = 
-                            (1.0f - proc->ema_alpha) * master->spectrum_powers[idx] + 
-                            proc->ema_alpha * proc->pwr_dbm[i + 5*quarter/8 + 1];
+            // 4-сегментный режим (как в эталоне)
+            
+            // Сегмент A: [center - OFFSET, center - OFFSET + Fs/4]
+            uint64_t seg_a_start = center_hz - OFFSET_HZ;
+            for (int i = 0; i < quarter; i++) {
+                double freq = seg_a_start + proc->bin_offsets_hz[i];
+                if (freq >= master->freq_start_hz && freq <= master->freq_stop_hz) {
+                    int idx = (int)((freq - master->freq_start_hz) / master->freq_step_hz);
+                    if (idx >= 0 && idx < master->spectrum_points) {
+                        // Применяем EMA фильтрацию
+                        if (master->spectrum_counts[idx] == 0) {
+                            master->spectrum_powers[idx] = proc->pwr_dbm[i + 5*quarter/8 + 1];
+                        } else {
+                            master->spectrum_powers[idx] = 
+                                (1.0f - proc->ema_alpha) * master->spectrum_powers[idx] + 
+                                proc->ema_alpha * proc->pwr_dbm[i + 5*quarter/8 + 1];
+                        }
+                        master->spectrum_counts[idx]++;
                     }
-                    master->spectrum_counts[idx]++;
                 }
-            }
-        }
-        
-        // Сегмент B: [center + OFFSET + Fs/2, center + OFFSET + 3Fs/4]
-        uint64_t seg_b_start = center_hz + OFFSET_HZ + proc->sample_rate/2;
-        for (int i = 0; i < quarter; i++) {
-            double freq = seg_b_start + proc->bin_offsets_hz[i];
-            if (freq >= master->freq_start_hz && freq <= master->freq_stop_hz) {
-                int idx = (int)((freq - master->freq_start_hz) / master->freq_step_hz);
-                if (idx >= 0 && idx < master->spectrum_points) {
-                    if (master->spectrum_counts[idx] == 0) {
-                        master->spectrum_powers[idx] = proc->pwr_dbm[i + quarter/8 + 1];
-                    } else {
-                        master->spectrum_powers[idx] = 
-                            (1.0f - proc->ema_alpha) * master->spectrum_powers[idx] + 
-                            proc->ema_alpha * proc->pwr_dbm[i + quarter/8 + 1];
-                    }
-                    master->spectrum_counts[idx]++;
-                }
-            }
-        }
-        
-        // Сегмент C: [center + OFFSET + Fs/4, center + OFFSET + Fs/2]
-        uint64_t seg_c_start = center_hz + OFFSET_HZ + proc->sample_rate/4;
-        for (int i = 0; i < quarter; i++) {
-            double freq = seg_c_start + proc->bin_offsets_hz[i];
-            if (freq >= master->freq_start_hz && freq <= master->freq_stop_hz) {
-                int idx = (int)((freq - master->freq_start_hz) / master->freq_step_hz);
-                if (idx >= 0 && idx < master->spectrum_points) {
-                    if (master->spectrum_counts[idx] == 0) {
-                        master->spectrum_powers[idx] = proc->pwr_dbm[i];
-                    } else {
-                        master->spectrum_powers[idx] = 
-                            (1.0f - proc->ema_alpha) * master->spectrum_powers[idx] + 
-                            proc->ema_alpha * proc->pwr_dbm[i];
-                    }
-                    master->spectrum_counts[idx]++;
-                }
-            }
-        }
-        
-        // Сегмент D: [center + OFFSET + 3Fs/4, center + OFFSET + Fs]
-        uint64_t seg_d_start = center_hz + OFFSET_HZ + 3*proc->sample_rate/4;
-        for (int i = 0; i < quarter; i++) {
-            double freq = seg_d_start + proc->bin_offsets_hz[i];
-            if (freq >= master->freq_start_hz && freq <= master->freq_stop_hz) {
-                int idx = (int)((freq - master->freq_start_hz) / master->freq_step_hz);
-                if (idx >= 0 && idx < master->spectrum_points) {
-                    if (master->spectrum_counts[idx] == 0) {
-                        master->spectrum_powers[idx] = proc->pwr_dbm[i + 3*quarter/8];
-                    } else {
-                        master->spectrum_powers[idx] = 
-                            (1.0f - proc->ema_alpha) * master->spectrum_powers[idx] + 
-                            proc->ema_alpha * proc->pwr_dbm[i + 3*quarter/8];
-                    }
-                    master->spectrum_counts[idx]++;
-                }
-            }
-        }
-        
-        // Подготавливаем данные сегментов для колбэка
-        if (master->multi_cb) {
-            // Заполняем структуры сегментов
-            for (int seg = 0; seg < 4; seg++) {
-                g_segments[seg].segment_id = seg;
-                g_segments[seg].count = quarter;
-                // Здесь нужно будет заполнить freqs_hz и data_dbm
-                // из соответствующих частей спектра
             }
             
-            master->multi_cb(g_segments, 4, proc->bin_width, center_hz, master->user_data);
-        }
-    }
-    
+            // Сегмент B: [center + OFFSET + Fs/2, center + OFFSET + 3Fs/4]
+            uint64_t seg_b_start = center_hz + OFFSET_HZ + proc->sample_rate/2;
+            for (int i = 0; i < quarter; i++) {
+                double freq = seg_b_start + proc->bin_offsets_hz[i];
+                if (freq >= master->freq_start_hz && freq <= master->freq_stop_hz) {
+                    int idx = (int)((freq - master->freq_start_hz) / master->freq_step_hz);
+                    if (idx >= 0 && idx < master->spectrum_points) {
+                        if (master->spectrum_counts[idx] == 0) {
+                            master->spectrum_powers[idx] = proc->pwr_dbm[i + quarter/8 + 1];
+                        } else {
+                            master->spectrum_powers[idx] = 
+                                (1.0f - proc->ema_alpha) * master->spectrum_powers[idx] + 
+                                proc->ema_alpha * proc->pwr_dbm[i + quarter/8 + 1];
+                        }
+                        master->spectrum_counts[idx]++;
+                    }
+                }
+            }
+            
+            // Сегмент C: [center + OFFSET + Fs/4, center + OFFSET + Fs/2]
+            uint64_t seg_c_start = center_hz + OFFSET_HZ + proc->sample_rate/4;
+            for (int i = 0; i < quarter; i++) {
+                double freq = seg_c_start + proc->bin_offsets_hz[i];
+                if (freq >= master->freq_start_hz && freq <= master->freq_stop_hz) {
+                    int idx = (int)((freq - master->freq_start_hz) / master->freq_step_hz);
+                    if (idx >= 0 && idx < master->spectrum_points) {
+                        if (master->spectrum_counts[idx] == 0) {
+                            master->spectrum_powers[idx] = proc->pwr_dbm[i];
+                        } else {
+                            master->spectrum_powers[idx] = 
+                                (1.0f - proc->ema_alpha) * master->spectrum_powers[idx] + 
+                                proc->ema_alpha * proc->pwr_dbm[i];
+                        }
+                        master->spectrum_counts[idx]++;
+                    }
+                }
+            }
+            
+            // Сегмент D: [center + OFFSET + 3Fs/4, center + OFFSET + Fs]
+            uint64_t seg_d_start = center_hz + OFFSET_HZ + 3*proc->sample_rate/4;
+            for (int i = 0; i < quarter; i++) {
+                double freq = seg_d_start + proc->bin_offsets_hz[i];
+                if (freq >= master->freq_start_hz && freq <= master->freq_stop_hz) {
+                    int idx = (int)((freq - master->freq_start_hz) / master->freq_step_hz);
+                    if (idx >= 0 && idx < master->spectrum_points) {
+                        if (master->spectrum_counts[idx] == 0) {
+                            master->spectrum_powers[idx] = proc->pwr_dbm[i + 3*quarter/8];
+                        } else {
+                            master->spectrum_powers[idx] = 
+                                (1.0f - proc->ema_alpha) * master->spectrum_powers[idx] + 
+                                proc->ema_alpha * proc->pwr_dbm[i + 3*quarter/8];
+                        }
+                        master->spectrum_counts[idx]++;
+                    }
+                }
+            }
     pthread_mutex_unlock(&master->spectrum_mutex);
 }
 
@@ -404,30 +418,40 @@ static void* worker_thread_fn(void* arg) {
     hackrf_set_sample_rate_manual(master->dev, DEFAULT_SAMPLE_RATE_HZ, 1);
     hackrf_set_baseband_filter_bandwidth(master->dev, DEFAULT_BASEBAND_FILTER_BANDWIDTH);
     
-    // Создаем контекст обработки
+    // Определяем размер FFT
     int fft_size = DEFAULT_FFT_SIZE;
-    if (master->freq_step_hz > 0) {
-        // Подбираем размер FFT под желаемый шаг
-        double desired_bin = master->freq_step_hz;
-        if (desired_bin < 2445.0) desired_bin = 2445.0;
-        if (desired_bin > 5e6) desired_bin = 5e6;
+    
+    if (master->fft_size_override > 0) {
+        // Используем фиксированный размер если задан
+        fft_size = master->fft_size_override;
+    } else if (master->freq_step_hz > 0) {
+        // Автоматически подбираем размер FFT под желаемый шаг
+        fft_size = (int)(DEFAULT_SAMPLE_RATE_HZ / master->freq_step_hz);
         
-        fft_size = (int)(DEFAULT_SAMPLE_RATE_HZ / desired_bin);
-        if (fft_size < 4) fft_size = 4;
-        if (fft_size > 8192) fft_size = 8192;
+        // Ограничиваем разумными пределами
+        if (fft_size < MIN_FFT_SIZE) fft_size = MIN_FFT_SIZE;
+        if (fft_size > MAX_FFT_SIZE) fft_size = MAX_FFT_SIZE;
         
-        // Выравниваем на 8
-        while ((fft_size + 4) % 8) fft_size++;
+        // Округляем до ближайшей степени 2 для оптимальной FFT
+        int power_of_2 = 1;
+        while (power_of_2 < fft_size) {
+            power_of_2 <<= 1;
+        }
+        // Если ближайшая степень 2 слишком большая, используем предыдущую
+        if (power_of_2 > MAX_FFT_SIZE) {
+            power_of_2 >>= 1;
+        }
+        fft_size = power_of_2;
     }
+    
+    printf("[HackRF Master] Using FFT size: %d (bin width: %.1f kHz)\n", 
+           fft_size, (DEFAULT_SAMPLE_RATE_HZ / (double)fft_size) / 1000.0);
     
     master->proc = create_processing_context(fft_size, DEFAULT_SAMPLE_RATE_HZ);
     if (!master->proc) {
         set_error("Failed to create processing context");
         return NULL;
     }
-    
-    printf("[HackRF Master] FFT size: %d, bin width: %.1f kHz\n", 
-           fft_size, master->proc->bin_width/1000);
     
     // Конфигурация sweep
     uint32_t freq_min_mhz = (uint32_t)(master->freq_start_hz / FREQ_ONE_MHZ);
@@ -463,9 +487,6 @@ static void* worker_thread_fn(void* arg) {
     // Основной цикл
     while (master->running && !master->stop_requested) {
         usleep(100000);  // 100 мс
-        
-        // Здесь можно добавить периодическую обработку,
-        // например, детекцию пиков или обновление статистики
     }
     
     printf("[HackRF Master] Stopping sweep\n");
@@ -552,6 +573,7 @@ int hq_open(const char* serial_suffix) {
     // Устанавливаем значения по умолчанию
     g_master->segment_mode = 4;
     g_master->calibration_offset_db = 0.0f;
+    g_master->fft_size_override = 0;  // Auto
     
     return 0;
 }
@@ -646,246 +668,6 @@ int hq_start_multi_segment(hq_multi_segment_cb cb, void* user) {
     // Запускаем worker thread
     if (pthread_create(&g_worker_thread, NULL, worker_thread_fn, g_master) != 0) {
         set_error("Failed to create worker thread");
-        g_master->running = 0;
-        return -1;
-    }
-    
-    return 0;
-}
+        g_master->running =
 
-int hq_start(hq_segment_cb cb, void* user) {
-    if (!g_master || !g_master->dev) {
-        set_error("Device not opened");
-        return -1;
-    }
-    
-    g_master->legacy_cb = cb;
-    g_master->multi_cb = NULL;
-    g_master->user_data = user;
-    g_master->running = 1;
-    g_master->stop_requested = 0;
-    
-    if (pthread_create(&g_worker_thread, NULL, worker_thread_fn, g_master) != 0) {
-        set_error("Failed to create worker thread");
-        g_master->running = 0;
-        return -1;
-    }
-    
-    return 0;
-}
-
-int hq_stop(void) {
-    if (!g_master || !g_master->running) {
-        return 0;
-    }
-    
-    g_master->stop_requested = 1;
-    
-    // Ждем завершения потока
-    pthread_join(g_worker_thread, NULL);
-    
-    g_master->running = 0;
-    g_master->stop_requested = 0;
-    
-    return 0;
-}
-
-// ================== Новые API функции для полной интеграции ==================
-
-int hq_get_master_spectrum(double* freqs_hz, float* powers_dbm, int max_points) {
-    if (!g_master || !freqs_hz || !powers_dbm || max_points <= 0) {
-        return 0;
-    }
-    
-    pthread_mutex_lock(&g_master->spectrum_mutex);
-    
-    int points_to_copy = (max_points < g_master->spectrum_points) ? 
-                         max_points : g_master->spectrum_points;
-    
-    memcpy(freqs_hz, g_master->spectrum_freqs, sizeof(double) * points_to_copy);
-    memcpy(powers_dbm, g_master->spectrum_powers, sizeof(float) * points_to_copy);
-    
-    pthread_mutex_unlock(&g_master->spectrum_mutex);
-    
-    return points_to_copy;
-}
-
-void hq_set_ema_alpha(float alpha) {
-    if (!g_master || !g_master->proc) return;
-    
-    if (alpha < 0.01f) alpha = 0.01f;
-    if (alpha > 1.0f) alpha = 1.0f;
-    
-    g_master->proc->ema_alpha = alpha;
-}
-
-void hq_set_detector_params(float threshold_offset_db, int min_width_bins,
-                            int min_sweeps, float timeout_sec) {
-    if (!g_master || !g_master->proc) return;
-    
-    g_master->proc->detection_threshold_db = threshold_offset_db;
-    g_master->proc->min_width_bins = min_width_bins;
-    g_master->proc->min_sweeps = min_sweeps;
-    g_master->proc->timeout_sec = timeout_sec;
-}
-
-int hq_set_segment_mode(int mode) {
-    if (mode != 2 && mode != 4) {
-        set_error("Invalid segment mode (must be 2 or 4)");
-        return -1;
-    }
-    
-    if (g_master) {
-        g_master->segment_mode = mode;
-    }
-    
-    return 0;
-}
-
-int hq_get_segment_mode(void) {
-    return g_master ? g_master->segment_mode : 4;
-}
-
-// ================== Калибровка ==================
-
-static struct {
-    float freq_mhz[MAX_CALIBRATION_ENTRIES];
-    int lna_db[MAX_CALIBRATION_ENTRIES];
-    int vga_db[MAX_CALIBRATION_ENTRIES];
-    int amp_on[MAX_CALIBRATION_ENTRIES];
-    float offset_db[MAX_CALIBRATION_ENTRIES];
-    int count;
-    int enabled;
-} g_calibration = {0};
-
-int hq_load_calibration(const char* csv_path) {
-    if (!csv_path) {
-        set_error("CSV path is NULL");
-        return -1;
-    }
-    
-    FILE* f = fopen(csv_path, "r");
-    if (!f) {
-        set_error("Cannot open calibration file: %s", csv_path);
-        return -1;
-    }
-    
-    char line[256];
-    int line_num = 0;
-    g_calibration.count = 0;
-    
-    // Пропускаем заголовок
-    if (fgets(line, sizeof(line), f)) {
-        line_num++;
-    }
-    
-    while (fgets(line, sizeof(line), f) && g_calibration.count < MAX_CALIBRATION_ENTRIES) {
-        line_num++;
         
-        float freq_mhz, offset_db;
-        int lna_db, vga_db, amp_on;
-        
-        if (sscanf(line, "%f,%d,%d,%d,%f", 
-                   &freq_mhz, &lna_db, &vga_db, &amp_on, &offset_db) == 5) {
-            int idx = g_calibration.count;
-            g_calibration.freq_mhz[idx] = freq_mhz;
-            g_calibration.lna_db[idx] = lna_db;
-            g_calibration.vga_db[idx] = vga_db;
-            g_calibration.amp_on[idx] = amp_on;
-            g_calibration.offset_db[idx] = offset_db;
-            g_calibration.count++;
-        }
-    }
-    
-    fclose(f);
-    
-    printf("[HackRF Master] Loaded %d calibration entries from %s\n", 
-           g_calibration.count, csv_path);
-    
-    // Автоматически применяем калибровку к текущему устройству
-    if (g_master && g_calibration.count > 0) {
-        // Находим ближайшую калибровку для текущей частоты
-        // (упрощенно - берем среднее)
-        float sum = 0;
-        for (int i = 0; i < g_calibration.count; i++) {
-            sum += g_calibration.offset_db[i];
-        }
-        g_master->calibration_offset_db = sum / g_calibration.count;
-    }
-    
-    return 0;
-}
-
-int hq_enable_calibration(int enable) {
-    g_calibration.enabled = enable ? 1 : 0;
-    
-    if (g_master) {
-        if (!enable) {
-            g_master->calibration_offset_db = 0.0f;
-        } else if (g_calibration.count > 0) {
-            // Применяем усредненную калибровку
-            float sum = 0;
-            for (int i = 0; i < g_calibration.count; i++) {
-                sum += g_calibration.offset_db[i];
-            }
-            g_master->calibration_offset_db = sum / g_calibration.count;
-        }
-    }
-    
-    return 0;
-}
-
-int hq_get_calibration_status(void) {
-    return g_calibration.enabled && g_calibration.count > 0;
-}
-
-// ================== Перечисление устройств ==================
-
-int hq_device_count(void) {
-    int r = hackrf_init();
-    if (r != HACKRF_SUCCESS) return 0;
-    
-    hackrf_device_list_t* list = hackrf_device_list();
-    if (!list) {
-        hackrf_exit();
-        return 0;
-    }
-    
-    int count = list->devicecount;
-    hackrf_device_list_free(list);
-    hackrf_exit();
-    
-    return count;
-}
-
-int hq_get_device_serial(int idx, char* out, int cap) {
-    if (!out || cap <= 0) return -1;
-    
-    int r = hackrf_init();
-    if (r != HACKRF_SUCCESS) return -1;
-    
-    hackrf_device_list_t* list = hackrf_device_list();
-    if (!list) {
-        hackrf_exit();
-        return -1;
-    }
-    
-    if (idx < 0 || idx >= list->devicecount) {
-        hackrf_device_list_free(list);
-        hackrf_exit();
-        return -1;
-    }
-    
-    const char* serial = list->serial_numbers[idx];
-    if (serial) {
-        strncpy(out, serial, cap - 1);
-        out[cap - 1] = '\0';
-    } else {
-        out[0] = '\0';
-    }
-    
-    hackrf_device_list_free(list);
-    hackrf_exit();
-    
-    return 0;
-}
