@@ -13,16 +13,18 @@ import numpy as np
 import pyqtgraph as pg
 from pathlib import Path
 from PyQt5 import QtWidgets, QtCore, QtGui
+from PyQt5.QtCore import QTimer
 
 from panorama.drivers.base import SweepConfig, SourceBackend
 from panorama.features.spectrum.model import SpectrumModel
 from panorama.shared.palettes import get_colormap
 
 # Константы оптимизации для плавного отображения 50-6000 МГц
-# Уменьшены значения для предотвращения зависания графика
-MAX_DISPLAY_COLS = 1024   # Максимум колонок для отображения (уменьшено для производительности)
+# Адаптивное разрешение с авто-детализацией при зуме
+MIN_DISPLAY_COLS = 1024   # Минимум колонок для отображения (панорама)
+MAX_DISPLAY_COLS = 8192   # Максимум колонок для отображения (детализация)
 WATER_ROWS_DEFAULT = 100  # Строк водопада по умолчанию
-MAX_SPECTRUM_POINTS = 1024  # Максимум точек для линий спектра (уменьшено для производительности)
+MAX_SPECTRUM_POINTS = 8192  # Максимум точек для линий спектра (увеличено для широких диапазонов)
 
 
 class SDRConfig:
@@ -72,7 +74,7 @@ class SDRConfig:
 
 
 class SpectrumView(QtWidgets.QWidget):
-    """Главный виджет спектра с водопадом, оптимизированный для плавного отображения 50-6000 МГц."""
+    """Главный виджет спектра с водопадом, оптимизированный для высокого разрешения широких диапазонов 50-6000 МГц."""
 
     newRowReady = QtCore.pyqtSignal(object, object)  # (freqs_hz, row_dbm)
     rangeSelected = QtCore.pyqtSignal(float, float)
@@ -104,6 +106,16 @@ class SpectrumView(QtWidgets.QWidget):
         self._last_full_ts: Optional[float] = None
         self._dt_ema: Optional[float] = None
         self._running = False
+        
+        # EMA состояние
+        self._ema_last: Optional[np.ndarray] = None
+        
+        # Min/Max hold
+        self._minhold: Optional[np.ndarray] = None
+        self._maxhold: Optional[np.ndarray] = None
+        
+        # Среднее окно
+        self._avg_queue = deque(maxlen=10)
         
         # Строим интерфейс
         self._build_ui()
@@ -159,6 +171,17 @@ class SpectrumView(QtWidgets.QWidget):
         self._minhold: Optional[np.ndarray] = None
         self._maxhold: Optional[np.ndarray] = None
         self._ema_last: Optional[np.ndarray] = None
+        
+        # Адаптивное разрешение для отрисовки
+        self._display_cols = MIN_DISPLAY_COLS  # динамическое число колонок для отрисовки
+        self._zoom_debounce = QTimer(self)
+        self._zoom_debounce.setInterval(120)   # мс
+        self._zoom_debounce.setSingleShot(True)
+        self._zoom_debounce.timeout.connect(self._apply_auto_resolution)
+        
+        # Кеш для перерисовки при смене масштаба
+        self._last_freqs_hz: Optional[np.ndarray] = None
+        self._last_power_dbm: Optional[np.ndarray] = None
         
         # Маркеры и ROI
         self._marker_seq = 0
@@ -293,6 +316,9 @@ class SpectrumView(QtWidgets.QWidget):
         self._lut_name = "turbo"
         self._lut = get_colormap(self._lut_name, 256)
         self._wf_levels = (-110.0, -20.0)
+        
+        # Подписываемся на изменение диапазона графика для авто-разрешения
+        self.plot.getViewBox().sigRangeChanged.connect(lambda *_: self._zoom_debounce.start())
 
     def _build_right_panel(self) -> QtWidgets.QWidget:
         """Создает правую панель настроек."""
@@ -475,6 +501,66 @@ class SpectrumView(QtWidgets.QWidget):
         
         self.config.save_to_file(self.config_path)
 
+    def _target_display_cols(self, span_hz: float) -> int:
+        """
+        Подбираем число точек ТОЛЬКО для отрисовки в зависимости от текущего видимого span.
+        Логика:
+          - обзорная панорама: мало точек (1024–2048)
+          - при зуме автоматом повышаем детализацию (до 8192), чтобы ~<=100 кГц/бин
+        """
+        if span_hz <= 0:
+            return MIN_DISPLAY_COLS
+
+        # хотим <=100 кГц на точку в «детализированном» режиме
+        target_bin_hz = 100_000.0
+        cols_by_resolution = int(max(1, span_hz / target_bin_hz))
+
+        # ступенчатые пороги, чтобы картинка не «дёргалась» при лёгком скролле
+        # > 1 ГГц — 1024; 200М–1Г — 2048; 50–200М — 4096; <50М — 8192
+        span_mhz = span_hz * 1e-6
+        if span_mhz > 1000:
+            tier_cols = 1024
+        elif span_mhz > 200:
+            tier_cols = 2048
+        elif span_mhz > 50:
+            tier_cols = 4096
+        else:
+            tier_cols = 8192
+
+        target = max(MIN_DISPLAY_COLS, min(MAX_DISPLAY_COLS, max(tier_cols, cols_by_resolution)))
+        return target
+
+    def _on_zoom_changed(self):
+        """Обработчик изменения зума для адаптивного разрешения."""
+        if self._last_freqs_hz is None or self._last_freqs_hz.size == 0:
+            return
+            
+        x0, x1 = self.plot.getViewBox().viewRange()[0]
+        span_mhz = max(0.001, x1 - x0)
+        full_span_mhz = (self._last_freqs_hz[-1] - self._last_freqs_hz[0]) * 1e-6
+        zoom_ratio = full_span_mhz / span_mhz
+
+        # Простая шкала: чем глубже зум, тем больше точек
+        new_cols = MIN_DISPLAY_COLS  # базовое значение
+        if zoom_ratio > 4:
+            new_cols = 4096
+        if zoom_ratio > 8:
+            new_cols = 8192
+        if zoom_ratio > 16:
+            new_cols = 16384
+            
+        # Ограничиваем максимальным значением
+        new_cols = min(new_cols, MAX_DISPLAY_COLS)
+        
+        if new_cols != self._display_cols:
+            self._display_cols = new_cols
+            # перерисовать с новым даунсемплом
+            self._refresh_spectrum()
+
+    def _apply_auto_resolution(self):
+        """Вызывается с дебаунсом при каждом зуме/скролле."""
+        self._on_zoom_changed()
+
     def set_source(self, src: SourceBackend):
         """Устанавливает источник данных."""
         if self._source is not None:
@@ -580,15 +666,9 @@ class SpectrumView(QtWidgets.QWidget):
         self.water_plot.setXRange(x0, x1, padding=0.0)
         
         # Адаптивный даунсемплинг для больших диапазонов
-        if n > 10000:  # Очень большие диапазоны
-            self._wf_max_cols = 512
-            waterfall_rows = 50
-        elif n > 2048:  # Большие диапазоны
-            self._wf_max_cols = 1024  # Уменьшено для производительности
-            waterfall_rows = 100
-        else:  # Обычные диапазоны
-            self._wf_max_cols = 2048  # Уменьшено для производительности
-            waterfall_rows = 200
+        # Используем динамическое разрешение для waterfall
+        self._wf_max_cols = self._display_cols
+        waterfall_rows = 100  # Фиксированное количество строк
         
         self._wf_ds_factor = max(1, int(np.ceil(n / self._wf_max_cols)))
         self._wf_cols_ds = int(np.ceil(n / self._wf_ds_factor))
@@ -621,41 +701,61 @@ class SpectrumView(QtWidgets.QWidget):
         self._ema_last = None
 
     def _update_waterfall_display(self):
-        """Обновление водопада."""
-        if self._water_view is None or self._model.power_dbm is None:
+        """Обновление водопада из накопленного массива модели."""
+        if self._model.waterfall is None or len(self._model.waterfall) == 0:
             return
         
-        # Даунсемплируем последнюю строку
-        row_ds = self._downsample_array(self._model.power_dbm, self._wf_ds_factor, method='max')
+        # Получаем накопленные строки водопада
+        waterfall_data = list(self._model.waterfall)
+        if not waterfall_data:
+            return
+            
+        # Даунсемплируем каждую строку
+        waterfall_ds = []
+        for row in waterfall_data:
+            row_ds = self._downsample_array(row, self._wf_ds_factor, method='max')
+            if row_ds.size != self._wf_cols_ds:
+                if row_ds.size > self._wf_cols_ds:
+                    row_ds = row_ds[:self._wf_cols_ds]
+                else:
+                    row_ds = np.pad(row_ds, (0, self._wf_cols_ds - row_ds.size), mode='edge')
+            waterfall_ds.append(row_ds)
         
-        # Проверяем размер
-        if row_ds.size != self._wf_cols_ds:
-            if row_ds.size > self._wf_cols_ds:
-                row_ds = row_ds[:self._wf_cols_ds]
-            else:
-                row_ds = np.pad(row_ds, (0, self._wf_cols_ds - row_ds.size), mode='edge')
-        
-        # Сдвигаем водопад вверх, новые данные внизу
-        self._water_view[:-1, :] = self._water_view[1:, :]
-        self._water_view[-1, :] = row_ds
-        
-        # Обновляем изображение
-        self.water_img.setImage(self._water_view, autoLevels=False)
+        # Создаем матрицу водопада
+        if waterfall_ds:
+            waterfall_matrix = np.array(waterfall_ds, dtype=np.float32)
+            # Обновляем изображение из накопленного массива
+            self.water_img.setImage(waterfall_matrix, autoLevels=False)
+            
+            # Устанавливаем правильный прямоугольник водопада
+            if self._last_freqs_hz is not None and self._last_freqs_hz.size > 0:
+                self.water_img.setRect(QtCore.QRectF(
+                    self._last_freqs_hz[0]*1e-6, 0.0,
+                    (self._last_freqs_hz[-1]-self._last_freqs_hz[0])*1e-6,
+                    float(waterfall_matrix.shape[0])
+                ))
         
         # Автонастройка уровней после первых свипов
         if self._sweep_count == 10:
             self._auto_levels()
 
-    def _refresh_spectrum(self):
-        """Обновление линий спектра."""
-        freqs = self._model.freqs_hz
-        power = self._model.power_dbm
+    def _render_spectrum(self, freqs_hz, power_dbm):
+        """Отрисовка спектра с адаптивным разрешением."""
+        # кешируем «сырые» массивы, чтобы можно было перерисовать при смене масштаба
+        self._last_freqs_hz = freqs_hz
+        self._last_power_dbm = power_dbm
         
-        if freqs is None or power is None or freqs.size == 0:
+        if freqs_hz is None or power_dbm is None or freqs_hz.size == 0:
             return
+            
+        # первый валидный свип — фиксируем обзорный диапазон
+        if not hasattr(self, '_last_freqs_hz') or self._last_freqs_hz is None:
+            vb = self.plot.getViewBox()
+            vb.setLimits(xMin=freqs_hz[0]*1e-6, xMax=freqs_hz[-1]*1e-6)  # запретить выход за края
+            vb.setXRange(freqs_hz[0]*1e-6, freqs_hz[-1]*1e-6, padding=0)
         
-        x_mhz = freqs.astype(np.float64) / 1e6
-        y = power.astype(np.float32, copy=False)
+        x_mhz = freqs_hz.astype(np.float64) / 1e6
+        y = power_dbm.astype(np.float32, copy=False)
         
         # Применяем сглаживание
         if self.chk_smooth.isChecked():
@@ -664,54 +764,48 @@ class SpectrumView(QtWidgets.QWidget):
         if self.chk_ema.isChecked():
             y = self._smooth_time_ema(y)
         
-        # Агрессивный даунсемплинг для отображения
-        max_display_points = MAX_SPECTRUM_POINTS
-        if x_mhz.size > max_display_points:
-            ds_factor = int(np.ceil(x_mhz.size / max_display_points))
-            x_ds = self._downsample_array(x_mhz, ds_factor, method='mean')
-            y_ds = self._downsample_array(y, ds_factor, method='max')
+        # Просто обновляем данные без полного reset
+        self.curve_now.setData(freqs_hz * 1e-6, power_dbm)
+
+        # EMA, min/max считаем на полных данных:
+        if getattr(self, "_ema_last", None) is None:
+            self._ema_last = power_dbm.astype("float32", copy=True)
         else:
-            x_ds = x_mhz
-            y_ds = y
-        
-        # Обновляем текущую линию
-        self.curve_now.setData(x_ds, y_ds)
-        
-        # Обновляем среднюю
-        self._avg_queue.append(power.copy())
-        if len(self._avg_queue) > self.avg_win.value():
-            self._avg_queue.popleft()
-        
-        if self._avg_queue:
-            y_avg = np.mean(np.stack(list(self._avg_queue), axis=0), axis=0)
-            if x_mhz.size > max_display_points:
-                y_avg_ds = self._downsample_array(y_avg, ds_factor, method='mean')
+            alpha = float(self.alpha.value()) if self.chk_ema.isChecked() else 1.0
+            self._ema_last = (1.0 - alpha) * self._ema_last + alpha * power_dbm
+
+        if self.chk_ema.isChecked():
+            self.curve_avg.setData(freqs_hz * 1e-6, self._ema_last)
+        else:
+            self.curve_avg.setData([], [])
+
+        if self.chk_min.isChecked():
+            if getattr(self, "_minhold", None) is None:
+                self._minhold = power_dbm.copy()
             else:
-                y_avg_ds = y_avg
-            self.curve_avg.setData(x_ds, y_avg_ds)
-        
-        # Min/Max hold
-        if self._minhold is None or self._minhold.shape != power.shape:
-            self._minhold = power.copy()
+                self._minhold = np.minimum(self._minhold, power_dbm)
+            self.curve_min.setData(freqs_hz * 1e-6, self._minhold)
         else:
-            self._minhold = np.minimum(self._minhold, power)
-        
-        if self._maxhold is None or self._maxhold.shape != power.shape:
-            self._maxhold = power.copy()
+            self.curve_min.setData([], [])
+
+        if self.chk_max.isChecked():
+            if getattr(self, "_maxhold", None) is None:
+                self._maxhold = power_dbm.copy()
+            else:
+                self._maxhold = np.maximum(self._maxhold, power_dbm)
+            self.curve_max.setData(freqs_hz * 1e-6, self._maxhold)
         else:
-            self._maxhold = np.maximum(self._maxhold, power)
-        
-        if x_mhz.size > max_display_points:
-            min_ds = self._downsample_array(self._minhold, ds_factor, method='min')
-            max_ds = self._downsample_array(self._maxhold, ds_factor, method='max')
-        else:
-            min_ds = self._minhold
-            max_ds = self._maxhold
-        
-        self.curve_min.setData(x_ds, min_ds)
-        self.curve_max.setData(x_ds, max_ds)
+            self.curve_max.setData([], [])
         
         self._update_cursor_label()
+        
+        # Обновляем бейдж с разрешением
+        self._update_resolution_badge()
+
+    def _refresh_spectrum(self):
+        """Обновление линий спектра (совместимость)."""
+        if self._model.freqs_hz is not None and self._model.power_dbm is not None:
+            self._render_spectrum(self._model.freqs_hz, self._model.power_dbm)
 
     def _downsample_array(self, arr: np.ndarray, factor: int, method: str = 'max') -> np.ndarray:
         """Универсальный даунсемплинг массива."""
@@ -738,6 +832,21 @@ class SpectrumView(QtWidgets.QWidget):
             result = np.max(blocks, axis=1)
         
         return result.astype(arr.dtype, copy=False)
+
+    def _downsample_line(self, x: np.ndarray, y: np.ndarray, max_points: int) -> tuple[np.ndarray, np.ndarray]:
+        """Равномерно прореживает x/y до max_points для быстрой отрисовки."""
+        if x is None or y is None:
+            return x, y
+        if not isinstance(x, np.ndarray):
+            x = np.asarray(x)
+        if not isinstance(y, np.ndarray):
+            y = np.asarray(y)
+        n = x.size
+        if n <= max_points or max_points <= 0:
+            return x, y
+        # Индексы равномерной выборки (включая последний)
+        idx = np.linspace(0, n - 1, num=max_points).astype(np.int64)
+        return x[idx], y[idx]
 
     def _smooth_freq(self, y: np.ndarray) -> np.ndarray:
         """Сглаживание по частоте."""
@@ -773,6 +882,29 @@ class SpectrumView(QtWidgets.QWidget):
         
         self._ema_last = (a * y) + ((1.0 - a) * self._ema_last)
         return self._ema_last.copy()
+
+    def _update_resolution_badge(self):
+        """Обновляет бейдж с текущим разрешением."""
+        if not hasattr(self, '_resolution_badge'):
+            # Создаем бейдж при первом вызове
+            self._resolution_badge = pg.TextItem(
+                text="", 
+                color=pg.mkColor(255, 255, 255), 
+                anchor=(1, 0),  # правый верхний угол
+                border=pg.mkPen(color=(100, 100, 100), width=1),
+                fill=pg.mkBrush(color=(50, 50, 50, 180))
+            )
+            self.plot.addItem(self._resolution_badge)
+        
+        # Вычисляем текущее разрешение
+        if self._last_freqs_hz is not None and self._last_freqs_hz.size > 1:
+            span_hz = self._last_freqs_hz[-1] - self._last_freqs_hz[0]
+            bin_width_khz = span_hz / self._display_cols / 1e3
+            resolution_text = f"Разрешение: {bin_width_khz:.1f} кГц/бин"
+        else:
+            resolution_text = f"Точек: {self._display_cols}"
+        
+        self._resolution_badge.setText(resolution_text)
 
     def _update_statistics(self):
         """Обновление статистики."""
@@ -825,17 +957,20 @@ class SpectrumView(QtWidgets.QWidget):
         
         # Создаем конфигурацию
         cfg = SweepConfig(
-            freq_start_hz=int(f0),
-            freq_end_hz=int(f1),
+            # всегда глобальный обзор для мастера
+            freq_start_hz=50_000_000,
+            freq_end_hz=6_000_000_000,
             bin_hz=int(bw),
             lna_db=int(self.lna_db.value()),
             vga_db=int(self.vga_db.value()),
             amp_on=bool(self.amp_on.isChecked()),
+            # локальное окно только для детектора/слейвов, мастер его игнорирует
+            detector_span_hz=int(self.spanSpin.value() * 1e6),
             serial=master_serial
         )
         self._current_cfg = cfg
         
-        # Инициализация модели
+        # Инициализация модели с глобальными границами
         self._model.set_grid(cfg.freq_start_hz, cfg.freq_end_hz, cfg.bin_hz)
         
         # Сброс счетчиков

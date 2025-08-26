@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import QSplitter, QFrame, QMessageBox, QFileDialog, QFormLa
 import numpy as np
 
 # Импортируем наши модули
-from panorama.features.master_sweep.master import MasterSweepController
+from panorama.features.spectrum.master import MasterSweepController
 from panorama.features.slave_sdr.slave import SlaveManager
 from panorama.features.trilateration.engine import RSSITrilaterationEngine
 from panorama.features.orchestrator.core import Orchestrator
@@ -32,7 +32,7 @@ from panorama.features.settings.manager_improved import ImprovedDeviceManagerDia
 from panorama.features.settings.storage import load_sdr_settings, save_sdr_settings
 from panorama.features.spectrum.master_adapter import MasterSourceAdapter
 from panorama.features.detector.settings_dialog import DetectorSettingsDialog, DetectorSettings
-from panorama.features.watchlist import WatchlistView
+from panorama.features.slaves import SlavesView
 
 
 class RSSIPanoramaMainWindow(QMainWindow):
@@ -156,33 +156,6 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def _update_ui_for_master_status(self):
         """Обновляет состояние UI в зависимости от наличия конфигурации Master устройства."""
         try:
-            if hasattr(self, 'start_orch_btn'):
-                if self.master_ready:
-                    self.start_orch_btn.setEnabled(True)
-                    self.start_orch_btn.setToolTip("Master устройство настроено. Можно запускать спектр.")
-                    self.start_orch_btn.setStyleSheet("""
-                        QPushButton {
-                            background-color: #4CAF50;
-                            color: white;
-                            font-weight: bold;
-                            padding: 8px 15px;
-                        }
-                        QPushButton:hover {
-                            background-color: #45a049;
-                        }
-                    """)
-                else:
-                    self.start_orch_btn.setEnabled(False)
-                    self.start_orch_btn.setToolTip("Master устройство не настроено. Перейдите в Настройки → Диспетчер устройств")
-                    self.start_orch_btn.setStyleSheet("""
-                        QPushButton {
-                            background-color: #f44336;
-                            color: white;
-                            font-weight: bold;
-                            padding: 8px 15px;
-                        }
-                    """)
-            
             if hasattr(self, 'toolbar_orch_action'):
                 if self.master_ready:
                     self.toolbar_orch_action.setEnabled(True)
@@ -272,23 +245,12 @@ class RSSIPanoramaMainWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
-        # Основной layout
-        main_layout = QHBoxLayout(central_widget)
+        # Основной layout - теперь только правая панель
+        main_layout = QVBoxLayout(central_widget)
         
-        # Создаем сплиттер для разделения панелей
-        splitter = QSplitter(QtCore.Qt.Horizontal)
-        main_layout.addWidget(splitter)
-        
-        # Левая панель — только спектр/водопад и результаты, без Master/Slave настроек
-        left_panel = self._create_left_panel_min()
-        splitter.addWidget(left_panel)
-        
-        # Правая панель - карта и спектр
+        # Правая панель - карта, спектр и управление слейвами
         right_panel = self._create_right_panel()
-        splitter.addWidget(right_panel)
-        
-        # Устанавливаем пропорции сплиттера
-        splitter.setSizes([400, 1000])
+        main_layout.addWidget(right_panel)
         
         # Создаем меню
         self._create_menu()
@@ -296,113 +258,31 @@ class RSSIPanoramaMainWindow(QMainWindow):
         # Создаем панель инструментов
         self._create_toolbar()
     
-    def _create_left_panel_min(self):
-        """Левая панель: параметры измерений + управление оркестратором, без настроек SDR."""
-        left_widget = QWidget()
-        layout = QVBoxLayout(left_widget)
-        # Панель параметров измерений
-        
-        # Панель параметров
-        params_group = QGroupBox("Параметры измерений")
-        params_layout = QVBoxLayout(params_group)
-        
-        # Глобальные параметры
-        global_params_layout = QHBoxLayout()
-        global_params_layout.addWidget(QLabel("Span (MHz):"))
-        self.span_spin = QDoubleSpinBox()
-        self.span_spin.setRange(0.1, 10.0)
-        self.span_spin.setValue(2.0)
-        self.span_spin.setDecimals(1)
-        global_params_layout.addWidget(self.span_spin)
-        
-        global_params_layout.addWidget(QLabel("Dwell (ms):"))
-        self.global_dwell_spin = QSpinBox()
-        self.global_dwell_spin.setRange(50, 500)
-        self.global_dwell_spin.setValue(150)
-        global_params_layout.addWidget(self.global_dwell_spin)
-        params_layout.addLayout(global_params_layout)
-        
-        # Режим работы
-        mode_layout = QHBoxLayout()
-        self.auto_mode_check = QCheckBox("Автоматический режим")
-        self.auto_mode_check.setChecked(True)
-        self.auto_mode_check.toggled.connect(self._toggle_mode)
-        mode_layout.addWidget(self.auto_mode_check)
-        
-        self.manual_mode_check = QCheckBox("Ручной режим")
-        self.manual_mode_check.toggled.connect(self._toggle_mode)
-        mode_layout.addWidget(self.manual_mode_check)
-        params_layout.addLayout(mode_layout)
-        
-        # Ручное измерение
-        manual_layout = QHBoxLayout()
-        manual_layout.addWidget(QLabel("Частота (MHz):"))
-        self.manual_freq_spin = QDoubleSpinBox()
-        self.manual_freq_spin.setRange(24.0, 6000.0)
-        self.manual_freq_spin.setValue(2400.0)
-        self.manual_freq_spin.setDecimals(1)
-        manual_layout.addWidget(self.manual_freq_spin)
-        
-        self.manual_measure_btn = QPushButton("Измерить")
-        self.manual_measure_btn.clicked.connect(self._manual_measure)
-        manual_layout.addWidget(self.manual_measure_btn)
-        params_layout.addLayout(manual_layout)
-        
-        layout.addWidget(params_group)
-        
-        # Оркестратор перенесен в отдельную вкладку справа
-        
-        # Дополнительные параметры измерений
-        advanced_params_group = QGroupBox("Дополнительные параметры")
-        advanced_params_layout = QFormLayout(advanced_params_group)
-        
-        # SNR порог
-        self.snr_threshold_spin = QDoubleSpinBox()
-        self.snr_threshold_spin.setRange(3.0, 50.0)
-        self.snr_threshold_spin.setValue(10.0)
-        self.snr_threshold_spin.setDecimals(1)
-        self.snr_threshold_spin.setSuffix(" дБ")
-        advanced_params_layout.addRow("SNR порог:", self.snr_threshold_spin)
-        
-        # Минимальная ширина пика
-        self.min_peak_width_spin = QSpinBox()
-        self.min_peak_width_spin.setRange(1, 20)
-        self.min_peak_width_spin.setValue(3)
-        self.min_peak_width_spin.setSuffix(" бинов")
-        advanced_params_layout.addRow("Мин. ширина пика:", self.min_peak_width_spin)
-        
-        # Минимальное расстояние между пиками
-        self.min_peak_distance_spin = QSpinBox()
-        self.min_peak_distance_spin.setRange(1, 50)
-        self.min_peak_distance_spin.setValue(5)
-        self.min_peak_distance_spin.setSuffix(" бинов")
-        advanced_params_layout.addRow("Мин. расстояние пиков:", self.min_peak_distance_spin)
-        
-        # Количество усреднений
-        self.avg_count_spin = QSpinBox()
-        self.avg_count_spin.setRange(1, 10)
-        self.avg_count_spin.setValue(1)
-        advanced_params_layout.addRow("Усреднений:", self.avg_count_spin)
-        
-        layout.addWidget(advanced_params_group)
-        
-        return left_widget
+
     
     def _show_detector_settings(self):
         """Показывает диалог настроек детектора."""
-        from panorama.features.detector.settings_dialog import DetectorSettingsDialog
-        dlg = DetectorSettingsDialog(self)
-        dlg.settingsChanged.connect(lambda s: self.watchlist_manager.set_parameters(
-            span_hz=s.watchlist_span_mhz * 1e6,
-            max_size=s.max_watchlist_size,
-            threshold_offset=s.baseline_offset_db
-        ))
-        dlg.exec_()
-        
+        try:
+            dlg = DetectorSettingsDialog(self)
+            def _on_changed(s: DetectorSettings):
+                # Применяем некоторые глобальные параметры к оркестратору
+                try:
+                    if self.orchestrator:
+                        self.orchestrator.set_global_parameters(span_hz=s.watchlist_span_mhz * 1e6,
+                                                                dwell_ms=int(s.watchlist_dwell_ms))
+                except Exception:
+                    pass
+            dlg.settingsChanged.connect(_on_changed)
+            dlg.exec_()
+        except Exception as e:
+            self.log.error(f"Detector settings dialog error: {e}")
+    
     def _create_right_panel(self):
-        """Создает правую панель с картой и спектром."""
+        """Создает правую панель с картой, спектром и управлением слейвами."""
         right_widget = QWidget()
         layout = QVBoxLayout(right_widget)
+        
+
         
         # Создаем вкладки
         tab_widget = QTabWidget()
@@ -414,7 +294,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
                 self.map_view.update_stations_from_config(self.sdr_settings)
         except Exception:
             pass
-        tab_widget.addTab(self.map_view, "Карта")
+        tab_widget.addTab(self.map_view, "🗺️ Карта")
         
         # Вкладка спектра
         self.spectrum_view = SpectrumView(orchestrator=self.orchestrator)
@@ -424,86 +304,17 @@ class RSSIPanoramaMainWindow(QMainWindow):
                 self.spectrum_view.set_source(MasterSourceAdapter(self.log))
         except Exception:
             pass
-        tab_widget.addTab(self.spectrum_view, "Спектр")
+        tab_widget.addTab(self.spectrum_view, "📊 Спектр")
         
-        # Вкладка результатов
-        results_widget = self._create_results_widget()
-        tab_widget.addTab(results_widget, "Результаты")
-        
-        # Вкладка оркестратора
-        orch_widget = self._create_orchestrator_widget()
-        tab_widget.addTab(orch_widget, "Контроль")
-        
-        # Вкладка Watchlist
-        self.watchlist_view = WatchlistView(orchestrator=self.orchestrator)
-        tab_widget.addTab(self.watchlist_view, "Watchlist")
+        # Вкладка управления слейвами (объединяет watchlist, результаты и контроль)
+        self.slaves_view = SlavesView(orchestrator=self.orchestrator)
+        tab_widget.addTab(self.slaves_view, "🎯 Слейвы")
         
         layout.addWidget(tab_widget)
         
         return right_widget
     
-    def _create_results_widget(self):
-        """Создает виджет для отображения результатов."""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        
-        # Таблица целей
-        targets_group = QGroupBox("Обнаруженные цели")
-        targets_layout = QVBoxLayout(targets_group)
-        
-        self.targets_table = QTableWidget()
-        self.targets_table.setColumnCount(6)
-        self.targets_table.setHorizontalHeaderLabels([
-            "Частота (МГц)", "X (м)", "Y (м)", "Доверие", "Возраст (с)", "Станции"
-        ])
-        targets_layout.addWidget(self.targets_table)
-        
-        layout.addWidget(targets_group)
-        
-        # Таблица задач
-        tasks_group = QGroupBox("Задачи измерений")
-        tasks_layout = QVBoxLayout(tasks_group)
-        
-        self.tasks_table = QTableWidget()
-        self.tasks_table.setColumnCount(5)
-        self.tasks_table.setHorizontalHeaderLabels([
-            "ID", "Частота (МГц)", "Статус", "Создана", "Завершена"
-        ])
-        tasks_layout.addWidget(self.tasks_table)
-        
-        layout.addWidget(tasks_group)
-        
-        return widget
 
-    def _create_orchestrator_widget(self):
-        """Создает вкладку управления оркестратором."""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        
-        # Кнопки управления
-        buttons = QHBoxLayout()
-        self.start_orch_btn = QPushButton("Старт")
-        self.start_orch_btn.clicked.connect(self._start_orchestrator)
-        buttons.addWidget(self.start_orch_btn)
-        
-        self.stop_orch_btn = QPushButton("Стоп")
-        self.stop_orch_btn.clicked.connect(self._stop_orchestrator)
-        self.stop_orch_btn.setEnabled(False)
-        buttons.addWidget(self.stop_orch_btn)
-        
-        layout.addLayout(buttons)
-        
-        # Статус
-        self.orchestrator_status_label = QLabel("Статус: Остановлен")
-        layout.addWidget(self.orchestrator_status_label)
-        
-        # Пояснение
-        hint = QLabel("Контроль распределяет измерения по Slave (SoapySDR) для трилатерации.")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        
-        layout.addStretch(1)
-        return widget
     
     def _create_menu(self):
         """Создает главное меню."""
@@ -724,34 +535,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
         except Exception as e:
             self.log.error(f"Error removing slave {slave_id}: {e}")
     
-    def _toggle_mode(self):
-        """Переключает режим работы."""
-        try:
-            auto_mode = self.auto_mode_check.isChecked()
-            self.orchestrator.set_auto_mode(auto_mode)
-            
-            if auto_mode:
-                self.log.info("Auto mode enabled")
-            else:
-                self.log.info("Manual mode enabled")
-                
-        except Exception as e:
-            self.log.error(f"Error toggling mode: {e}")
-    
-    def _manual_measure(self):
-        """Выполняет ручное измерение."""
-        try:
-            freq_hz = self.manual_freq_spin.value() * 1e6
-            span_hz = self.span_spin.value() * 1e6
-            dwell_ms = self.global_dwell_spin.value()
-            
-            self.orchestrator.create_manual_measurement(freq_hz, span_hz, dwell_ms)
-            
-            self.log.info(f"Manual measurement started: {freq_hz/1e6:.1f} MHz")
-            
-        except Exception as e:
-            self.log.error(f"Error starting manual measurement: {e}")
-            QMessageBox.critical(self, "Ошибка", f"Не удалось запустить измерение: {e}")
+
     
     def _start_orchestrator(self):
         """Запускает оркестратор."""
@@ -770,17 +554,17 @@ class RSSIPanoramaMainWindow(QMainWindow):
                     raise RuntimeError("Failed to initialize SDR")
                 self.log.info("SDR initialized successfully")
             
-            # Устанавливаем глобальные параметры
-            span_hz = self.span_spin.value() * 1e6
-            dwell_ms = self.global_dwell_spin.value()
+            # Устанавливаем глобальные параметры по умолчанию
+            # (конкретные значения настраиваются через диалог настроек детектора)
+            span_hz = 2.0 * 1e6  # 2 MHz по умолчанию
+            dwell_ms = 150  # 150 ms по умолчанию
             
             self.orchestrator.set_global_parameters(span_hz, dwell_ms)
             
             # Запускаем оркестратор
             self.orchestrator.start()
             
-            self.start_orch_btn.setEnabled(False)
-            self.stop_orch_btn.setEnabled(True)
+            # Кнопки управления оркестратором находятся в тулбаре
             self.toolbar_orch_action.setText('⏹ Контроль')
             
             self.system_status['orchestrator_running'] = True
@@ -807,8 +591,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
                 self.master_controller.deinitialize_sdr()
                 self.log.info("SDR deinitialized successfully")
             
-            self.start_orch_btn.setEnabled(True)
-            self.stop_orch_btn.setEnabled(False)
+            # Кнопки управления оркестратором находятся в тулбаре
             self.toolbar_orch_action.setText('▶ Контроль')
             
             self.system_status['orchestrator_running'] = False
@@ -1003,13 +786,10 @@ class RSSIPanoramaMainWindow(QMainWindow):
             # Обновляем статус мастера по факту работы контроллера
             if self.master_controller is not None:
                 self.system_status['master_running'] = bool(getattr(self.master_controller, 'is_running', False))
-            # Обновляем статус оркестратора
+            # Обновляем статус оркестратора (без отображения в UI)
             if self.orchestrator:
                 orch_status = self.orchestrator.get_system_status()
-                if orch_status['is_running']:
-                    self.orchestrator_status_label.setText("Статус: Работает")
-                else:
-                    self.orchestrator_status_label.setText("Статус: Остановлен")
+                # Статус отображается только в заголовке окна
             
             # Обновляем заголовок окна
             title = f"ПАНОРАМА RSSI - Master: {'ON' if self.system_status['master_running'] else 'OFF'}, "

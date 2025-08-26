@@ -13,7 +13,8 @@ from collections import deque, defaultdict
 
 from PyQt5.QtCore import QObject, pyqtSignal, QMutex, QTimer
 
-from panorama.features.master_sweep.master import DetectedPeak, MasterSweepController
+from panorama.features.spectrum.master import MasterSweepController
+from panorama.features.spectrum.model import DetectedPeak
 from panorama.features.slave_sdr.slave import (
     RSSIMeasurement,
     MeasurementWindow,

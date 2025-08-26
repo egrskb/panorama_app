@@ -4,8 +4,7 @@ import numpy as np
 import time
 from PyQt5 import QtCore
 
-from panorama.features.spectrum.model import PeakDetector
-from panorama.features.master_sweep.master import DetectedPeak
+from panorama.features.spectrum.model import PeakDetector, DetectedPeak
 
 
 def _qt_parent(parent):
@@ -134,9 +133,13 @@ class MasterSweepController(QtCore.QObject):
 
             # старый контракт: DetectedPeak
             dp = DetectedPeak(
+                freq_hz=float(peak_freq),
+                snr_db=float(peak_snr),
+                power_dbm=float(power[np.argmin(np.abs(freqs - peak_freq))]),
+                band_hz=float(self.span_hz / 2.0),
+                idx=int(np.argmin(np.abs(freqs - peak_freq))),
                 id=f"peak_{int(round(peak_freq))}",
                 f_peak=float(peak_freq),
-                snr_db=float(peak_snr),
                 bin_hz=float(self.span_hz),  # исторически здесь bin; кладём span для совместимости
                 t0=now,
                 last_seen=now,

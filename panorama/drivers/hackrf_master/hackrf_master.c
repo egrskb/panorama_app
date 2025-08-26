@@ -36,6 +36,8 @@
 #define MAX_SPECTRUM_POINTS                100000
 #define INTERLEAVED                        1
 
+
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -96,6 +98,10 @@ typedef struct {
     volatile int running;
     volatile int stop_requested;
     struct timeval start_time;
+    
+    // Поток свипа
+    volatile int is_running_thread;
+    pthread_t sweep_thread;
 
     // Калибровка
     float calibration_offset_db;
@@ -110,10 +116,12 @@ typedef struct {
     void* user_data;
 } MasterContext;
 
+// ================== Прототипы (NEW) ==================
+static int setup_global_spectrum_grid(MasterContext* m, double f_start_hz, double f_stop_hz, double freq_step_hz);
+
 // ================== Глобальные ==================
 static MasterContext* g_master = NULL;
 static char g_last_error[256] = {0};
-static pthread_t g_worker_thread;
 
 // Буферы сегментов для multi_cb
 static hq_segment_data_t g_segments[MAX_SEGMENTS];
@@ -272,6 +280,7 @@ static void destroy_processing_context(ProcessingContext* ctx) {
 
 // ================== Глобальный спектр ==================
 static inline void spectrum_update_ema(MasterContext* m, double freq_hz, float val_dbm, float alpha) {
+    if (!m || !m->spectrum_freqs || !m->spectrum_powers || !m->spectrum_counts) return;  // защита от неинициализированных массивов
     if (freq_hz < m->freq_start_hz || freq_hz > m->freq_stop_hz) return;
     if (m->freq_step_hz <= 0) return;
 
@@ -289,6 +298,7 @@ static inline void spectrum_update_ema(MasterContext* m, double freq_hz, float v
 // ================== Обработка sweep-блока ==================
 static void process_sweep_block(MasterContext* master, uint8_t* buffer, int valid_length) {
     if (!master || !master->proc || !buffer || valid_length < 16) return;
+    if (master->stop_requested) return;  // защита от остановки
     ProcessingContext* proc = master->proc;
 
     // сигнатура sweep-пакета
@@ -589,98 +599,154 @@ int hq_open(const char* serial_suffix) {
     g_master->calibration_offset_db = 0.0f;
     g_master->running = 0;
     g_master->stop_requested = 0;
+    g_master->is_running_thread = 0;
 
     return 0;
 }
 
 void hq_close(void) {
     if (!g_master) return;
+    MasterContext* m = g_master;
+    g_master = NULL; // обнуляем сразу, чтобы повторные вызовы были безопасны
 
-    // Сначала останавливаем если запущен
-    if (g_master->running) {
-        hq_stop();
+    // сначала стоп
+    hq_stop();
+
+    // освобождение ресурсов
+    if (m->dev) {
+        hackrf_close(m->dev);
+        m->dev = NULL;
     }
-
-    // Очищаем спектр
-    if (g_master->spectrum_freqs) {
-        free(g_master->spectrum_freqs);
-        g_master->spectrum_freqs = NULL;
-    }
-    if (g_master->spectrum_powers) {
-        free(g_master->spectrum_powers);
-        g_master->spectrum_powers = NULL;
-    }
-    if (g_master->spectrum_counts) {
-        free(g_master->spectrum_counts);
-        g_master->spectrum_counts = NULL;
-    }
-
-    // Уничтожаем мьютекс
-    pthread_mutex_destroy(&g_master->spectrum_mutex);
-
-    // Закрываем устройство
-    if (g_master->dev) {
-        hackrf_close(g_master->dev);
-        g_master->dev = NULL;
-    }
-
-    // Очищаем буферы сегментов
-    for (int i = 0; i < 4; i++) {
-        if (g_seg_freqs[i]) {
-            free(g_seg_freqs[i]);
-            g_seg_freqs[i] = NULL;
-        }
-        if (g_seg_powers[i]) {
-            free(g_seg_powers[i]);
-            g_seg_powers[i] = NULL;
-        }
-        g_seg_caps[i] = 0;
-    }
-
-    // Освобождаем контекст
-    free(g_master);
-    g_master = NULL;
-
-    // Выходим из hackrf
     hackrf_exit();
+
+    // освободить буферы спектра/контексты
+    if (m->proc) {
+        destroy_processing_context(m->proc);
+        m->proc = NULL;
+    }
+    if (m->spectrum_freqs)  { free(m->spectrum_freqs);  m->spectrum_freqs  = NULL; }
+    if (m->spectrum_powers) { free(m->spectrum_powers); m->spectrum_powers = NULL; }
+    if (m->spectrum_counts) { free(m->spectrum_counts); m->spectrum_counts = NULL; }
+
+    // маленький «дыхательный» промежуток, чтобы ядро отпустило интерфейс
+    usleep(150 * 1000); // 150 мс
+
+    free(m);
 }
 
 int hq_configure(double f_start_mhz, double f_stop_mhz, double bin_hz,
-                 int lna_db, int vga_db, int amp_on) {
-    if (!g_master || !g_master->dev) { set_error("Device not opened"); return -1; }
+                  int lna_db, int vga_db, int amp_on)
+{
+    if (!g_master) {
+        set_error("Master not opened");
+        return -1;
+    }
+    MasterContext* m = g_master;
 
-    g_master->freq_start_hz = f_start_mhz * 1e6;
-    g_master->freq_stop_hz  = f_stop_mhz  * 1e6;
-    g_master->freq_step_hz  = bin_hz;
+    // Приведём входы
+    if (f_stop_mhz <= f_start_mhz) {
+        set_error("Invalid range: stop <= start");
+        return -1;
+    }
+    const double f_start_hz = f_start_mhz * 1e6;
+    const double f_stop_hz  = f_stop_mhz  * 1e6;
 
-    hackrf_set_lna_gain(g_master->dev, lna_db);
-    hackrf_set_vga_gain(g_master->dev, vga_db);
-    hackrf_set_amp_enable(g_master->dev, amp_on);
+    // Выбор/уточнение FFT размера относительно bin_hz
+    // Если bin_hz == 0, используем дефолтный размер
+    double sr = (double)DEFAULT_SAMPLE_RATE_HZ;
+    int fft_size = m->fft_size_override > 0 ? m->fft_size_override : DEFAULT_FFT_SIZE;
+    if (bin_hz > 0.0) {
+        // Подгоняем FFT так, чтобы bin ≈ bin_hz (до ближайшей степени двойки)
+        double ideal_n = sr / bin_hz;
+        int n = 1;
+        while (n < (int)ideal_n && n < MAX_FFT_SIZE) n <<= 1;
+        // Выбираем ближайшую степень двойки
+        int n_prev = n >> 1;
+        if (n_prev >= MIN_FFT_SIZE && fabs(sr/n_prev - bin_hz) < fabs(sr/n - bin_hz)) {
+            fft_size = n_prev;
+        } else {
+            fft_size = n;
+        }
+        if (fft_size < MIN_FFT_SIZE) fft_size = MIN_FFT_SIZE;
+        if (fft_size > MAX_FFT_SIZE) fft_size = MAX_FFT_SIZE;
+    }
 
-    if (g_master->freq_step_hz <= 0)
-        g_master->freq_step_hz = (DEFAULT_SAMPLE_RATE_HZ / (double)DEFAULT_FFT_SIZE);
-
-    size_t n_points = (size_t)((g_master->freq_stop_hz - g_master->freq_start_hz) / g_master->freq_step_hz) + 1;
-    if (n_points > MAX_SPECTRUM_POINTS) n_points = MAX_SPECTRUM_POINTS;
-
-    g_master->spectrum_points = n_points;
-    g_master->spectrum_freqs  = (double*)realloc(g_master->spectrum_freqs,  sizeof(double) * n_points);
-    g_master->spectrum_powers = (float*) realloc(g_master->spectrum_powers, sizeof(float)  * n_points);
-    g_master->spectrum_counts = (int*)   realloc(g_master->spectrum_counts, sizeof(int)    * n_points);
-    if (!g_master->spectrum_freqs || !g_master->spectrum_powers || !g_master->spectrum_counts) {
-        set_error("realloc spectrum arrays failed");
+    // Уничтожаем прежний proc (если есть) и создаём новый с указанным FFT size
+    if (m->proc) {
+        destroy_processing_context(m->proc);
+        m->proc = NULL;
+    }
+    m->proc = create_processing_context(fft_size, sr);
+    if (!m->proc) {
+        set_error("Failed to create processing context");
         return -1;
     }
 
-    for (size_t i = 0; i < n_points; i++) {
-        g_master->spectrum_freqs[i]  = g_master->freq_start_hz + i * g_master->freq_step_hz;
-        g_master->spectrum_powers[i] = -120.0f;
-        g_master->spectrum_counts[i] = 0;
+    // ВАЖНО: шаг глобальной сетки = реальный шаг FFT (NEW/CRITICAL)
+    m->freq_step_hz = m->proc->bin_width; // <<— ключевая фиксация
+
+    // Сохраняем границы
+    m->freq_start_hz = f_start_hz;
+    m->freq_stop_hz  = f_stop_hz;
+
+    // Создаём глобальную сетку спектра строго с шагом bin_width (NEW)
+    if (setup_global_spectrum_grid(m, f_start_hz, f_stop_hz, m->freq_step_hz) != 0) {
+        set_error("Failed to allocate spectrum grid");
+        return -1;
     }
 
-    // fprintf(stdout, "[HackRF Master] Configured: %.1f–%.1f MHz, %zu pts, bin=%.1f kHz\n",
-    //         f_start_mhz, f_stop_mhz, n_points, g_master->freq_step_hz/1000.0);
+    // Настройки усилений/AMP — по твоей текущей логике (не показана в отрывке)
+    // TODO: здесь поставить hackrf_set_amp_enable(dev, amp_on), hackrf_set_lna_gain, hackrf_set_vga_gain
+    if (m->dev) {
+        hackrf_set_lna_gain(m->dev, lna_db);
+        hackrf_set_vga_gain(m->dev, vga_db);
+        hackrf_set_amp_enable(m->dev, amp_on);
+    }
 
+    return 0;
+}
+
+// ================== Построение глобальной сетки (NEW) ==================
+static int setup_global_spectrum_grid(MasterContext* m, double f_start_hz, double f_stop_hz, double freq_step_hz)
+{
+    if (!m || freq_step_hz <= 0.0) return -1;
+
+    // Освобождаем предыдущие буферы (если были)
+    if (m->spectrum_freqs) { free(m->spectrum_freqs); m->spectrum_freqs = NULL; }
+    if (m->spectrum_powers){ free(m->spectrum_powers); m->spectrum_powers = NULL; }
+    if (m->spectrum_counts){ free(m->spectrum_counts); m->spectrum_counts = NULL; }
+    
+    // Уничтожаем предыдущий мьютекс (если был)
+    pthread_mutex_destroy(&m->spectrum_mutex);
+
+    // Размер сетки (включая правую границу)
+    double span_hz = f_stop_hz - f_start_hz;
+    if (span_hz <= 0.0) return -1;
+
+    size_t points = (size_t)floor(span_hz / freq_step_hz + 1.0);
+    if (points < 2) points = 2; // на всякий случай
+    if (points > MAX_SPECTRUM_POINTS) points = MAX_SPECTRUM_POINTS; // защита
+
+    m->spectrum_points = points;
+    m->spectrum_freqs  = (double*)malloc(points * sizeof(double));
+    m->spectrum_powers = (float*) malloc(points * sizeof(float));
+    m->spectrum_counts = (int*)   malloc(points * sizeof(int));
+    if (!m->spectrum_freqs || !m->spectrum_powers || !m->spectrum_counts) {
+        if (m->spectrum_freqs)  free(m->spectrum_freqs);
+        if (m->spectrum_powers) free(m->spectrum_powers);
+        if (m->spectrum_counts) free(m->spectrum_counts);
+        m->spectrum_freqs = NULL; m->spectrum_powers = NULL; m->spectrum_counts = NULL;
+        m->spectrum_points = 0;
+        return -1;
+    }
+
+    for (size_t i = 0; i < points; ++i) {
+        m->spectrum_freqs[i]  = f_start_hz + (double)i * freq_step_hz;
+        m->spectrum_powers[i] = -INFINITY; // или, например, -200.f
+        m->spectrum_counts[i] = 0;
+    }
+
+    pthread_mutex_init(&m->spectrum_mutex, NULL);
     return 0;
 }
 
@@ -696,11 +762,12 @@ int hq_start_multi_segment(hq_multi_segment_cb cb, void* user) {
 
     gettimeofday(&g_master->start_time, NULL);
 
-    if (pthread_create(&g_worker_thread, NULL, worker_thread_fn, g_master) != 0) {
+    if (pthread_create(&g_master->sweep_thread, NULL, worker_thread_fn, g_master) != 0) {
         set_error("pthread_create failed: %s", strerror(errno));
         g_master->running = 0;
         return -1;
     }
+    g_master->is_running_thread = 1;
     return 0;
 }
 
@@ -714,39 +781,43 @@ int hq_start(hq_segment_cb cb, void* user) {  // hq_segment_cb = hq_legacy_cb
     g_master->running = 1;
     g_master->stop_requested = 0;
 
-    if (pthread_create(&g_worker_thread, NULL, worker_thread_fn, g_master) != 0) {
+    if (pthread_create(&g_master->sweep_thread, NULL, worker_thread_fn, g_master) != 0) {
         set_error("pthread_create failed: %s", strerror(errno));
         g_master->running = 0;
         return -1;
     }
+    g_master->is_running_thread = 1;
     return 0;
 }
 
 int hq_stop(void) {
-    if (!g_master || !g_master->running) return 0;
-    
-    // Устанавливаем флаг остановки
-    g_master->stop_requested = 1;
-    
-    // Ждем завершения потока
-    pthread_join(g_worker_thread, NULL);
-    
-    // Сбрасываем флаги
-    g_master->running = 0;
-    g_master->stop_requested = 0;
-    
-    // Очищаем обработчик
-    if (g_master->proc) {
-        destroy_processing_context(g_master->proc);
-        g_master->proc = NULL;
+    if (!g_master) return 0; // уже закрыт/не открыт
+    MasterContext* m = g_master;
+
+    // просим тред остановиться
+    m->stop_requested = 1;
+
+    // если идёт стриминг — остановим
+    if (m->dev) {
+        // игнорируем код возврата: если уже не стримит — это нормально
+        hackrf_stop_rx(m->dev);
     }
-    
+
+    // дождаться рабочего треда, если он запущен
+    if (m->is_running_thread) {
+        void* rc = NULL;
+        pthread_join(m->sweep_thread, &rc);
+        m->is_running_thread = 0;
+    }
+
+    m->running = 0;
     return 0;
 }
 
 // ================== Доступ к глобальному спектру ==================
 int hq_get_master_spectrum(double* freqs_hz, float* powers_dbm, int max_points) {
     if (!g_master || !freqs_hz || !powers_dbm || max_points <= 0) return 0;
+    if (!g_master->spectrum_freqs || !g_master->spectrum_powers) return 0;  // защита от неинициализированных массивов
     pthread_mutex_lock(&g_master->spectrum_mutex);
     int n = (int)((size_t)max_points < g_master->spectrum_points ? max_points : g_master->spectrum_points);
     memcpy(freqs_hz,   g_master->spectrum_freqs,  sizeof(double) * n);

@@ -27,11 +27,21 @@ from panorama.features.settings.storage import load_detector_settings
 @dataclass(frozen=True)
 class DetectedPeak:
     """Информация о пике, для мастера/оркестратора/слейвов."""
+    # Основные поля (совместимость с новым кодом)
     freq_hz: float           # Частота пика (по максимуму)
     snr_db: float            # Оценка SNR (peak - noise_floor)
     power_dbm: float         # Абсолютная мощность в точке пика
     band_hz: float           # Полуширина окна +/- (из настроек)
     idx: int                 # Индекс бина на текущей сетке
+    
+    # Дополнительные поля для совместимости со старым кодом
+    id: str = ""             # Идентификатор пика
+    f_peak: float = 0.0     # Частота пика (дублирует freq_hz)
+    bin_hz: float = 0.0     # Ширина бина
+    t0: float = 0.0         # Время первого обнаружения
+    last_seen: float = 0.0  # Время последнего обнаружения
+    span_user: float = 0.0  # Пользовательский span
+    status: str = "ACTIVE"  # Статус пика
 
 
 # ---------- Общая реализация детекции (ядро) ----------
@@ -269,11 +279,23 @@ class SpectrumModel(QObject if _HAS_QT else object):
         if freqs_hz.ndim != 1 or power_dbm.ndim != 1 or len(freqs_hz) != len(power_dbm):
             self._emit_status("Некорректные размеры данных панорамы")
             return
-        self.freqs_hz = freqs_hz
+            
+        if self.freqs_hz is None:
+            # инициализируем глобальную сетку частот один раз
+            self.freqs_hz = freqs_hz
+            self.power_dbm = np.zeros_like(power_dbm)
+            self.waterfall = []
+
+        # обновляем только мощность
         self.power_dbm = power_dbm
+        # добавляем строку в водопад
+        self.waterfall.append(power_dbm.copy())
+        if len(self.waterfall) > self._rows_limit:
+            self.waterfall.pop(0)
+            
         # поддержим last_row для курсора — берём текущий спектр
         self._last_row = power_dbm.copy()
-        self.waterfall.append(self._last_row)
+        
         self._emit_spectrum()
         self._emit_waterfall()
 

@@ -46,8 +46,8 @@ def setup_environment():
     
     # Проверяем наличие наших модулей
     try:
-        from panorama.features.master_sweep.master import MasterSweepController
-        print("✓ Модуль Master доступен")
+       from panorama.features.spectrum.master import MasterSweepController
+       print("✓ Модуль Master доступен")
     except ImportError as e:
         print(f"✗ Модуль Master не найден: {e}")
         return False

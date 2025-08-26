@@ -7,14 +7,23 @@ from PyQt5 import QtCore
 @dataclass
 class SweepConfig:
     """Конфигурация для свипа."""
+    # ГЛОБАЛЬНЫЙ диапазон для мастера (панорама)
     freq_start_hz: int
     freq_end_hz: int
-    bin_hz: int = 800_000  # ОПТИМИЗАЦИЯ: крупнее бин — быстрее UI
+    # шаг для построения глобальной сетки (визуально можно даунсемплить дальше)
+    bin_hz: int = 1_000_000  # 1 МГц по умолчанию для панорамы
     lna_db: int = 24
     vga_db: int = 20
     amp_on: bool = False
     serial: Optional[str] = None  # Серийник устройства обязателен для HackRF QSA
     extra: Optional[list[str]] = None
+    
+    # ЛОКАЛЬНОЕ окно ДЛЯ ДЕТЕКТОРА/Трилатерации (Soapy/слейвы), мастер это не трогает
+    detector_span_hz: int = 2_000_000  # 2 МГц по умолчанию
+    
+    # совместимость
+    @property
+    def span_hz(self): return self.detector_span_hz
 
     def to_args(self) -> list[str]:
         """Аргументы в стиле hackrf_sweep (если пригодятся)."""

@@ -83,6 +83,10 @@ class HackRFQSABackend(SourceBackend):
         # Параметры по умолчанию
         self._segment_mode = 4
         self._ema_alpha = 0.25
+        
+        # Поля для управления жизненным циклом
+        self._closing = False
+        self._last_close_ts = 0.0
     
     def __del__(self):
         """Деструктор - гарантирует закрытие устройства."""
@@ -101,16 +105,15 @@ class HackRFQSABackend(SourceBackend):
                 finally:
                     self._worker = None
             
-            # Закрываем устройство только если оно открыто
-            if hasattr(self, '_device_opened') and self._device_opened and hasattr(self, '_lib'):
+            # Закрываем устройство только если открыто (на случай если stop() не был вызван)
+            if self._device_opened and hasattr(self, '_lib'):
                 try:
-                    self._lib.hq_stop()
+                    # НЕ дергаем hq_stop здесь — оно уже было в stop()
                     self._lib.hq_close()
                     self._device_opened = False
-                    if hasattr(self, '_emit_status'):
-                        self._emit_status("[HackRF] Устройство закрыто")
-                except Exception as e:
-                    pass  # Игнорируем ошибки при закрытии
+                    self._emit_status("[HackRF] Устройство закрыто")
+                except Exception:
+                    pass
             
             self._running = False
             self._configured = False
@@ -186,10 +189,25 @@ class HackRFQSABackend(SourceBackend):
     
     def start(self, config: SweepConfig):
         """Запускает sweep с параметрами из конфигурации."""
-        if self._running:
-            self._emit_status("Уже запущен")
+        if self._running or self._closing:
+            self._emit_status("Старт отклонён: идёт закрытие/уже запущен")
             return
-        
+
+        # Анти-дребезг: не стартуем мгновенно после закрытия
+        import time
+        if time.time() - self._last_close_ts < 0.2:  # 200 мс
+            time.sleep(0.2)
+
+        # открыть, если не открыто
+        if not self._device_opened:
+            if not self._open_device(config.serial or self._serial):
+                self._emit_error("Не удалось открыть HackRF")
+                return
+
+        if not hasattr(self, "_lib") or not self._device_opened:
+            self._emit_error("Устройство не открыто или закрывается")
+            return
+
         # Обновляем конфигурацию из GUI
         if self.config_manager:
             self.config_manager.update_from_gui(
@@ -202,13 +220,19 @@ class HackRFQSABackend(SourceBackend):
             )
             self.config_manager.save()
         
-        # Открываем устройство только если не открыто
-        if not self._device_opened:
-            if not self._open_device(config.serial or self._serial):
-                return
+        # ГЛОБАЛЬНЫЕ границы для мастера: всегда 50–6000 МГц
+        f_start_hz = 50_000_000.0
+        f_stop_hz  = 6_000_000_000.0
+        # шаг для сетки; ограничим снизу 500 кГц, сверху ~2 МГц
+        bin_hz = max(500_000.0, min(2_000_000.0, float(config.bin_hz or 1_000_000.0)))
         
-        # Конфигурируем устройство с параметрами из JSON
-        if not self._configure_device():
+        # Сохраняем параметры усиления для конфигурации
+        self._lna_db = config.lna_db
+        self._vga_db = config.vga_db
+        self._amp_on = config.amp_on
+        
+        # передаём в C-бэкенд именно глобальный диапазон
+        if not self._configure_device_with(f_start_hz, f_stop_hz, bin_hz):
             self._cleanup()
             return
         
@@ -222,34 +246,36 @@ class HackRFQSABackend(SourceBackend):
         self._emit_status("HackRF Master started with C processing")
     
     def stop(self):
-        """Останавливает sweep но НЕ закрывает устройство."""
-        if not self._running:
+        """Останавливает sweep и закрывает устройство."""
+        if not self._running and not self._device_opened:
             return
-        
+        self._closing = True
         self._emit_status("Остановка...")
-        
-        # Останавливаем воркер
-        if hasattr(self, '_worker') and self._worker:
+
+        # Остановить воркер аккуратно
+        if self._worker:
             try:
                 self._worker.stop()
-                # Даем время воркеру корректно завершиться
-                if not self._worker.wait(3000):  # Увеличиваем timeout
-                    self._emit_error("Worker не завершился за 3 секунды")
+                self._worker.wait(3000)
             except Exception as e:
                 self._emit_error(f"Ошибка остановки worker: {e}")
             finally:
                 self._worker = None
-        
-        # Останавливаем C код но НЕ закрываем устройство
+
+        # Гасим и закрываем C-бэкенд
         try:
-            if self._device_opened:
+            if self._device_opened and hasattr(self, "_lib"):
                 self._lib.hq_stop()
-                self._emit_status("Sweep остановлен")
-                # НЕ вызываем hq_close() здесь!
+                self._lib.hq_close()
+                self._device_opened = False
+                self._emit_status("HackRF закрыт")
         except Exception as e:
             self._emit_error(f"Ошибка остановки: {e}")
-        
+
         self._running = False
+        self._closing = False
+        import time
+        self._last_close_ts = time.time()
         self.finished.emit(0)
         self._emit_status("Остановлен")
     
@@ -316,48 +342,30 @@ class HackRFQSABackend(SourceBackend):
             return False
     
     def _configure_device(self) -> bool:
-        """Конфигурирует устройство параметрами из JSON."""
+        """Не используем — конфигурируем через _configure_device_with()."""
+        return self._configure_device_with(50e6, 6e9, 1e6)
+
+    def _configure_device_with(self, f_start_hz: float, f_stop_hz: float, bin_hz: float) -> bool:
+        """Чётко конфигурирует C-бэкенд на глобальный обзор."""
         try:
-            if not self.config_manager:
-                self._emit_error("Менеджер конфигурации не доступен")
-                return False
+            # Получаем параметры из config_manager или используем дефолтные
+            lna_db = getattr(self, '_lna_db', 24)
+            vga_db = getattr(self, '_vga_db', 20)
+            amp_on = getattr(self, '_amp_on', False)
             
-            # Получаем параметры для C библиотеки
-            c_config = self.config_manager.get_c_config()
-            
-            # Конфигурируем через C библиотеку
-            r = self._lib.hq_configure(
-                c_config['f_start_mhz'],
-                c_config['f_stop_mhz'],
-                c_config['bin_hz'],
-                c_config['lna_db'],
-                c_config['vga_db'],
-                c_config['amp_on']
+            ok = self._lib.hq_configure(
+                float(f_start_hz / 1e6),
+                float(f_stop_hz  / 1e6),
+                float(bin_hz),
+                int(lna_db), int(vga_db), int(amp_on)
             )
-            
-            if r != 0:
-                error_msg = self._get_last_error()
-                self._emit_error(f"Не удалось сконфигурировать: {error_msg}")
+            if ok != 0:
+                self._emit_error("Ошибка конфигурации HackRF")
                 return False
-            
-            # Устанавливаем дополнительные параметры
-            self._lib.hq_set_segment_mode(c_config['segment_mode'])
-            
-            if c_config['fft_size'] > 0:
-                self._lib.hq_set_fft_size(c_config['fft_size'])
-            
-            # Устанавливаем EMA параметры
-            self._lib.hq_set_ema_alpha(self._ema_alpha)
-            
-            # Загружаем калибровку если доступна
-            self._auto_load_calibration()
-            
-            self._configured = True
             self._emit_status("Устройство сконфигурировано")
             return True
-            
         except Exception as e:
-            self._emit_error(f"Исключение при конфигурации: {e}")
+            self._emit_error(f"Ошибка конфигурации: {e}")
             return False
     
     def load_calibration(self, csv_path: str) -> bool:
