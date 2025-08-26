@@ -1,86 +1,98 @@
-// hackrf_master.h — C API для бэкенда sweep (совместим с CFFI)
+// hackrf_master.h — Заголовок для master_hackrf.c
+#ifndef HACKRF_MASTER_H
+#define HACKRF_MASTER_H
 
-#pragma once
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Константы для FFT
-#define MIN_FFT_SIZE 16
-#define DEFAULT_FFT_SIZE 32      // Для bin ~800 кГц при 20 MHz SR
-#define MAX_FFT_SIZE 256         // Максимум для детального анализа
+// ================== Константы FFT ==================
+#define MIN_FFT_SIZE       16
+#define DEFAULT_FFT_SIZE   32     // bin ≈ 625 кГц при 20 МГц SR
+#define MAX_FFT_SIZE       65536  // максимум для FFTW
 
-// Константы для многосекционного режима
-#define MAX_SEGMENTS 4
-#define MAX_CALIBRATION_ENTRIES 1000
+// ================== Константы сегментов ==================
+#define HQ_SEGMENT_MODE_2  2
+#define HQ_SEGMENT_MODE_4  4
+#define MAX_SEGMENTS       4
 
-// Структура для передачи данных сегмента
+// ================== Калибровка ==================
+#define MAX_CALIBRATION_ENTRIES 256
+
+// ================== Типы данных ==================
+
+// Данные одного сегмента спектра
 typedef struct {
-    double* freqs_hz;      // массив частот для сегмента
-    float*  data_dbm;      // массив мощностей для сегмента
-    int     count;         // количество бинов в сегменте
-    int     segment_id;    // идентификатор сегмента (A/B/C/D)
-    uint64_t hz_low;       // нижняя частота сегмента
-    uint64_t hz_high;      // верхняя частота сегмента
+    int     segment_id;   // 0..3
+    int     count;        // количество бинов
+    double* freqs_hz;     // массив частот [count]
+    float*  data_dbm;     // мощности [count]
 } hq_segment_data_t;
 
-// Колбэки
+// Колбэк: несколько сегментов (2 или 4)
 typedef void (*hq_multi_segment_cb)(
     const hq_segment_data_t* segments,
-    int                       segment_count,
-    double                    fft_bin_width_hz,
-    uint64_t                  center_hz,
-    void*                     user
-);
+    int segment_count,
+    double bin_width_hz,
+    uint64_t center_hz,
+    void* user_data);
 
+// Колбэк: «наследие» — весь спектр одним куском
 typedef void (*hq_segment_cb)(
     const double* freqs_hz,
-    const float*  data_dbm,
-    int           count,
-    double        fft_bin_width_hz,
-    uint64_t      hz_low,
-    uint64_t      hz_high,
-    void*         user
-);
+    const float*  powers_dbm,
+    int count,
+    uint64_t center_hz,
+    void* user_data);
 
-// Основные функции
-int  hq_open(const char* serial_suffix_or_null);
+// ================== API ==================
+
+// --- Ошибки ---
+const char* hq_last_error(void);
+
+// --- Управление устройством ---
+int  hq_open(const char* serial_suffix); // "" или NULL = первое устройство
 void hq_close(void);
+int  hq_device_count(void);
+int  hq_get_device_serial(int idx, char* out, int cap);
 
+// --- Конфигурация ---
 int  hq_configure(double f_start_mhz, double f_stop_mhz, double bin_hz,
                   int lna_db, int vga_db, int amp_on);
 
-// Запуск sweep
+// --- Старт/стоп ---
 int  hq_start_multi_segment(hq_multi_segment_cb cb, void* user);
-int  hq_start(hq_segment_cb cb, void* user);  // для обратной совместимости
+int  hq_start(hq_segment_cb cb, void* user);
 int  hq_stop(void);
 
-// Получение готового спектра
+// --- Доступ к спектру (EMA-сетка) ---
 int  hq_get_master_spectrum(double* freqs_hz, float* powers_dbm, int max_points);
 
-// Настройки обработки
+// --- Настройки обработки ---
 void hq_set_ema_alpha(float alpha);
 void hq_set_detector_params(float threshold_offset_db, int min_width_bins,
                             int min_sweeps, float timeout_sec);
-int  hq_set_segment_mode(int mode);  // 2 или 4 сегмента
-int  hq_get_segment_mode(void);
-int  hq_set_fft_size(int size);      // Установить размер FFT
-int  hq_get_fft_size(void);          // Получить текущий размер FFT
 
-// Калибровка
+int  hq_set_segment_mode(int mode); // 2 или 4
+int  hq_get_segment_mode(void);
+
+int  hq_set_fft_size(int size); // power-of-2, в пределах MIN..MAX
+int  hq_get_fft_size(void);
+
+// --- Частотное сглаживание ---
+void hq_set_freq_smoothing(int enabled, int window_bins);
+int  hq_get_freq_smoothing_enabled(void);
+int  hq_get_freq_smoothing_window(void);
+
+// --- Калибровка ---
 int  hq_load_calibration(const char* csv_path);
 int  hq_enable_calibration(int enable);
 int  hq_get_calibration_status(void);
 
-// Ошибки и статус
-const char* hq_last_error(void);
-
-// Перечисление устройств
-int  hq_device_count(void);
-int  hq_get_device_serial(int idx, char* out, int cap);
-
 #ifdef __cplusplus
 }
 #endif
+
+#endif // HACKRF_MASTER_H

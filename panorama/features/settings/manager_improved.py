@@ -21,10 +21,10 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 # Импорт C библиотеки для HackRF
 try:
-    from panorama.drivers.hrf_backend import HackRFMaster
+    from panorama.drivers.hrf_backend import HackRFQSABackend
     HACKRF_AVAILABLE = True
 except ImportError:
-    HackRFMaster = None
+    HackRFQSABackend = None
     HACKRF_AVAILABLE = False
 
 # Импорт SoapySDR для Slave устройств
@@ -173,8 +173,45 @@ class DeviceDiscoveryThread(QThread):
                 
             else:
                 print("DEBUG: No master_controller, trying direct approach")
-                # Если нет контроллера - НЕ создаем фиктивные устройства
-                return []
+                # Прямой поиск через C библиотеку
+                try:
+                    if HackRFQSABackend:
+                        # Создаем временный экземпляр для поиска устройств
+                        temp_backend = HackRFQSABackend()
+                        
+                        # Безопасно вызываем list_serials
+                        try:
+                            serials = temp_backend.list_serials()
+                            print(f"DEBUG: Direct search found {len(serials) if serials else 0} devices")
+                            
+                            if serials:
+                                for serial in serials:
+                                    if serial and len(serial) >= 4:
+                                        info = SDRDeviceInfo(
+                                            driver="hackrf",
+                                            serial=serial,
+                                            label=f"HackRF {serial[-4:]}",
+                                            uri=f"driver=hackrf,serial={serial}",
+                                            capabilities={
+                                                "frequency_range": (24e6, 6e9),
+                                                "bandwidth": 20e6,
+                                                "sample_rates": [2e6, 4e6, 8e6, 10e6, 12.5e6, 16e6, 20e6]
+                                            }
+                                        )
+                                        info.is_available = True
+                                        info.last_seen = time.time()
+                                        devices.append(info)
+                                        print(f"DEBUG: Added device via direct search: {serial[-4:]}")
+                        except Exception as e:
+                            print(f"DEBUG: list_serials failed: {e}")
+                        
+                        # Очищаем временный объект
+                        del temp_backend
+                        
+                except Exception as e:
+                    print(f"DEBUG: Direct search failed: {e}")
+                
+                return devices
                 
         except Exception as e:
             print(f"DEBUG: Exception in _find_hackrf_devices: {e}")

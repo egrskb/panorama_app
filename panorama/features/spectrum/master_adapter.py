@@ -8,29 +8,14 @@ Starts/stops backend, pushes sweeps to MasterSweepController, emits status to UI
 
 from __future__ import annotations
 from typing import Optional, Callable, Dict, Any
-from dataclasses import dataclass
 import logging
 import numpy as np
 from PyQt5 import QtCore
 
 # наш backend
-from panorama.drivers.hrf_backend import HackRFQSABackend
+from panorama.drivers.hrf_backend import HackRFQSABackend, SweepConfig
 # контроллер поиска пиков
 from panorama.features.spectrum.master import MasterSweepController
-
-
-@dataclass
-class SweepConfig:
-    freq_start_hz: int
-    freq_end_hz: int
-    bin_hz: int
-    lna_db: int
-    vga_db: int
-    amp_on: bool
-    serial: Optional[str] = None
-    threshold_dbm: Optional[float] = None
-    peak_span_hz: Optional[float] = None
-    dwell_ms: Optional[int] = None
 
 
 class MasterSourceAdapter(QtCore.QObject):

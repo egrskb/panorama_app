@@ -14,7 +14,7 @@ HACKRF_LIBS = $(shell pkg-config --libs libhackrf 2>/dev/null || echo "-L/usr/li
 FFTW_LIBS = $(shell pkg-config --libs fftw3f 2>/dev/null || echo "-L/usr/lib -lfftw3f")
 
 # Целевые файлы
-TARGET = libhackrf_qsa.so
+TARGET = libhackrf_master.so
 SOURCE = hackrf_master.c
 OBJECT = hackrf_master.o
 HEADER = hackrf_master.h

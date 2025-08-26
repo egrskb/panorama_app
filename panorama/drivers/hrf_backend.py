@@ -64,16 +64,44 @@ class HackRFQSABackend(SourceBackend):
         # Параметры по умолчанию
         self._segment_mode = 4
         self._ema_alpha = 0.25
+    
+    def __del__(self):
+        """Деструктор для автоматической очистки ресурсов."""
+        try:
+            if hasattr(self, '_running') and self._running:
+                self.stop()
+            if hasattr(self, '_lib') and self._lib:
+                self._lib.hq_close()
+        except:
+            pass  # Игнорируем ошибки в деструкторе
         
     def _define_interface(self):
         """Определяем интерфейс C-библиотеки."""
         self._ffi.cdef("""
+            // Типы колбэков
+            typedef void (*hq_legacy_cb)(
+                const double* freqs_hz,
+                const float*  powers_dbm,
+                int           n,
+                uint64_t      center_hz,
+                void*         user
+            );
+            
+            typedef void (*hq_multi_segment_cb)(
+                const void* segments,
+                int         segment_count,
+                double      fft_bin_width_hz,
+                uint64_t    center_hz,
+                void*       user
+            );
+            
             // Основные функции
             int  hq_open(const char* serial_suffix);
             void hq_close(void);
             int  hq_configure(double f_start_mhz, double f_stop_mhz, double bin_hz,
                               int lna_db, int vga_db, int amp_on);
-            int  hq_start(void* cb, void* user);
+            int  hq_start(hq_legacy_cb cb, void* user);
+            int  hq_start_multi_segment(hq_multi_segment_cb cb, void* user);
             int  hq_stop(void);
             const char* hq_last_error(void);
             
@@ -84,6 +112,8 @@ class HackRFQSABackend(SourceBackend):
                                        int min_sweeps, float timeout_sec);
             int  hq_set_segment_mode(int mode);
             int  hq_get_segment_mode(void);
+            int  hq_set_fft_size(int size);
+            int  hq_get_fft_size(void);
             
             // Калибровка
             int  hq_load_calibration(const char* csv_path);
@@ -94,6 +124,12 @@ class HackRFQSABackend(SourceBackend):
             int  hq_device_count(void);
             int  hq_get_device_serial(int idx, char* out, int cap);
         """)
+        
+        # Создаем колбэк для получения данных от C
+        self._spectrum_callback = self._ffi.callback(
+            "void(const double*, const float*, int, uint64_t, void*)",
+            self._on_spectrum_data
+        )
     
     def start(self, config: SweepConfig):
         """Запускает sweep с полными расчетами в C."""
@@ -107,19 +143,22 @@ class HackRFQSABackend(SourceBackend):
             # Пытаемся найти первое доступное устройство
             serials = self.list_serials()
             if serials:
-                serial = serials[0][-4:]  # Берем последние 4 символа
-                self.status.emit(f"Using device with suffix: {serial}")
+                serial = serials[0]  # Берем полный серийник
+                self.status.emit(f"Using device: {serial}")
             else:
                 self.error.emit("No HackRF devices found")
                 return
         
         # Открываем устройство
         try:
-            r = self._lib.hq_open(serial.encode('utf-8') if serial else self._ffi.NULL)
+            # Передаем полный серийник или NULL для первого доступного
+            serial_ptr = serial.encode('utf-8') if serial else self._ffi.NULL
+            r = self._lib.hq_open(serial_ptr)
             if r != 0:
                 error_msg = self._get_last_error()
                 self.error.emit(f"Failed to open device: {error_msg}")
                 return
+            self.status.emit(f"Successfully opened HackRF device")
         except Exception as e:
             self.error.emit(f"Exception opening device: {e}")
             return
@@ -177,12 +216,21 @@ class HackRFQSABackend(SourceBackend):
         
         try:
             self._lib.hq_stop()
-            self._lib.hq_close()
-        except Exception:
-            pass
+            self.status.emit("C code stopped")
+        except Exception as e:
+            self.error.emit(f"Error stopping C code: {e}")
         
+        try:
+            self._lib.hq_close()
+            self.status.emit("Device closed")
+        except Exception as e:
+            self.error.emit(f"Error closing device: {e}")
+        
+        # Сбрасываем состояние
         self._running = False
         self._configured = False
+        self._serial = None
+        
         self.finished.emit(0)
         self.status.emit("Stopped")
     
@@ -198,12 +246,17 @@ class HackRFQSABackend(SourceBackend):
             
             serials = []
             for i in range(count):
-                buf = self._ffi.new("char[128]")
-                if self._lib.hq_get_device_serial(i, buf, 127) == 0:
-                    serial = self._ffi.string(buf).decode('utf-8')
-                    if serial and serial != "0000000000000000":
-                        serials.append(serial)
+                try:
+                    buf = self._ffi.new("char[128]")
+                    if self._lib.hq_get_device_serial(i, buf, 127) == 0:
+                        serial = self._ffi.string(buf).decode('utf-8')
+                        if serial and serial != "0000000000000000":
+                            serials.append(serial)
+                except Exception:
+                    continue
+                    
             return serials
+            
         except Exception as e:
             self._emit_error(f"Error listing devices: {e}")
             return []
@@ -321,6 +374,31 @@ class HackRFQSABackend(SourceBackend):
             self.log.error(msg)
         print(f"ERROR: {msg}")
         self.error.emit(msg)
+    
+    def _on_spectrum_data(self, freqs_ptr, powers_ptr, n, center_hz, user):
+        """Колбэк от C кода для получения данных спектра."""
+        try:
+            # Копируем данные из C в numpy массивы
+            freqs = np.frombuffer(
+                self._ffi.buffer(freqs_ptr, n * 8),
+                dtype=np.float64
+            ).copy()
+            
+            powers = np.frombuffer(
+                self._ffi.buffer(powers_ptr, n * 4),
+                dtype=np.float32
+            ).copy()
+            
+            # Отправляем данные в UI
+            self.fullSweepReady.emit(freqs, powers)
+            
+            # Статус
+            if n > 0:
+                max_power = np.max(powers)
+                self.status.emit(f"Spectrum: {n} points, max={max_power:.1f}dBm")
+                
+        except Exception as e:
+            self.error.emit(f"Error in spectrum callback: {e}")
 
 
 class _MasterWorker(QtCore.QThread):
@@ -348,53 +426,21 @@ class _MasterWorker(QtCore.QThread):
         code, msg = 0, ""
         
         try:
-            # Запускаем C-код (он запустит свой внутренний поток)
-            # Мы используем NULL колбэк, так как будем читать через hq_get_master_spectrum
-            r = self._backend._lib.hq_start(self._backend._ffi.NULL, self._backend._ffi.NULL)
+            # Запускаем C-код с колбэком для получения данных
+            r = self._backend._lib.hq_start(self._backend._spectrum_callback, self._backend._ffi.NULL)
             if r != 0:
                 msg = self._backend._get_last_error()
                 raise RuntimeError(f"Failed to start: {msg}")
             
-            # Буферы для чтения спектра
-            freqs_buf = self._backend._ffi.new("double[]", self._n_points)
-            powers_buf = self._backend._ffi.new("float[]", self._n_points)
-            
-            last_emit_time = time.time()
-            emit_interval = 0.1  # Обновляем UI каждые 100 мс
-            
+            # Ждем завершения или остановки
             while not self._stop_flag.is_set():
-                current_time = time.time()
-                
-                # Читаем текущий спектр из C
-                n_read = self._backend._lib.hq_get_master_spectrum(
-                    freqs_buf, powers_buf, self._n_points
-                )
-                
-                if n_read > 0 and (current_time - last_emit_time) >= emit_interval:
-                    # Копируем данные в numpy массивы
-                    freqs = np.frombuffer(
-                        self._backend._ffi.buffer(freqs_buf, n_read * 8),
-                        dtype=np.float64
-                    ).copy()
-                    
-                    powers = np.frombuffer(
-                        self._backend._ffi.buffer(powers_buf, n_read * 4),
-                        dtype=np.float32
-                    ).copy()
-                    
-                    # Отправляем в UI
-                    self._backend.fullSweepReady.emit(freqs, powers)
-                    last_emit_time = current_time
-                    
-                    # Статус
-                    max_power = np.max(powers)
-                    self._backend.status.emit(f"Spectrum: {n_read} points, max={max_power:.1f}dBm")
-                
-                # Небольшая задержка чтобы не нагружать CPU
-                self.msleep(50)
+                self.msleep(100)  # Проверяем каждые 100 мс
         
         except Exception as e:
             code, msg = 1, str(e)
         
         finally:
             self.finished_sig.emit(code, msg)
+
+# Экспортируем публичные классы
+__all__ = ['HackRFQSABackend', 'SweepConfig']
