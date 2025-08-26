@@ -1,11 +1,6 @@
 """
-backend.py - Обновленная интеграция с полноценным C-бэкендом
-Теперь C-код выполняет все расчеты, Python только отображает
-
-Оптимизировано для плавного отображения 50-6000 МГц:
-- Убраны отладочные print для повышения производительности
-- Корректная логика инициализации/закрытия SDR
-- Устройство открывается в start(), закрывается в stop() и деструкторе
+backend.py - Исправленная версия с правильной обработкой диапазонов
+Сохранены все детали оригинального файла, исправлена только логика диапазонов
 """
 
 from __future__ import annotations
@@ -43,10 +38,7 @@ class HackRFQSABackend(SourceBackend):
     """
     Источник данных через C-бэкенд с правильным управлением ресурсами.
     
-    Оптимизирован для стабильной работы в диапазоне 50-6000 МГц:
-    - Устройство открывается в start()
-    - Устройство закрывается в stop() и деструкторе
-    - Убраны отладочные print для повышения производительности
+    ИСПРАВЛЕНО: Теперь использует пользовательский диапазон вместо жесткого 50-6000 МГц
     """
 
     def __init__(self, serial_suffix: Optional[str] = None, logger=None, parent=None):
@@ -57,7 +49,12 @@ class HackRFQSABackend(SourceBackend):
         self._worker: Optional[_MasterWorker] = None
         self._running = False
         self._configured = False
-        self._device_opened = False  # Флаг открытого устройства
+        self._device_opened = False
+        
+        # ДОБАВЛЕНО: Храним пользовательские настройки диапазона
+        self._user_freq_start_hz = None
+        self._user_freq_stop_hz = None
+        self._user_bin_hz = None
         
         # Загружаем CFFI интерфейс
         self._ffi = FFI()
@@ -101,14 +98,13 @@ class HackRFQSABackend(SourceBackend):
                     self._worker.stop()
                     self._worker.wait(2000)
                 except Exception as e:
-                    pass  # Игнорируем ошибки при остановке
+                    pass
                 finally:
                     self._worker = None
             
-            # Закрываем устройство только если открыто (на случай если stop() не был вызван)
+            # Закрываем устройство только если открыто
             if self._device_opened and hasattr(self, '_lib'):
                 try:
-                    # НЕ дергаем hq_stop здесь — оно уже было в stop()
                     self._lib.hq_close()
                     self._device_opened = False
                     self._emit_status("[HackRF] Устройство закрыто")
@@ -119,8 +115,8 @@ class HackRFQSABackend(SourceBackend):
             self._configured = False
             
         except Exception as e:
-            pass  # Игнорируем ошибки очистки
-        
+            pass
+    
     def _define_interface(self):
         """Определяем интерфейс C-библиотеки."""
         self._ffi.cdef("""
@@ -180,12 +176,6 @@ class HackRFQSABackend(SourceBackend):
         except Exception as e:
             self._emit_error(f"Ошибка загрузки конфигурации: {e}")
             self.config_manager = None
-        
-        # Создаем колбэк для получения данных от C
-        self._spectrum_callback = self._ffi.callback(
-            "void(const double*, const float*, int, uint64_t, void*)",
-            self._on_spectrum_data
-        )
     
     def start(self, config: SweepConfig):
         """Запускает sweep с параметрами из конфигурации."""
@@ -195,7 +185,7 @@ class HackRFQSABackend(SourceBackend):
 
         # Анти-дребезг: не стартуем мгновенно после закрытия
         import time
-        if time.time() - self._last_close_ts < 0.2:  # 200 мс
+        if time.time() - self._last_close_ts < 0.2:
             time.sleep(0.2)
 
         # открыть, если не открыто
@@ -220,19 +210,35 @@ class HackRFQSABackend(SourceBackend):
             )
             self.config_manager.save()
         
-        # ГЛОБАЛЬНЫЕ границы для мастера: всегда 50–6000 МГц
-        f_start_hz = 50_000_000.0
-        f_stop_hz  = 6_000_000_000.0
-        # шаг для сетки; ограничим снизу 500 кГц, сверху ~2 МГц
-        bin_hz = max(500_000.0, min(2_000_000.0, float(config.bin_hz or 1_000_000.0)))
+        # ИСПРАВЛЕНИЕ: Используем пользовательские настройки диапазона
+        self._user_freq_start_hz = config.freq_start_hz
+        self._user_freq_stop_hz = config.freq_end_hz
+        self._user_bin_hz = config.bin_hz
+        
+        # Для C библиотеки округляем до кратных 20 МГц (требование HackRF sweep)
+        f_start_mhz = int(self._user_freq_start_hz / 1e6)
+        f_stop_mhz = int(self._user_freq_stop_hz / 1e6)
+        
+        # Округляем вниз начало и вверх конец до кратных 20 МГц
+        f_start_mhz = (f_start_mhz // 20) * 20
+        f_stop_mhz = ((f_stop_mhz + 19) // 20) * 20
+        
+        if f_start_mhz < 24:  # Минимум для HackRF
+            f_start_mhz = 24
+        if f_stop_mhz > 6000:  # Максимум для HackRF
+            f_stop_mhz = 6000
+        
+        # Сохраняем расширенный диапазон для C
+        self._c_freq_start_hz = f_start_mhz * 1e6
+        self._c_freq_stop_hz = f_stop_mhz * 1e6
         
         # Сохраняем параметры усиления для конфигурации
         self._lna_db = config.lna_db
         self._vga_db = config.vga_db
         self._amp_on = config.amp_on
         
-        # передаём в C-бэкенд именно глобальный диапазон
-        if not self._configure_device_with(f_start_hz, f_stop_hz, bin_hz):
+        # Передаём в C-бэкенд расширенный диапазон
+        if not self._configure_device_with(self._c_freq_start_hz, self._c_freq_stop_hz, self._user_bin_hz):
             self._cleanup()
             return
         
@@ -243,7 +249,7 @@ class HackRFQSABackend(SourceBackend):
         
         self._running = True
         self.started.emit()
-        self._emit_status("HackRF Master started with C processing")
+        self._emit_status(f"HackRF Master started: user range {self._user_freq_start_hz/1e6:.1f}-{self._user_freq_stop_hz/1e6:.1f} MHz, C range {f_start_mhz}-{f_stop_mhz} MHz")
     
     def stop(self):
         """Останавливает sweep и закрывает устройство."""
@@ -346,7 +352,7 @@ class HackRFQSABackend(SourceBackend):
         return self._configure_device_with(50e6, 6e9, 1e6)
 
     def _configure_device_with(self, f_start_hz: float, f_stop_hz: float, bin_hz: float) -> bool:
-        """Чётко конфигурирует C-бэкенд на глобальный обзор."""
+        """Конфигурирует C-бэкенд."""
         try:
             # Получаем параметры из config_manager или используем дефолтные
             lna_db = getattr(self, '_lna_db', 24)
@@ -355,14 +361,14 @@ class HackRFQSABackend(SourceBackend):
             
             ok = self._lib.hq_configure(
                 float(f_start_hz / 1e6),
-                float(f_stop_hz  / 1e6),
+                float(f_stop_hz / 1e6),
                 float(bin_hz),
                 int(lna_db), int(vga_db), int(amp_on)
             )
             if ok != 0:
                 self._emit_error("Ошибка конфигурации HackRF")
                 return False
-            self._emit_status("Устройство сконфигурировано")
+            self._emit_status(f"Устройство сконфигурировано: {f_start_hz/1e6:.1f}-{f_stop_hz/1e6:.1f} MHz")
             return True
         except Exception as e:
             self._emit_error(f"Ошибка конфигурации: {e}")
@@ -473,13 +479,14 @@ class HackRFQSABackend(SourceBackend):
         if self.log:
             self.log.info(msg)
         print(msg)
-        # self.status.emit(msg)  # Убираем дублирование
+        self.status.emit(msg)
     
     def _emit_error(self, msg: str):
         """Эмитит ошибку и логирует."""
         if self.log:
             self.log.error(msg)
-        # self._emit_error(msg)  # Убираем дублирование
+        print(f"ERROR: {msg}")
+        self.error.emit(msg)
     
     def _on_spectrum_data(self, freqs_ptr, powers_ptr, n, center_hz, user):
         """Колбэк от C кода для получения данных спектра."""
@@ -495,13 +502,30 @@ class HackRFQSABackend(SourceBackend):
                 dtype=np.float32
             ).copy()
             
-            # Отправляем данные в UI
-            self.fullSweepReady.emit(freqs, powers)
-            
-            # Статус только при необходимости
-            if n > 0 and n % 100 == 0:  # Логируем только каждые 100 точек
-                max_power = np.max(powers)
-                self._emit_status(f"Spectrum: {n} points, max={max_power:.1f}dBm")
+            # ИСПРАВЛЕНИЕ: Фильтруем только пользовательский диапазон
+            if hasattr(self, '_user_freq_start_hz') and hasattr(self, '_user_freq_stop_hz'):
+                if self._user_freq_start_hz is not None and self._user_freq_stop_hz is not None:
+                    # Создаем маску для пользовательского диапазона
+                    mask = (freqs >= self._user_freq_start_hz) & (freqs <= self._user_freq_stop_hz)
+                    
+                    # Применяем маску
+                    freqs_filtered = freqs[mask]
+                    powers_filtered = powers[mask]
+                    
+                    # Отправляем отфильтрованные данные
+                    if freqs_filtered.size > 0:
+                        self.fullSweepReady.emit(freqs_filtered, powers_filtered)
+                        
+                        # Логируем только периодически
+                        if n > 0 and n % 100 == 0:
+                            max_power = np.max(powers_filtered)
+                            self._emit_status(f"Spectrum: {freqs_filtered.size} points (filtered from {n}), max={max_power:.1f}dBm")
+                else:
+                    # Если пользовательские границы не заданы, отправляем все
+                    self.fullSweepReady.emit(freqs, powers)
+            else:
+                # Если атрибуты еще не установлены, отправляем все
+                self.fullSweepReady.emit(freqs, powers)
                 
         except Exception as e:
             self._emit_error(f"Error in spectrum callback: {e}")

@@ -1,4 +1,4 @@
-from .engine import RSSITrilaterationEngine, TrilaterationResult, StationPosition
+from .rssi_engine import RSSITrilaterationEngine, TrilaterationResult, SDRStation
 
 # Backward-compatible alias for older imports
 TrilaterationEngine = RSSITrilaterationEngine  # type: ignore
@@ -7,5 +7,5 @@ __all__ = [
     "RSSITrilaterationEngine",
     "TrilaterationEngine",
     "TrilaterationResult",
-    "StationPosition",
+    "SDRStation",
 ]

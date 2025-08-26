@@ -23,7 +23,7 @@ import numpy as np
 import pyqtgraph as pg
 
 from panorama.features.orchestrator.core import Orchestrator, MeasurementTask
-from panorama.features.trilateration.engine import TrilaterationResult
+from panorama.features.trilateration import TrilaterationResult
 from panorama.features.slave_sdr.slave import RSSIMeasurement
 
 

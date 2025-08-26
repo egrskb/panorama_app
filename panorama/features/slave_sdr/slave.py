@@ -150,23 +150,20 @@ class SlaveSDR(QObject):
             # центрируем вокруг center_hz
             freqs = freqs + (center_hz - self.sample_rate / 2.0)
 
-            # извлекаем окно по span
-            half = span_hz / 2.0
-            mask = (freqs >= center_hz - half) & (freqs <= center_hz + half)
-            if not np.any(mask):
-                raise RuntimeError("no bins in band window")
-
-            band_vals = psd_dbm[mask]
-
+            # ВАЖНО: Вычисляем RMS по всей полосе span_hz
+            # Фильтруем только нужный диапазон
+            freq_mask = (freqs >= center_hz - span_hz/2) & (freqs <= center_hz + span_hz/2)
+            band_powers = psd_dbm[freq_mask]
+            
+            # Вычисляем RMS в линейной шкале
+            band_linear = 10.0 ** (band_powers / 10.0)
+            rms_linear = np.sqrt(np.mean(band_linear))
+            band_rssi_dbm = 10.0 * np.log10(rms_linear + 1e-20)
+            
             # шумовой пол — медиана нижних 30%
-            sorted_vals = np.sort(band_vals)
+            sorted_vals = np.sort(band_powers)
             k = max(1, int(len(sorted_vals) * 0.3))
             noise_dbm = float(np.median(sorted_vals[:k]))
-
-            # RMS в линейной шкале в полосе
-            band_lin = 10.0 ** (band_vals / 10.0)
-            rms_lin = float(np.sqrt(np.mean(band_lin ** 2)))
-            band_rssi_dbm = 10.0 * np.log10(rms_lin + 1e-20)
 
             # калибровка
             k_corr = float(self.k_cal_db if k_cal_db is None else k_cal_db)

@@ -20,7 +20,7 @@ from panorama.features.slave_sdr.slave import (
     MeasurementWindow,
     SlaveManager,
 )
-from panorama.features.trilateration.engine import (
+from panorama.features.trilateration import (
     RSSITrilaterationEngine,
     TrilaterationResult,
 )
@@ -62,6 +62,9 @@ class Orchestrator(QObject):
         self.master_controller: Optional[MasterSweepController] = None
         self.slave_manager: Optional[SlaveManager] = None
         self.trilateration_engine: Optional[RSSITrilaterationEngine] = None
+        
+        # Добавляем координатор трилатерации
+        self.trilateration_coordinator = None
 
         self.is_running = True
         self.auto_mode = True
@@ -112,6 +115,18 @@ class Orchestrator(QObject):
             eng.trilateration_error.connect(self._on_trilateration_error)
             self.log.info("Trilateration engine connected")
             self._emit_status()
+    
+    def set_trilateration_coordinator(self, coordinator):
+        """Устанавливает координатор трилатерации."""
+        self.trilateration_coordinator = coordinator
+    
+    def _get_peak_id_for_freq(self, center_hz: float) -> Optional[str]:
+        """Извлекает peak_id из watchlist по частоте."""
+        # Простая реализация - можно улучшить
+        for tid, task in self.tasks.items():
+            if abs(task.window.center - center_hz) < 1e3:  # В пределах 1 кГц
+                return tid
+        return None
 
     # ─────────────────────── public API (UI) ───────────────────────
 
@@ -264,6 +279,19 @@ class Orchestrator(QObject):
                             )
                     except Exception as e:
                         self._emit_error(f"Trilateration error: {e}")
+                
+                # Передаем в координатор трилатерации
+                if self.trilateration_coordinator:
+                    for measurement in valid:
+                        # Извлекаем peak_id из watchlist
+                        peak_id = self._get_peak_id_for_freq(measurement.center_hz)
+                        if peak_id:
+                            self.trilateration_coordinator.add_slave_rssi_measurement(
+                                slave_id=measurement.slave_id,
+                                peak_id=peak_id,
+                                center_freq_hz=measurement.center_hz,
+                                rssi_rms_dbm=measurement.band_rssi_dbm
+                            )
 
             # после обработки — запускаем следующую задачу, если есть
             self._process_queue()

@@ -20,7 +20,7 @@ import numpy as np
 # Импортируем наши модули
 from panorama.features.spectrum.master import MasterSweepController
 from panorama.features.slave_sdr.slave import SlaveManager
-from panorama.features.trilateration.engine import RSSITrilaterationEngine
+from panorama.features.trilateration import RSSITrilaterationEngine
 from panorama.features.orchestrator.core import Orchestrator
 from panorama.features.calibration.manager import CalibrationManager
 
@@ -33,6 +33,8 @@ from panorama.features.settings.storage import load_sdr_settings, save_sdr_setti
 from panorama.features.spectrum.master_adapter import MasterSourceAdapter
 from panorama.features.detector.settings_dialog import DetectorSettingsDialog, DetectorSettings
 from panorama.features.slaves import SlavesView
+from panorama.features.detector.peak_watchlist_manager import PeakWatchlistManager
+from panorama.features.trilateration.coordinator import TrilaterationCoordinator
 
 
 class RSSIPanoramaMainWindow(QMainWindow):
@@ -99,21 +101,33 @@ class RSSIPanoramaMainWindow(QMainWindow):
             self.calibration_manager = CalibrationManager(self.log)
             
             # Движок трилатерации
-            self.trilateration_engine = RSSITrilaterationEngine(self.log)
+            self.trilateration_engine = RSSITrilaterationEngine()
             
             # Менеджер slave SDR
             self.slave_manager = SlaveManager(self.log)
             
             # Контроллер Master sweep
-            self.master_controller = MasterSweepController(self.log)
+            self.master_controller = MasterSweepController()
             
             # Оркестратор
             self.orchestrator = Orchestrator(self.log)
+            
+            # Создаем менеджер пиков и координатор трилатерации
+            self.peak_watchlist_manager = PeakWatchlistManager()
+            self.trilateration_coordinator = TrilaterationCoordinator()
+            
+            # Устанавливаем span из UI
+            self.trilateration_coordinator.set_user_span(5.0)  # По умолчанию 5 МГц
+            
+            # Подключение к спектру будет выполнено после создания UI
             
             # Подключаем компоненты к оркестратору
             self.orchestrator.set_master_controller(self.master_controller)
             self.orchestrator.set_slave_manager(self.slave_manager)
             self.orchestrator.set_trilateration_engine(self.trilateration_engine)
+            
+            # Подключаем координатор трилатерации к оркестратору
+            self.orchestrator.set_trilateration_coordinator(self.trilateration_coordinator)
             
             # Загружаем настройки SDR (master/slaves) из JSON
             self.sdr_settings = load_sdr_settings()
@@ -257,6 +271,9 @@ class RSSIPanoramaMainWindow(QMainWindow):
         
         # Создаем панель инструментов
         self._create_toolbar()
+        
+        # Подключаем трилатерацию к спектру (после создания UI)
+        self._connect_trilateration()
     
 
     
@@ -868,6 +885,29 @@ class RSSIPanoramaMainWindow(QMainWindow):
                          "Система трилатерации по RSSI в реальном времени\n"
                          "Поддерживает множественные SDR станции\n\n"
                          "© 2024 ПАНОРАМА Team")
+    
+    def _connect_trilateration(self):
+        """Подключает систему трилатерации к спектру."""
+        # Когда приходят данные от Master
+        self.spectrum_view.newRowReady.connect(
+            self.trilateration_coordinator.process_master_spectrum
+        )
+        
+        # Обновления позиций slave из настроек
+        self.trilateration_coordinator.set_slave_positions({
+            'slave1': (10.0, 0.0, 0.0),
+            'slave2': (0.0, 10.0, 0.0),
+            'slave3': (-10.0, 0.0, 0.0)
+        })
+        
+        # Подключаем к карте
+        self.trilateration_coordinator.target_detected.connect(
+            self.map_view.add_target_from_detector
+        )
+        # TODO: Добавить метод update_target_position в MapView
+        # self.trilateration_coordinator.target_updated.connect(
+        #     self.map_view.update_target_position
+        # )
     
     def closeEvent(self, event):
         """Обрабатывает закрытие приложения."""

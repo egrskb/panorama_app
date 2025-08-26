@@ -60,7 +60,7 @@ def setup_environment():
         return False
     
     try:
-        from panorama.features.trilateration.engine import RSSITrilaterationEngine
+        from panorama.features.trilateration import RSSITrilaterationEngine
         print("✓ Модуль трилатерации доступен")
     except ImportError as e:
         print(f"✗ Модуль трилатерации не найден: {e}")
