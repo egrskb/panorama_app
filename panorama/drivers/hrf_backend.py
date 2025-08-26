@@ -36,44 +36,79 @@ def _find_library() -> str:
 
 class HackRFQSABackend(SourceBackend):
     """
-    Источник данных через полноценный C-бэкенд с расчетами спектра.
-    C-код выполняет FFT, нормализацию, калибровку и выдает готовый спектр.
+    Источник данных через C-бэкенд с правильным управлением ресурсами.
     """
 
     def __init__(self, serial_suffix: Optional[str] = None, logger=None, parent=None):
         super().__init__(parent)
         
-        # Сохраняем logger
         self.log = logger
-        
-        self._ffi = FFI()
-        self._define_interface()
-        
-        lib_path = _find_library()
-        try:
-            self._lib = self._ffi.dlopen(lib_path)
-            self._emit_status(f"[HackRF Master] Loaded library: {lib_path}")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load HackRF Master library: {e}")
-        
         self._serial = serial_suffix
         self._worker: Optional[_MasterWorker] = None
         self._running = False
         self._configured = False
+        self._device_opened = False  # Флаг открытого устройства
+        
+        # Загружаем CFFI интерфейс
+        self._ffi = FFI()
+        self._define_interface()
+        
+        # Загружаем библиотеку
+        lib_path = _find_library()
+        try:
+            self._lib = self._ffi.dlopen(lib_path)
+            self._emit_status(f"[HackRF Master] Библиотека загружена: {lib_path}")
+        except Exception as e:
+            raise RuntimeError(f"Не удалось загрузить библиотеку HackRF Master: {e}")
+        
+        # Создаем колбэк для данных
+        self._spectrum_callback = self._ffi.callback(
+            "void(const double*, const float*, int, uint64_t, void*)",
+            self._on_spectrum_data
+        )
+        
+        # Загружаем конфигурацию из JSON
+        self._load_config()
         
         # Параметры по умолчанию
         self._segment_mode = 4
         self._ema_alpha = 0.25
     
     def __del__(self):
-        """Деструктор для автоматической очистки ресурсов."""
+        """Деструктор - гарантирует закрытие устройства."""
+        self._cleanup()
+    
+    def _cleanup(self):
+        """Очистка ресурсов."""
         try:
-            if hasattr(self, '_running') and self._running:
-                self.stop()
-            if hasattr(self, '_lib') and self._lib:
-                self._lib.hq_close()
-        except:
-            pass  # Игнорируем ошибки в деструкторе
+            # Останавливаем воркер если запущен
+            if hasattr(self, '_worker') and self._worker and self._worker.isRunning():
+                try:
+                    self._worker.stop()
+                    self._worker.wait(2000)
+                except Exception as e:
+                    print(f"[HackRF] Ошибка остановки worker: {e}")
+                finally:
+                    self._worker = None
+            
+            # Закрываем устройство только если оно открыто
+            if hasattr(self, '_device_opened') and self._device_opened and hasattr(self, '_lib'):
+                try:
+                    self._lib.hq_stop()
+                    self._lib.hq_close()
+                    self._device_opened = False
+                    if hasattr(self, '_emit_status'):
+                        self._emit_status("[HackRF] Устройство закрыто")
+                    else:
+                        print("[HackRF] Устройство закрыто")
+                except Exception as e:
+                    print(f"[HackRF] Ошибка при закрытии: {e}")
+            
+            self._running = False
+            self._configured = False
+            
+        except Exception as e:
+            print(f"[HackRF] Ошибка очистки: {e}")
         
     def _define_interface(self):
         """Определяем интерфейс C-библиотеки."""
@@ -124,6 +159,16 @@ class HackRFQSABackend(SourceBackend):
             int  hq_device_count(void);
             int  hq_get_device_serial(int idx, char* out, int cap);
         """)
+    
+    def _load_config(self):
+        """Загружает конфигурацию из JSON."""
+        try:
+            from panorama.features.settings.sdr_config import SDRConfigManager
+            self.config_manager = SDRConfigManager()
+            self._emit_status(f"[HackRF] Конфигурация загружена")
+        except Exception as e:
+            self._emit_error(f"Ошибка загрузки конфигурации: {e}")
+            self.config_manager = None
         
         # Создаем колбэк для получения данных от C
         self._spectrum_callback = self._ffi.callback(
@@ -132,65 +177,31 @@ class HackRFQSABackend(SourceBackend):
         )
     
     def start(self, config: SweepConfig):
-        """Запускает sweep с полными расчетами в C."""
+        """Запускает sweep с параметрами из конфигурации."""
         if self._running:
-            self.status.emit("Already running")
+            self._emit_status("Уже запущен")
             return
         
-        # Используем серийник из конфига или из конструктора
-        serial = config.serial or self._serial
-        if not serial:
-            # Пытаемся найти первое доступное устройство
-            serials = self.list_serials()
-            if serials:
-                serial = serials[0]  # Берем полный серийник
-                self.status.emit(f"Using device: {serial}")
-            else:
-                self.error.emit("No HackRF devices found")
-                return
-        
-        # Открываем устройство
-        try:
-            # Передаем полный серийник или NULL для первого доступного
-            serial_ptr = serial.encode('utf-8') if serial else self._ffi.NULL
-            r = self._lib.hq_open(serial_ptr)
-            if r != 0:
-                error_msg = self._get_last_error()
-                self.error.emit(f"Failed to open device: {error_msg}")
-                return
-            self.status.emit(f"Successfully opened HackRF device")
-        except Exception as e:
-            self.error.emit(f"Exception opening device: {e}")
-            return
-        
-        # Конфигурируем
-        try:
-            r = self._lib.hq_configure(
-                config.freq_start_hz / 1e6,
-                config.freq_end_hz / 1e6,
-                config.bin_hz,
-                config.lna_db,
-                config.vga_db,
-                1 if config.amp_on else 0
+        # Обновляем конфигурацию из GUI
+        if self.config_manager:
+            self.config_manager.update_from_gui(
+                freq_start_mhz=config.freq_start_hz / 1e6,
+                freq_stop_mhz=config.freq_end_hz / 1e6,
+                bin_khz=config.bin_hz / 1e3,
+                lna_db=config.lna_db,
+                vga_db=config.vga_db,
+                amp_on=config.amp_on
             )
-            if r != 0:
-                error_msg = self._get_last_error()
-                self.error.emit(f"Failed to configure: {error_msg}")
-                self._lib.hq_close()
+            self.config_manager.save()
+        
+        # Открываем устройство только если не открыто
+        if not self._device_opened:
+            if not self._open_device(config.serial or self._serial):
                 return
-            
-            self._configured = True
-            
-            # Устанавливаем параметры обработки
-            self._lib.hq_set_segment_mode(self._segment_mode)
-            self._lib.hq_set_ema_alpha(self._ema_alpha)
-            
-            # Загружаем калибровку если доступна
-            self._auto_load_calibration()
-            
-        except Exception as e:
-            self.error.emit(f"Exception configuring: {e}")
-            self._lib.hq_close()
+        
+        # Конфигурируем устройство с параметрами из JSON
+        if not self._configure_device():
+            self._cleanup()
             return
         
         # Запускаем worker для чтения спектра
@@ -200,39 +211,43 @@ class HackRFQSABackend(SourceBackend):
         
         self._running = True
         self.started.emit()
-        self.status.emit("HackRF Master started with C processing")
+        self._emit_status("HackRF Master started with C processing")
     
     def stop(self):
-        """Останавливает sweep."""
+        """Останавливает sweep но НЕ закрывает устройство."""
         if not self._running:
             return
         
-        self.status.emit("Stopping...")
+        self._emit_status("Остановка...")
         
-        if self._worker:
-            self._worker.stop()
-            self._worker.wait(2000)
-            self._worker = None
+        # Останавливаем воркер
+        if hasattr(self, '_worker') and self._worker:
+            try:
+                self._worker.stop()
+                # Даем время воркеру корректно завершиться
+                if not self._worker.wait(3000):  # Увеличиваем timeout
+                    self._emit_error("Worker не завершился за 3 секунды")
+            except Exception as e:
+                self._emit_error(f"Ошибка остановки worker: {e}")
+            finally:
+                self._worker = None
         
+        # Останавливаем C код но НЕ закрываем устройство
         try:
-            self._lib.hq_stop()
-            self.status.emit("C code stopped")
+            if self._device_opened:
+                self._lib.hq_stop()
+                self._emit_status("Sweep остановлен")
+                # НЕ вызываем hq_close() здесь!
         except Exception as e:
-            self.error.emit(f"Error stopping C code: {e}")
+            self._emit_error(f"Ошибка остановки: {e}")
         
-        try:
-            self._lib.hq_close()
-            self.status.emit("Device closed")
-        except Exception as e:
-            self.error.emit(f"Error closing device: {e}")
-        
-        # Сбрасываем состояние
         self._running = False
-        self._configured = False
-        self._serial = None
-        
         self.finished.emit(0)
-        self.status.emit("Stopped")
+        self._emit_status("Остановлен")
+    
+    def close(self):
+        """Явное закрытие устройства."""
+        self._cleanup()
     
     def is_running(self) -> bool:
         return self._running
@@ -261,6 +276,82 @@ class HackRFQSABackend(SourceBackend):
             self._emit_error(f"Error listing devices: {e}")
             return []
     
+    def _open_device(self, serial: Optional[str]) -> bool:
+        """Открывает устройство HackRF."""
+        try:
+            # Определяем серийный номер
+            device_serial = serial
+            if not device_serial:
+                serials = self.list_serials()
+                if serials:
+                    device_serial = serials[0]
+                    self._emit_status(f"Используется устройство: {device_serial}")
+                else:
+                    self._emit_error("HackRF устройства не найдены")
+                    return False
+            
+            # Открываем устройство через C библиотеку
+            serial_bytes = device_serial.encode('utf-8') if device_serial else self._ffi.NULL
+            r = self._lib.hq_open(serial_bytes)
+            
+            if r != 0:
+                error_msg = self._get_last_error()
+                self._emit_error(f"Не удалось открыть устройство: {error_msg}")
+                return False
+            
+            self._device_opened = True
+            self._emit_status(f"HackRF устройство открыто")
+            return True
+            
+        except Exception as e:
+            self._emit_error(f"Исключение при открытии устройства: {e}")
+            return False
+    
+    def _configure_device(self) -> bool:
+        """Конфигурирует устройство параметрами из JSON."""
+        try:
+            if not self.config_manager:
+                self._emit_error("Менеджер конфигурации не доступен")
+                return False
+            
+            # Получаем параметры для C библиотеки
+            c_config = self.config_manager.get_c_config()
+            
+            # Конфигурируем через C библиотеку
+            r = self._lib.hq_configure(
+                c_config['f_start_mhz'],
+                c_config['f_stop_mhz'],
+                c_config['bin_hz'],
+                c_config['lna_db'],
+                c_config['vga_db'],
+                c_config['amp_on']
+            )
+            
+            if r != 0:
+                error_msg = self._get_last_error()
+                self._emit_error(f"Не удалось сконфигурировать: {error_msg}")
+                return False
+            
+            # Устанавливаем дополнительные параметры
+            self._lib.hq_set_segment_mode(c_config['segment_mode'])
+            
+            if c_config['fft_size'] > 0:
+                self._lib.hq_set_fft_size(c_config['fft_size'])
+            
+            # Устанавливаем EMA параметры
+            self._lib.hq_set_ema_alpha(self._ema_alpha)
+            
+            # Загружаем калибровку если доступна
+            self._auto_load_calibration()
+            
+            self._configured = True
+            self._emit_status("Устройство сконфигурировано")
+            return True
+            
+        except Exception as e:
+            self._emit_error(f"Исключение при конфигурации: {e}")
+            return False
+    
     def load_calibration(self, csv_path: str) -> bool:
         """Загружает калибровку из CSV файла."""
         try:
@@ -268,14 +359,14 @@ class HackRFQSABackend(SourceBackend):
             r = self._lib.hq_load_calibration(path_bytes)
             if r == 0:
                 self._lib.hq_enable_calibration(1)
-                self.status.emit(f"Calibration loaded from {csv_path}")
+                self._emit_status(f"Calibration loaded from {csv_path}")
                 return True
             else:
                 error_msg = self._get_last_error()
-                self.error.emit(f"Failed to load calibration: {error_msg}")
+                self._emit_error(f"Failed to load calibration: {error_msg}")
                 return False
         except Exception as e:
-            self.error.emit(f"Exception loading calibration: {e}")
+            self._emit_error(f"Exception loading calibration: {e}")
             return False
     
     def set_calibration_enabled(self, enabled: bool):
@@ -283,7 +374,7 @@ class HackRFQSABackend(SourceBackend):
         try:
             self._lib.hq_enable_calibration(1 if enabled else 0)
             status = "enabled" if enabled else "disabled"
-            self.status.emit(f"Calibration {status}")
+            self._emit_status(f"Calibration {status}")
         except Exception:
             pass
     
@@ -297,14 +388,14 @@ class HackRFQSABackend(SourceBackend):
     def set_segment_mode(self, mode: int):
         """Устанавливает режим сегментов (2 или 4)."""
         if mode not in [2, 4]:
-            self.error.emit("Invalid segment mode (must be 2 or 4)")
+            self._emit_error("Invalid segment mode (must be 2 or 4)")
             return
         
         self._segment_mode = mode
         if self._configured:
             try:
                 self._lib.hq_set_segment_mode(mode)
-                self.status.emit(f"Segment mode set to {mode}")
+                self._emit_status(f"Segment mode set to {mode}")
             except Exception:
                 pass
     
@@ -326,7 +417,7 @@ class HackRFQSABackend(SourceBackend):
         if self._configured:
             try:
                 self._lib.hq_set_detector_params(threshold_db, min_width, min_sweeps, timeout)
-                self.status.emit(f"Detector params updated: threshold={threshold_db:.1f}dB")
+                self._emit_status(f"Detector params updated: threshold={threshold_db:.1f}dB")
             except Exception:
                 pass
     
@@ -357,7 +448,7 @@ class HackRFQSABackend(SourceBackend):
     @QtCore.pyqtSlot(int, str)
     def _on_worker_finished(self, code: int, msg: str):
         if code != 0 and msg:
-            self.error.emit(msg)
+            self._emit_error(msg)
         self._running = False
         self.finished.emit(code)
     
@@ -366,14 +457,14 @@ class HackRFQSABackend(SourceBackend):
         if self.log:
             self.log.info(msg)
         print(msg)
-        self.status.emit(msg)
+        # self.status.emit(msg)  # Убираем дублирование
     
     def _emit_error(self, msg: str):
         """Эмитит ошибку и логирует."""
         if self.log:
             self.log.error(msg)
         print(f"ERROR: {msg}")
-        self.error.emit(msg)
+        # self._emit_error(msg)  # Убираем дублирование
     
     def _on_spectrum_data(self, freqs_ptr, powers_ptr, n, center_hz, user):
         """Колбэк от C кода для получения данных спектра."""
@@ -389,16 +480,26 @@ class HackRFQSABackend(SourceBackend):
                 dtype=np.float32
             ).copy()
             
+            # Дополнительное логирование для отладки
+            print(f"[DEBUG] _on_spectrum_data: n={n}, freqs_shape={freqs.shape}, powers_shape={powers.shape}")
+            if n > 0:
+                print(f"[DEBUG] freq range: {freqs[0]:.1f} - {freqs[-1]:.1f} Hz")
+                print(f"[DEBUG] power range: {np.min(powers):.1f} - {np.max(powers):.1f} dBm")
+            
             # Отправляем данные в UI
+            print(f"[DEBUG] Emitting fullSweepReady signal")
             self.fullSweepReady.emit(freqs, powers)
+            print(f"[DEBUG] Signal emitted successfully")
             
             # Статус
             if n > 0:
                 max_power = np.max(powers)
-                self.status.emit(f"Spectrum: {n} points, max={max_power:.1f}dBm")
+                self._emit_status(f"Spectrum: {n} points, max={max_power:.1f}dBm")
                 
         except Exception as e:
-            self.error.emit(f"Error in spectrum callback: {e}")
+            self._emit_error(f"Error in spectrum callback: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 class _MasterWorker(QtCore.QThread):
@@ -426,20 +527,33 @@ class _MasterWorker(QtCore.QThread):
         code, msg = 0, ""
         
         try:
+            print(f"[DEBUG] _MasterWorker: Starting C code with callback")
             # Запускаем C-код с колбэком для получения данных
             r = self._backend._lib.hq_start(self._backend._spectrum_callback, self._backend._ffi.NULL)
             if r != 0:
                 msg = self._backend._get_last_error()
                 raise RuntimeError(f"Failed to start: {msg}")
             
+            print(f"[DEBUG] _MasterWorker: C code started successfully, r={r}")
+            
             # Ждем завершения или остановки
             while not self._stop_flag.is_set():
                 self.msleep(100)  # Проверяем каждые 100 мс
-        
+            
+            print(f"[DEBUG] _MasterWorker: Loop exited, stop_flag={self._stop_flag.is_set()}")
+            
         except Exception as e:
+            print(f"[DEBUG] _MasterWorker: Exception occurred: {e}")
             code, msg = 1, str(e)
         
         finally:
+            # Всегда останавливаем C код
+            try:
+                print(f"[DEBUG] _MasterWorker: Stopping C code")
+                self._backend._lib.hq_stop()
+                print(f"[DEBUG] _MasterWorker: C code stopped")
+            except Exception as e:
+                print(f"[DEBUG] _MasterWorker: Error stopping C code: {e}")
             self.finished_sig.emit(code, msg)
 
 # Экспортируем публичные классы
