@@ -18,18 +18,19 @@ from panorama.drivers.base import SweepConfig, SourceBackend
 from panorama.features.spectrum.model import SpectrumModel
 from panorama.shared.palettes import get_colormap
 
-# Константы оптимизации
-MAX_DISPLAY_COLS = 2048   # Максимум колонок для отображения
+# Константы оптимизации для плавного отображения 50-6000 МГц
+# Уменьшены значения для предотвращения зависания графика
+MAX_DISPLAY_COLS = 1024   # Максимум колонок для отображения (уменьшено для производительности)
 WATER_ROWS_DEFAULT = 100  # Строк водопада по умолчанию
-MAX_SPECTRUM_POINTS = 2048  # Максимум точек для линий спектра
+MAX_SPECTRUM_POINTS = 1024  # Максимум точек для линий спектра (уменьшено для производительности)
 
 
 class SDRConfig:
-    """Конфигурация SDR параметров."""
+    """Конфигурация SDR параметров для стабильной работы в диапазоне 50-6000 МГц."""
     def __init__(self):
         self.freq_start_mhz = 50.0
         self.freq_stop_mhz = 6000.0
-        self.bin_khz = 800.0
+        self.bin_khz = 800.0  # Минимальный bin 800 кГц для производительности
         self.lna_db = 24
         self.vga_db = 20
         self.amp_on = False
@@ -71,7 +72,7 @@ class SDRConfig:
 
 
 class SpectrumView(QtWidgets.QWidget):
-    """Главный виджет спектра с водопадом, оптимизированный для 50-6000 МГц."""
+    """Главный виджет спектра с водопадом, оптимизированный для плавного отображения 50-6000 МГц."""
 
     newRowReady = QtCore.pyqtSignal(object, object)  # (freqs_hz, row_dbm)
     rangeSelected = QtCore.pyqtSignal(float, float)
@@ -172,19 +173,19 @@ class SpectrumView(QtWidgets.QWidget):
         
         # Параметры частоты
         self.start_mhz = QtWidgets.QDoubleSpinBox()
-        self.start_mhz.setRange(24, 7000)
+        self.start_mhz.setRange(50, 6000)  # Ограничиваем диапазон 50-6000 МГц
         self.start_mhz.setDecimals(1)
         self.start_mhz.setValue(50.0)
         self.start_mhz.setSuffix(" МГц")
         
         self.stop_mhz = QtWidgets.QDoubleSpinBox()
-        self.stop_mhz.setRange(25, 7000)
+        self.stop_mhz.setRange(50, 6000)  # Ограничиваем диапазон 50-6000 МГц
         self.stop_mhz.setDecimals(1)
         self.stop_mhz.setValue(6000.0)
         self.stop_mhz.setSuffix(" МГц")
         
         self.bin_khz = QtWidgets.QDoubleSpinBox()
-        self.bin_khz.setRange(1, 5000)
+        self.bin_khz.setRange(500, 5000)  # Минимальный bin ограничен 500 кГц для производительности
         self.bin_khz.setDecimals(0)
         self.bin_khz.setValue(800)
         self.bin_khz.setSuffix(" кГц")
@@ -512,8 +513,11 @@ class SpectrumView(QtWidgets.QWidget):
         if freqs_hz.size == 0 or power_dbm.size == 0 or freqs_hz.size != power_dbm.size:
             return
         
-        # Фильтруем невалидные значения
+        # Фильтруем невалидные значения и ограничиваем диапазон 50-6000 МГц
         valid_mask = np.isfinite(power_dbm) & np.isfinite(freqs_hz)
+        freq_mask = (freqs_hz >= 50e6) & (freqs_hz <= 6000e6)  # 50-6000 МГц
+        valid_mask = valid_mask & freq_mask
+        
         if not np.all(valid_mask):
             freqs_hz = freqs_hz[valid_mask]
             power_dbm = power_dbm[valid_mask]
@@ -549,7 +553,6 @@ class SpectrumView(QtWidgets.QWidget):
     def _initialize_display(self, freqs_hz: np.ndarray, power_dbm: np.ndarray):
         """Инициализация отображения."""
         n = int(freqs_hz.size)
-        print(f"[SpectrumView] Инициализация: {n} точек, диапазон {freqs_hz[0]/1e6:.1f}-{freqs_hz[-1]/1e6:.1f} МГц")
         
         # Сохраняем полную сетку
         self._model.freqs_hz = freqs_hz.astype(np.float64, copy=True)
@@ -560,9 +563,14 @@ class SpectrumView(QtWidgets.QWidget):
         x_mhz = self._model.freqs_hz / 1e6
         x0, x1 = float(x_mhz[0]), float(x_mhz[-1])
         
-        # Ограничиваем 50-6000 МГц
+        # Ограничиваем 50-6000 МГц для стабильности
         x0 = max(50.0, x0)
         x1 = min(6000.0, x1)
+        
+        # Дополнительная проверка размера данных
+        if x_mhz.size > 10000:  # Если слишком много точек, принудительно даунсемплируем
+            self._wf_max_cols = 512
+            waterfall_rows = 50
         
         self.plot.setLimits(xMin=x0, xMax=x1)
         self.water_plot.setLimits(xMin=x0, xMax=x1)
@@ -572,11 +580,14 @@ class SpectrumView(QtWidgets.QWidget):
         self.water_plot.setXRange(x0, x1, padding=0.0)
         
         # Адаптивный даунсемплинг для больших диапазонов
-        if n > 4096:
-            self._wf_max_cols = 2048
+        if n > 10000:  # Очень большие диапазоны
+            self._wf_max_cols = 512
+            waterfall_rows = 50
+        elif n > 2048:  # Большие диапазоны
+            self._wf_max_cols = 1024  # Уменьшено для производительности
             waterfall_rows = 100
-        else:
-            self._wf_max_cols = 4096
+        else:  # Обычные диапазоны
+            self._wf_max_cols = 2048  # Уменьшено для производительности
             waterfall_rows = 200
         
         self._wf_ds_factor = max(1, int(np.ceil(n / self._wf_max_cols)))

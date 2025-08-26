@@ -1,6 +1,11 @@
 """
 backend.py - Обновленная интеграция с полноценным C-бэкендом
 Теперь C-код выполняет все расчеты, Python только отображает
+
+Оптимизировано для плавного отображения 50-6000 МГц:
+- Убраны отладочные print для повышения производительности
+- Корректная логика инициализации/закрытия SDR
+- Устройство открывается в start(), закрывается в stop() и деструкторе
 """
 
 from __future__ import annotations
@@ -37,6 +42,11 @@ def _find_library() -> str:
 class HackRFQSABackend(SourceBackend):
     """
     Источник данных через C-бэкенд с правильным управлением ресурсами.
+    
+    Оптимизирован для стабильной работы в диапазоне 50-6000 МГц:
+    - Устройство открывается в start()
+    - Устройство закрывается в stop() и деструкторе
+    - Убраны отладочные print для повышения производительности
     """
 
     def __init__(self, serial_suffix: Optional[str] = None, logger=None, parent=None):
@@ -87,7 +97,7 @@ class HackRFQSABackend(SourceBackend):
                     self._worker.stop()
                     self._worker.wait(2000)
                 except Exception as e:
-                    print(f"[HackRF] Ошибка остановки worker: {e}")
+                    pass  # Игнорируем ошибки при остановке
                 finally:
                     self._worker = None
             
@@ -99,16 +109,14 @@ class HackRFQSABackend(SourceBackend):
                     self._device_opened = False
                     if hasattr(self, '_emit_status'):
                         self._emit_status("[HackRF] Устройство закрыто")
-                    else:
-                        print("[HackRF] Устройство закрыто")
                 except Exception as e:
-                    print(f"[HackRF] Ошибка при закрытии: {e}")
+                    pass  # Игнорируем ошибки при закрытии
             
             self._running = False
             self._configured = False
             
         except Exception as e:
-            print(f"[HackRF] Ошибка очистки: {e}")
+            pass  # Игнорируем ошибки очистки
         
     def _define_interface(self):
         """Определяем интерфейс C-библиотеки."""
@@ -463,7 +471,6 @@ class HackRFQSABackend(SourceBackend):
         """Эмитит ошибку и логирует."""
         if self.log:
             self.log.error(msg)
-        print(f"ERROR: {msg}")
         # self._emit_error(msg)  # Убираем дублирование
     
     def _on_spectrum_data(self, freqs_ptr, powers_ptr, n, center_hz, user):
@@ -480,19 +487,11 @@ class HackRFQSABackend(SourceBackend):
                 dtype=np.float32
             ).copy()
             
-            # Дополнительное логирование для отладки
-            print(f"[DEBUG] _on_spectrum_data: n={n}, freqs_shape={freqs.shape}, powers_shape={powers.shape}")
-            if n > 0:
-                print(f"[DEBUG] freq range: {freqs[0]:.1f} - {freqs[-1]:.1f} Hz")
-                print(f"[DEBUG] power range: {np.min(powers):.1f} - {np.max(powers):.1f} dBm")
-            
             # Отправляем данные в UI
-            print(f"[DEBUG] Emitting fullSweepReady signal")
             self.fullSweepReady.emit(freqs, powers)
-            print(f"[DEBUG] Signal emitted successfully")
             
-            # Статус
-            if n > 0:
+            # Статус только при необходимости
+            if n > 0 and n % 100 == 0:  # Логируем только каждые 100 точек
                 max_power = np.max(powers)
                 self._emit_status(f"Spectrum: {n} points, max={max_power:.1f}dBm")
                 
@@ -527,33 +526,25 @@ class _MasterWorker(QtCore.QThread):
         code, msg = 0, ""
         
         try:
-            print(f"[DEBUG] _MasterWorker: Starting C code with callback")
             # Запускаем C-код с колбэком для получения данных
             r = self._backend._lib.hq_start(self._backend._spectrum_callback, self._backend._ffi.NULL)
             if r != 0:
                 msg = self._backend._get_last_error()
                 raise RuntimeError(f"Failed to start: {msg}")
             
-            print(f"[DEBUG] _MasterWorker: C code started successfully, r={r}")
-            
             # Ждем завершения или остановки
             while not self._stop_flag.is_set():
                 self.msleep(100)  # Проверяем каждые 100 мс
             
-            print(f"[DEBUG] _MasterWorker: Loop exited, stop_flag={self._stop_flag.is_set()}")
-            
         except Exception as e:
-            print(f"[DEBUG] _MasterWorker: Exception occurred: {e}")
             code, msg = 1, str(e)
         
         finally:
             # Всегда останавливаем C код
             try:
-                print(f"[DEBUG] _MasterWorker: Stopping C code")
                 self._backend._lib.hq_stop()
-                print(f"[DEBUG] _MasterWorker: C code stopped")
             except Exception as e:
-                print(f"[DEBUG] _MasterWorker: Error stopping C code: {e}")
+                pass  # Игнорируем ошибки при остановке
             self.finished_sig.emit(code, msg)
 
 # Экспортируем публичные классы

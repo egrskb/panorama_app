@@ -113,8 +113,6 @@ class MasterSourceAdapter(QtCore.QObject):
     def _on_full_sweep_from_backend(self, freqs, dbm):
         """Обрабатывает полный sweep от backend'а."""
         try:
-            print(f"[MasterSourceAdapter] _on_full_sweep_from_backend: freqs_size={freqs.size if hasattr(freqs, 'size') else len(freqs)}, dbm_size={dbm.size if hasattr(dbm, 'size') else len(dbm)}")
-            
             # Конвертируем в numpy arrays если нужно
             if not isinstance(freqs, np.ndarray):
                 freqs = np.array(freqs, dtype=np.float64)
@@ -128,8 +126,6 @@ class MasterSourceAdapter(QtCore.QObject):
             # Эмитим для SpectrumView
             self.spectrumReady.emit(freqs, dbm)
             self.fullSweepReady.emit(freqs, dbm)  # Для совместимости
-            
-            print(f"[MasterSourceAdapter] Signals emitted successfully")
             
         except Exception as e:
             self._relay_error(f"Error in _on_full_sweep_from_backend: {e}")
