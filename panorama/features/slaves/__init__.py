@@ -4,6 +4,6 @@
 в едином современном интерфейсе.
 """
 
-from .view import SlavesView
+from .view import ImprovedSlavesView
 
-__all__ = ['SlavesView']
+__all__ = ['ImprovedSlavesView']

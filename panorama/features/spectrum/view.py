@@ -599,9 +599,16 @@ class SpectrumView(QtWidgets.QWidget):
         if freqs_hz.size == 0 or power_dbm.size == 0 or freqs_hz.size != power_dbm.size:
             return
         
-        # Фильтруем невалидные значения и ограничиваем диапазон 50-6000 МГц
+        # Фильтруем невалидные значения и ограничиваем диапазон пользовательскими границами
         valid_mask = np.isfinite(power_dbm) & np.isfinite(freqs_hz)
-        freq_mask = (freqs_hz >= 50e6) & (freqs_hz <= 6000e6)  # 50-6000 МГц
+        
+        # Используем текущую конфигурацию для фильтрации
+        if self._current_cfg:
+            freq_mask = (freqs_hz >= self._current_cfg.freq_start_hz) & (freqs_hz <= self._current_cfg.freq_end_hz)
+        else:
+            # Fallback на разумные границы если конфигурация не задана
+            freq_mask = (freqs_hz >= 50e6) & (freqs_hz <= 6000e6)
+        
         valid_mask = valid_mask & freq_mask
         
         if not np.all(valid_mask):
@@ -649,9 +656,16 @@ class SpectrumView(QtWidgets.QWidget):
         x_mhz = self._model.freqs_hz / 1e6
         x0, x1 = float(x_mhz[0]), float(x_mhz[-1])
         
-        # Ограничиваем 50-6000 МГц для стабильности
-        x0 = max(50.0, x0)
-        x1 = min(6000.0, x1)
+        # Используем пользовательские границы для стабильности
+        if self._current_cfg:
+            user_x0 = self._current_cfg.freq_start_hz / 1e6
+            user_x1 = self._current_cfg.freq_end_hz / 1e6
+            x0 = max(user_x0, x0)
+            x1 = min(user_x1, x1)
+        else:
+            # Fallback на разумные границы если конфигурация не задана
+            x0 = max(50.0, x0)
+            x1 = min(6000.0, x1)
         
         # Дополнительная проверка размера данных
         if x_mhz.size > 10000:  # Если слишком много точек, принудительно даунсемплируем
@@ -957,9 +971,9 @@ class SpectrumView(QtWidgets.QWidget):
         
         # Создаем конфигурацию
         cfg = SweepConfig(
-            # всегда глобальный обзор для мастера
-            freq_start_hz=50_000_000,
-            freq_end_hz=6_000_000_000,
+            # Используем частоты из UI вместо захардкоженных
+            freq_start_hz=int(self.start_mhz.value() * 1e6),
+            freq_end_hz=int(self.stop_mhz.value() * 1e6),
             bin_hz=int(bw),
             lna_db=int(self.lna_db.value()),
             vga_db=int(self.vga_db.value()),
@@ -970,7 +984,7 @@ class SpectrumView(QtWidgets.QWidget):
         )
         self._current_cfg = cfg
         
-        # Инициализация модели с глобальными границами
+        # Инициализация модели с пользовательскими границами
         self._model.set_grid(cfg.freq_start_hz, cfg.freq_end_hz, cfg.bin_hz)
         
         # Сброс счетчиков

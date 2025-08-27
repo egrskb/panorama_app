@@ -68,11 +68,7 @@ class HackRFQSABackend(SourceBackend):
         except Exception as e:
             raise RuntimeError(f"Не удалось загрузить библиотеку HackRF Master: {e}")
         
-        # Создаем колбэк для данных
-        self._spectrum_callback = self._ffi.callback(
-            "void(const double*, const float*, int, uint64_t, void*)",
-            self._on_spectrum_data
-        )
+
         
         # Загружаем конфигурацию из JSON
         self._load_config()
@@ -120,34 +116,27 @@ class HackRFQSABackend(SourceBackend):
     def _define_interface(self):
         """Определяем интерфейс C-библиотеки."""
         self._ffi.cdef("""
-            // Типы колбэков
-            typedef void (*hq_legacy_cb)(
-                const double* freqs_hz,
-                const float*  powers_dbm,
-                int           n,
-                uint64_t      center_hz,
-                void*         user
-            );
-            
-            typedef void (*hq_multi_segment_cb)(
-                const void* segments,
-                int         segment_count,
-                double      fft_bin_width_hz,
-                uint64_t    center_hz,
-                void*       user
-            );
+            // Multi-segment (на будущее)
+            typedef struct {
+                int     seg_count;
+                double* freqs_hz[4];
+                float*  pwr_dbm[4];
+                int     lens[4];
+                double  centers_hz[4];
+            } hq_segment_data_t;
+            typedef void (*hq_multi_segment_cb)(const hq_segment_data_t* data, void* user);
             
             // Основные функции
             int  hq_open(const char* serial_suffix);
             void hq_close(void);
             int  hq_configure(double f_start_mhz, double f_stop_mhz, double bin_hz,
                               int lna_db, int vga_db, int amp_on);
-            int  hq_start(hq_legacy_cb cb, void* user);
             int  hq_start_multi_segment(hq_multi_segment_cb cb, void* user);
+            // Старт без колбэков
+            int  hq_start_no_cb(void);
             int  hq_stop(void);
             const char* hq_last_error(void);
             
-            // Новые функции для полной интеграции
             int  hq_get_master_spectrum(double* freqs_hz, float* powers_dbm, int max_points);
             void hq_set_ema_alpha(float alpha);
             void hq_set_detector_params(float threshold_offset_db, int min_width_bins,
@@ -488,49 +477,7 @@ class HackRFQSABackend(SourceBackend):
         print(f"ERROR: {msg}")
         self.error.emit(msg)
     
-    def _on_spectrum_data(self, freqs_ptr, powers_ptr, n, center_hz, user):
-        """Колбэк от C кода для получения данных спектра."""
-        try:
-            # Копируем данные из C в numpy массивы
-            freqs = np.frombuffer(
-                self._ffi.buffer(freqs_ptr, n * 8),
-                dtype=np.float64
-            ).copy()
-            
-            powers = np.frombuffer(
-                self._ffi.buffer(powers_ptr, n * 4),
-                dtype=np.float32
-            ).copy()
-            
-            # ИСПРАВЛЕНИЕ: Фильтруем только пользовательский диапазон
-            if hasattr(self, '_user_freq_start_hz') and hasattr(self, '_user_freq_stop_hz'):
-                if self._user_freq_start_hz is not None and self._user_freq_stop_hz is not None:
-                    # Создаем маску для пользовательского диапазона
-                    mask = (freqs >= self._user_freq_start_hz) & (freqs <= self._user_freq_stop_hz)
-                    
-                    # Применяем маску
-                    freqs_filtered = freqs[mask]
-                    powers_filtered = powers[mask]
-                    
-                    # Отправляем отфильтрованные данные
-                    if freqs_filtered.size > 0:
-                        self.fullSweepReady.emit(freqs_filtered, powers_filtered)
-                        
-                        # Логируем только периодически
-                        if n > 0 and n % 100 == 0:
-                            max_power = np.max(powers_filtered)
-                            self._emit_status(f"Spectrum: {freqs_filtered.size} points (filtered from {n}), max={max_power:.1f}dBm")
-                else:
-                    # Если пользовательские границы не заданы, отправляем все
-                    self.fullSweepReady.emit(freqs, powers)
-            else:
-                # Если атрибуты еще не установлены, отправляем все
-                self.fullSweepReady.emit(freqs, powers)
-                
-        except Exception as e:
-            self._emit_error(f"Error in spectrum callback: {e}")
-            import traceback
-            traceback.print_exc()
+    # legacy C-колбэк был удалён — ничего тут не нужно
 
 
 class _MasterWorker(QtCore.QThread):
@@ -558,8 +505,8 @@ class _MasterWorker(QtCore.QThread):
         code, msg = 0, ""
         
         try:
-            # Запускаем C-код с колбэком для получения данных
-            r = self._backend._lib.hq_start(self._backend._spectrum_callback, self._backend._ffi.NULL)
+            # Запускаем C-код без колбэков
+            r = self._backend._lib.hq_start_no_cb()
             if r != 0:
                 msg = self._backend._get_last_error()
                 raise RuntimeError(f"Failed to start: {msg}")

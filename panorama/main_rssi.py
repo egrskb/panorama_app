@@ -32,7 +32,7 @@ from panorama.features.settings.manager_improved import ImprovedDeviceManagerDia
 from panorama.features.settings.storage import load_sdr_settings, save_sdr_settings
 from panorama.features.spectrum.master_adapter import MasterSourceAdapter
 from panorama.features.detector.settings_dialog import DetectorSettingsDialog, DetectorSettings
-from panorama.features.slaves import SlavesView
+from panorama.features.slaves import ImprovedSlavesView
 from panorama.features.detector.peak_watchlist_manager import PeakWatchlistManager
 from panorama.features.trilateration.coordinator import TrilaterationCoordinator
 
@@ -324,7 +324,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
         tab_widget.addTab(self.spectrum_view, "📊 Спектр")
         
         # Вкладка управления слейвами (объединяет watchlist, результаты и контроль)
-        self.slaves_view = SlavesView(orchestrator=self.orchestrator)
+        self.slaves_view = ImprovedSlavesView(orchestrator=self.orchestrator)
         tab_widget.addTab(self.slaves_view, "🎯 Слейвы")
         
         layout.addWidget(tab_widget)
@@ -365,6 +365,23 @@ class RSSIPanoramaMainWindow(QMainWindow):
         det_settings_action = settings_menu.addAction('Настройки детектора...')
         det_settings_action.triggered.connect(self._show_detector_settings)
         
+        # Меню Слейвы
+        slaves_menu = menubar.addMenu('🎯 Слейвы')
+        
+        # Действие обновления данных слейвов
+        refresh_slaves_action = slaves_menu.addAction('🔄 Обновить данные')
+        refresh_slaves_action.triggered.connect(self._refresh_slaves_data)
+        
+        # Действие экспорта состояния слейвов
+        export_slaves_action = slaves_menu.addAction('💾 Экспорт состояния...')
+        export_slaves_action.triggered.connect(self._export_slaves_state)
+        
+        slaves_menu.addSeparator()
+        
+        # Действие очистки данных слейвов
+        clear_slaves_action = slaves_menu.addAction('🗑️ Очистить данные')
+        clear_slaves_action.triggered.connect(self._clear_slaves_data)
+        
         # Меню Справка
         help_menu = menubar.addMenu('Справка')
         
@@ -384,6 +401,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
         
         # Только новый диспетчер устройств
         toolbar.addAction('🧭 Диспетчер устройств', self._open_device_manager)
+        
         
         # Убираем дублирование кнопки "Измерить" в тулбаре — остаётся кнопка в параметрах
     
@@ -412,6 +430,12 @@ class RSSIPanoramaMainWindow(QMainWindow):
             if hasattr(self, 'watchlist_view') and self.watchlist_view:
                 self.watchlist_view.task_cancelled.connect(self._on_task_cancelled)
                 self.watchlist_view.task_retried.connect(self._on_task_retried)
+            
+            # Сигналы SlavesView
+            if hasattr(self, 'slaves_view') and self.slaves_view:
+                self.slaves_view.send_to_map.connect(self._on_slave_target_to_map)
+                self.slaves_view.task_selected.connect(self._on_slave_task_selected)
+                self.slaves_view.watchlist_updated.connect(self._on_slave_watchlist_updated)
                 
             self.log.info("All signals connected successfully")
         except Exception as e:
@@ -877,6 +901,83 @@ class RSSIPanoramaMainWindow(QMainWindow):
             dlg.exec_()
         except Exception as e:
             self.log.error(f"Detector settings dialog error: {e}")
+    
+    def _on_slave_target_to_map(self, target_data: dict):
+        """Обрабатывает сигнал отправки цели на карту от slaves_view."""
+        try:
+            if hasattr(self, 'map_view') and self.map_view:
+                # Отправляем цель на карту
+                if hasattr(self.map_view, 'add_target_from_detector'):
+                    self.map_view.add_target_from_detector(target_data)
+                    self.log.info(f"Цель от слейва отправлена на карту: {target_data.get('id', 'Unknown')}")
+                else:
+                    self.log.warning("Метод add_target_from_detector не доступен в map_view")
+            else:
+                self.log.warning("Map view не доступен")
+        except Exception as e:
+            self.log.error(f"Ошибка отправки цели на карту: {e}")
+    
+    def _on_slave_task_selected(self, task_id: str):
+        """Обрабатывает сигнал выбора задачи от slaves_view."""
+        try:
+            self.log.info(f"Выбрана задача от слейва: {task_id}")
+            # TODO: Реализовать логику выбора задачи
+        except Exception as e:
+            self.log.error(f"Ошибка обработки выбора задачи: {e}")
+    
+    def _on_slave_watchlist_updated(self, watchlist_data: list):
+        """Обрабатывает сигнал обновления watchlist от slaves_view."""
+        try:
+            # Логируем только при реальных изменениях, а не каждые 2 секунды
+            if not hasattr(self, '_last_watchlist_count') or self._last_watchlist_count != len(watchlist_data):
+                self.log.info(f"Watchlist обновлен от слейва: {len(watchlist_data)} элементов")
+                self._last_watchlist_count = len(watchlist_data)
+            # TODO: Реализовать логику обновления watchlist
+        except Exception as e:
+            self.log.error(f"Ошибка обработки обновления watchlist: {e}")
+    
+    def _refresh_slaves_data(self):
+        """Обновляет данные слейвов."""
+        try:
+            if hasattr(self, 'slaves_view') and self.slaves_view:
+                # Вызываем метод обновления данных в slaves_view
+                if hasattr(self.slaves_view, 'manual_refresh'):
+                    self.slaves_view.manual_refresh()
+                self.log.info("Данные слейвов обновлены")
+            else:
+                self.log.warning("Slaves view не доступен")
+        except Exception as e:
+            self.log.error(f"Ошибка обновления данных слейвов: {e}")
+    
+    def _export_slaves_state(self):
+        """Экспортирует состояние слейвов в файл."""
+        try:
+            if hasattr(self, 'slaves_view') and self.slaves_view:
+                # Вызываем метод экспорта в slaves_view
+                if hasattr(self.slaves_view, 'export_current_state'):
+                    self.slaves_view.export_current_state()
+                    self.log.info("Состояние слейвов экспортировано")
+                else:
+                    self.log.warning("Метод экспорта не доступен в slaves_view")
+            else:
+                self.log.warning("Slaves view не доступен")
+        except Exception as e:
+            self.log.error(f"Ошибка экспорта состояния слейвов: {e}")
+    
+    def _clear_slaves_data(self):
+        """Очищает данные слейвов."""
+        try:
+            if hasattr(self, 'slaves_view') and self.slaves_view:
+                # Вызываем метод очистки в slaves_view
+                if hasattr(self.slaves_view, 'clear_all_data'):
+                    self.slaves_view.clear_all_data()
+                    self.log.info("Данные слейвов очищены")
+                else:
+                    self.log.warning("Метод очистки не доступен в slaves_view")
+            else:
+                self.log.warning("Slaves view не доступен")
+        except Exception as e:
+            self.log.error(f"Ошибка очистки данных слейвов: {e}")
     
     def _show_about(self):
         """Показывает информацию о программе."""

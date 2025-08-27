@@ -110,9 +110,8 @@ typedef struct {
     int segment_mode;       // 2 или 4
     int fft_size_override;  // 0 = авто
 
-    // Колбэки
+    // Колбэки (оставляем только multi_cb на будущее)
     hq_multi_segment_cb multi_cb;
-    hq_segment_cb       legacy_cb;  // Это hq_legacy_cb в Python
     void* user_data;
 } MasterContext;
 
@@ -409,9 +408,6 @@ static void process_sweep_block(MasterContext* master, uint8_t* buffer, int vali
         }
 
         master->multi_cb(g_segments, seg_count, proc->bin_width, center_hz, master->user_data);
-    } else if (master->legacy_cb) {
-        // (const double* freqs_hz, const float* pwr_dbm, int count, uint64_t center_hz, void* user)
-        master->legacy_cb(proc->freqs_hz, pwr_src, proc->fft_size, center_hz, master->user_data);
     }
 
     pthread_mutex_unlock(&master->spectrum_mutex);
@@ -755,7 +751,6 @@ int hq_start_multi_segment(hq_multi_segment_cb cb, void* user) {
     if (g_master->running) { set_error("Already running"); return -1; }
 
     g_master->multi_cb = cb;
-    g_master->legacy_cb = NULL;
     g_master->user_data = user;
     g_master->running = 1;
     g_master->stop_requested = 0;
@@ -771,22 +766,20 @@ int hq_start_multi_segment(hq_multi_segment_cb cb, void* user) {
     return 0;
 }
 
-int hq_start(hq_segment_cb cb, void* user) {  // hq_segment_cb = hq_legacy_cb
-    if (!g_master || !g_master->dev) { set_error("Device not opened"); return -1; }
-    if (g_master->running) { set_error("Already running"); return -1; }
-
-    g_master->legacy_cb = cb;
-    g_master->multi_cb = NULL;
-    g_master->user_data = user;
-    g_master->running = 1;
+// Старт без каких-либо колбэков — только наполняем глобальную сетку,
+// которую далее читают через hq_get_master_spectrum()
+int hq_start_no_cb(void) {
+    if (!g_master) { set_error("Not configured"); return -1; }
+    if (g_master->running) return 0;
+    g_master->multi_cb  = NULL;
+    g_master->user_data = NULL;
     g_master->stop_requested = 0;
-
-    if (pthread_create(&g_master->sweep_thread, NULL, worker_thread_fn, g_master) != 0) {
-        set_error("pthread_create failed: %s", strerror(errno));
-        g_master->running = 0;
-        return -1;
-    }
+    // запуск потока свипа ...
+    // (оставь ту же логику запуска, что и в hq_start_multi_segment)
+    int rc = pthread_create(&g_master->sweep_thread, NULL, worker_thread_fn, g_master);
+    if (rc != 0) { set_error("pthread_create failed"); return -1; }
     g_master->is_running_thread = 1;
+    g_master->running = 1;
     return 0;
 }
 

@@ -3,11 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Panorama RSSI Map</title>
+    <title>Panorama RSSI Map - OpenLayers v10</title>
     
-    <!-- OpenLayers 9.x -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@9.2.4/ol.css">
-    <script src="https://cdn.jsdelivr.net/npm/ol@9.2.4/dist/ol.js"></script>
+    <!-- OpenLayers 10.6.0 -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@10.6.0/ol.css">
+    <script src="https://cdn.jsdelivr.net/npm/ol@10.6.0/dist/ol.js"></script>
     
     <!-- Qt WebChannel -->
     <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
@@ -331,34 +331,38 @@
     <div class="tooltip" id="tooltip"></div>
     
     <script>
-        // ==================== Инициализация карты ====================
+        // ==================== Инициализация карты OpenLayers v10 ====================
         
-        // Проекция в метрах для локальной системы координат
+        // Создаем проекцию в метрах для локальной системы координат
         const projection = new ol.proj.Projection({
             code: 'local-meters',
             units: 'meters',
             extent: [-500, -500, 500, 500] // 1км x 1км область
         });
         
-        // Стили для различных элементов
+        // Стили для различных элементов (v10 совместимые)
         const styles = {
             // Стиль для Slave SDR
-            slaveSDR: new ol.style.Style({
-                image: new ol.style.Circle({
-                    radius: 10,
-                    fill: new ol.style.Fill({ color: 'rgba(74, 222, 128, 0.8)' }),
-                    stroke: new ol.style.Stroke({ 
-                        color: 'rgba(74, 222, 128, 1)', 
-                        width: 2 
+            slaveSDR: function(feature) {
+                const name = feature.get('name') || '';
+                return new ol.style.Style({
+                    image: new ol.style.Circle({
+                        radius: 10,
+                        fill: new ol.style.Fill({ color: 'rgba(74, 222, 128, 0.8)' }),
+                        stroke: new ol.style.Stroke({ 
+                            color: 'rgba(74, 222, 128, 1)', 
+                            width: 2 
+                        })
+                    }),
+                    text: new ol.style.Text({
+                        text: name,
+                        font: '12px sans-serif',
+                        fill: new ol.style.Fill({ color: '#ffffff' }),
+                        stroke: new ol.style.Stroke({ color: '#000000', width: 3 }),
+                        offsetY: -20
                     })
-                }),
-                text: new ol.style.Text({
-                    font: '12px sans-serif',
-                    fill: new ol.style.Fill({ color: '#ffffff' }),
-                    stroke: new ol.style.Stroke({ color: '#000000', width: 3 }),
-                    offsetY: -20
-                })
-            }),
+                });
+            },
             
             // Стиль для активных целей
             activeTarget: new ol.style.Style({
@@ -415,18 +419,17 @@
             webglPoints: new ol.source.Vector()
         };
         
-        // Слои карты
+        // Слои карты (обновлены для v10)
         const layers = {
-            // Базовая сетка
-            grid: new ol.layer.Graticule({
-                strokeStyle: new ol.style.Stroke({
-                    color: 'rgba(255, 255, 255, 0.1)',
-                    width: 1,
-                    lineDash: [2, 4]
+            // Базовый слой с сеткой (фон)
+            base: new ol.layer.Vector({
+                source: new ol.source.Vector(),
+                style: new ol.style.Style({
+                    fill: new ol.style.Fill({
+                        color: 'rgba(26, 26, 26, 1)'
+                    })
                 }),
-                showLabels: true,
-                wrapX: false,
-                visible: true
+                zIndex: 0
             }),
             
             // Слой Slave SDR устройств
@@ -470,24 +473,24 @@
             })
         };
         
-        // WebGL слой для больших объемов точек
-        if (ol.layer.WebGLPoints) {
+        // WebGL слой для больших объемов точек (v10 улучшения)
+        try {
+            // В v10 WebGL Points layer имеет новый API
             layers.webglPoints = new ol.layer.WebGLPoints({
                 source: sources.webglPoints,
                 style: {
-                    symbol: {
-                        symbolType: 'circle',
-                        size: 8,
-                        color: 'rgba(255, 0, 0, 0.5)',
-                        opacity: 0.8
-                    }
+                    'circle-radius': 8,
+                    'circle-fill-color': 'rgba(255, 0, 0, 0.5)',
+                    'circle-opacity': 0.8
                 },
                 visible: false,
                 zIndex: 85
             });
+        } catch (e) {
+            console.log('WebGL Points layer not available, using fallback');
         }
         
-        // Создание карты
+        // Создание карты с обновленными настройками для v10
         const map = new ol.Map({
             target: 'map',
             layers: Object.values(layers).filter(l => l),
@@ -496,16 +499,36 @@
                 center: [0, 0],
                 zoom: 14,
                 maxZoom: 20,
-                minZoom: 10
+                minZoom: 10,
+                enableRotation: true,
+                constrainResolution: true
             }),
-            controls: ol.control.defaults({
+            controls: ol.control.defaults.defaults({
                 attribution: false
             }).extend([
                 new ol.control.ScaleLine({
-                    units: 'metric'
+                    units: 'metric',
+                    bar: true,
+                    steps: 4,
+                    text: true,
+                    minWidth: 140
                 })
             ])
         });
+        
+        // Добавляем сетку координат (Graticule в v10)
+        const gridLayer = new ol.layer.Graticule({
+            strokeStyle: new ol.style.Stroke({
+                color: 'rgba(255, 255, 255, 0.1)',
+                width: 1,
+                lineDash: [2, 4]
+            }),
+            showLabels: true,
+            wrapX: false,
+            visible: true,
+            zIndex: 1
+        });
+        map.addLayer(gridLayer);
         
         // ==================== WebChannel для связи с Python ====================
         
@@ -515,17 +538,21 @@
         const UPDATE_RATE = 50; // ms (20Hz max)
         
         // Инициализация Qt WebChannel
-        new QWebChannel(qt.webChannelTransport, function(channel) {
-            bridge = channel.objects.bridge;
-            console.log('WebChannel connected');
-            
-            // Подписка на обновления от Python
-            if (bridge.dataUpdated) {
-                bridge.dataUpdated.connect(function(data) {
-                    handleDataUpdate(JSON.parse(data));
-                });
-            }
-        });
+        if (typeof QWebChannel !== 'undefined' && typeof qt !== 'undefined') {
+            new QWebChannel(qt.webChannelTransport, function(channel) {
+                bridge = channel.objects.bridge;
+                console.log('WebChannel connected');
+                
+                // Подписка на обновления от Python
+                if (bridge && bridge.dataUpdated) {
+                    bridge.dataUpdated.connect(function(data) {
+                        handleDataUpdate(JSON.parse(data));
+                    });
+                }
+            });
+        } else {
+            console.log('Running without Qt WebChannel (development mode)');
+        }
         
         // ==================== Обработчики данных ====================
         
@@ -604,7 +631,7 @@
                     // Добавляем iso-круги дальности
                     if (slave.range) {
                         const rangeCircle = new ol.Feature({
-                            geometry: ol.geom.Polygon.circular([slave.x, slave.y], slave.range, 64)
+                            geometry: new ol.geom.Polygon.circular([slave.x, slave.y], slave.range, 64)
                         });
                         rangeCircle.setStyle(styles.rangeCircle);
                         sources.coverage.addFeature(rangeCircle);
@@ -715,7 +742,9 @@
                 let geometry;
                 
                 if (zone.type === 'circle') {
-                    geometry = ol.geom.Polygon.circular([zone.x, zone.y], zone.radius, 64);
+                    // В v10 используем fromCircle вместо circular
+                    const circle = new ol.geom.Circle([zone.x, zone.y], zone.radius);
+                    geometry = ol.geom.Polygon.fromCircle(circle, 64);
                 } else if (zone.type === 'ellipse') {
                     // Эллипс для направленных антенн
                     geometry = createEllipse(zone.x, zone.y, zone.radiusX, zone.radiusY, zone.rotation);
@@ -834,57 +863,75 @@
                 `X: ${coords[0].toFixed(1)} м | Y: ${coords[1].toFixed(1)} м`;
         });
         
-        // Tooltip при наведении
+        // Tooltip при наведении (v10 совместимый)
         const tooltip = document.getElementById('tooltip');
+        let currentFeature = null;
         
         map.on('pointermove', function(evt) {
-            const feature = map.forEachFeatureAtPixel(evt.pixel, function(feature) {
+            const pixel = evt.pixel;
+            const feature = map.forEachFeatureAtPixel(pixel, function(feature) {
                 return feature;
+            }, {
+                hitTolerance: 2
             });
             
-            if (feature) {
-                const props = feature.getProperties();
-                let content = '';
+            if (feature !== currentFeature) {
+                currentFeature = feature;
                 
-                if (props.name) {
-                    content += `<strong>${props.name}</strong><br>`;
-                }
-                if (props.freq) {
-                    content += `Частота: ${props.freq.toFixed(1)} МГц<br>`;
-                }
-                if (props.rssi) {
-                    content += `RSSI: ${props.rssi.toFixed(1)} дБм<br>`;
-                }
-                if (props.confidence) {
-                    content += `Уверенность: ${(props.confidence * 100).toFixed(0)}%<br>`;
-                }
-                if (props.status) {
-                    content += `Статус: ${props.status}<br>`;
-                }
-                
-                if (content) {
-                    tooltip.innerHTML = content;
-                    tooltip.style.left = evt.pixel[0] + 10 + 'px';
-                    tooltip.style.top = evt.pixel[1] - 10 + 'px';
-                    tooltip.classList.add('visible');
+                if (feature) {
+                    const props = feature.getProperties();
+                    let content = '';
+                    
+                    if (props.name) {
+                        content += `<strong>${props.name}</strong><br>`;
+                    }
+                    if (props.freq) {
+                        content += `Частота: ${props.freq.toFixed(1)} МГц<br>`;
+                    }
+                    if (props.rssi) {
+                        content += `RSSI: ${props.rssi.toFixed(1)} дБм<br>`;
+                    }
+                    if (props.confidence) {
+                        content += `Уверенность: ${(props.confidence * 100).toFixed(0)}%<br>`;
+                    }
+                    if (props.status) {
+                        content += `Статус: ${props.status}<br>`;
+                    }
+                    
+                    if (content) {
+                        tooltip.innerHTML = content;
+                        tooltip.style.left = pixel[0] + 10 + 'px';
+                        tooltip.style.top = pixel[1] - 10 + 'px';
+                        tooltip.classList.add('visible');
+                    } else {
+                        tooltip.classList.remove('visible');
+                    }
                 } else {
                     tooltip.classList.remove('visible');
                 }
-            } else {
-                tooltip.classList.remove('visible');
             }
         });
         
         // Клик по объектам
-        map.on('click', function(evt) {
+        map.on('singleclick', function(evt) {
             const feature = map.forEachFeatureAtPixel(evt.pixel, function(feature) {
                 return feature;
+            }, {
+                hitTolerance: 5
             });
             
             if (feature && bridge) {
                 const props = feature.getProperties();
                 bridge.featureClicked(JSON.stringify(props));
             }
+        });
+        
+        // Изменение курсора при наведении на объект
+        map.on('pointermove', function(evt) {
+            const hit = map.hasFeatureAtPixel(evt.pixel, {
+                hitTolerance: 2
+            });
+            map.getTargetElement().style.cursor = hit ? 'pointer' : '';
         });
         
         // ==================== Управление слоями ====================
@@ -909,17 +956,23 @@
         function setMode(mode) {
             document.getElementById('mode-status').textContent = mode.toUpperCase();
             
-            // Переключение между 2D и 3D (псевдо-3D через стили)
+            // Переключение между 2D и 3D (псевдо-3D через наклон и поворот)
             if (mode === '3d') {
                 map.getView().animate({
                     rotation: Math.PI / 6,
                     duration: 500
                 });
+                // В v10 можно добавить эффект наклона через CSS transform
+                const mapElement = document.getElementById('map');
+                mapElement.style.transform = 'perspective(1000px) rotateX(30deg)';
+                mapElement.style.transformOrigin = 'center bottom';
             } else {
                 map.getView().animate({
                     rotation: 0,
                     duration: 500
                 });
+                const mapElement = document.getElementById('map');
+                mapElement.style.transform = '';
             }
             
             // Обновляем активную кнопку
@@ -933,21 +986,63 @@
         }
         
         function centerMap() {
+            // Плавная анимация к центру
             map.getView().animate({
                 center: [0, 0],
                 zoom: 14,
-                duration: 500
+                duration: 500,
+                easing: ol.easing.easeOut
             });
         }
         
         function clearTargets() {
-            sources.targets.clear();
+            // Очистка с анимацией исчезновения
+            const features = sources.targets.getFeatures();
+            features.forEach(feature => {
+                animateRemoval(feature, () => {
+                    sources.targets.removeFeature(feature);
+                });
+            });
+            
             sources.trajectories.clear();
             sources.heatmap.clear();
             if (sources.webglPoints) {
                 sources.webglPoints.clear();
             }
-            updateStats();
+            
+            setTimeout(updateStats, 300);
+        }
+        
+        function animateRemoval(feature, callback) {
+            let opacity = 1;
+            const originalStyle = feature.getStyle() || styles.activeTarget;
+            
+            function animate() {
+                opacity -= 0.05;
+                if (opacity <= 0) {
+                    callback();
+                    return;
+                }
+                
+                const style = originalStyle.clone();
+                const image = style.getImage();
+                if (image) {
+                    const fill = image.getFill();
+                    if (fill) {
+                        const color = fill.getColor();
+                        if (typeof color === 'string') {
+                            const rgba = ol.color.asArray(color);
+                            rgba[3] = opacity;
+                            fill.setColor(rgba);
+                        }
+                    }
+                }
+                
+                feature.setStyle(style);
+                requestAnimationFrame(animate);
+            }
+            
+            animate();
         }
         
         // ==================== Обновление статистики ====================
@@ -967,7 +1062,7 @@
             targetsEl.className = targetsCount > 0 ? 'status-value warning' : 'status-value';
         }
         
-        // Счетчик FPS
+        // Счетчик FPS/UPS
         let frameCount = 0;
         let lastFpsUpdate = Date.now();
         
@@ -983,23 +1078,180 @@
         }
         updateFPS();
         
+        // ==================== Дополнительные функции для v10 ====================
+        
+        // Функция для добавления кластеризации (новое в v10)
+        function enableClustering(source, distance = 40) {
+            const clusterSource = new ol.source.Cluster({
+                distance: distance,
+                source: source,
+                geometryFunction: function(feature) {
+                    const geometry = feature.getGeometry();
+                    if (geometry.getType() === 'Point') {
+                        return geometry;
+                    }
+                    return null;
+                }
+            });
+            
+            return new ol.layer.Vector({
+                source: clusterSource,
+                style: function(feature) {
+                    const size = feature.get('features').length;
+                    return new ol.style.Style({
+                        image: new ol.style.Circle({
+                            radius: 10 + Math.min(size * 0.5, 20),
+                            fill: new ol.style.Fill({
+                                color: `rgba(255, 153, 0, ${Math.min(0.8, 0.4 + size * 0.05)})`
+                            }),
+                            stroke: new ol.style.Stroke({
+                                color: 'rgba(255, 153, 0, 1)',
+                                width: 2
+                            })
+                        }),
+                        text: new ol.style.Text({
+                            text: size.toString(),
+                            fill: new ol.style.Fill({ color: '#fff' }),
+                            font: 'bold 12px sans-serif'
+                        })
+                    });
+                }
+            });
+        }
+        
+        // Функция для экспорта карты в изображение
+        function exportMap() {
+            map.once('rendercomplete', function() {
+                const mapCanvas = document.createElement('canvas');
+                const size = map.getSize();
+                mapCanvas.width = size[0];
+                mapCanvas.height = size[1];
+                const mapContext = mapCanvas.getContext('2d');
+                
+                Array.prototype.forEach.call(
+                    map.getViewport().querySelectorAll('.ol-layer canvas, canvas.ol-layer'),
+                    function(canvas) {
+                        if (canvas.width > 0) {
+                            const opacity = canvas.parentNode.style.opacity || canvas.style.opacity;
+                            mapContext.globalAlpha = opacity === '' ? 1 : Number(opacity);
+                            
+                            const transform = canvas.style.transform;
+                            const matrix = transform
+                                .match(/^matrix\(([^\(]*)\)$/)[1]
+                                .split(',')
+                                .map(Number);
+                            
+                            CanvasRenderingContext2D.prototype.setTransform.apply(mapContext, matrix);
+                            mapContext.drawImage(canvas, 0, 0);
+                        }
+                    }
+                );
+                
+                // Сохранение изображения
+                mapCanvas.toBlob(function(blob) {
+                    const url = URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = `map_${Date.now()}.png`;
+                    link.click();
+                    URL.revokeObjectURL(url);
+                });
+            });
+            map.renderSync();
+        }
+        
         // ==================== Экспорт функций для Python ====================
         
         window.mapAPI = {
+            // Основные функции обновления
             updateSlaves: updateSlaves,
             updateTargets: updateTargets,
             updateTrajectories: updateTrajectories,
             updateHeatmap: updateHeatmap,
             updateCoverage: updateCoverage,
             removeFeatures: removeFeatures,
+            
+            // Управление картой
             centerMap: centerMap,
             clearTargets: clearTargets,
             toggleLayer: toggleLayer,
-            setMode: setMode
+            setMode: setMode,
+            exportMap: exportMap,
+            
+            // Новые функции для v10
+            setView: function(center, zoom) {
+                map.getView().animate({
+                    center: center,
+                    zoom: zoom,
+                    duration: 500
+                });
+            },
+            
+            addMarker: function(coords, text, color = '#ff0000') {
+                const marker = new ol.Feature({
+                    geometry: new ol.geom.Point(coords)
+                });
+                
+                marker.setStyle(new ol.style.Style({
+                    image: new ol.style.Icon({
+                        anchor: [0.5, 1],
+                        src: `data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="32" viewBox="0 0 24 32"><path d="M12 0C5.4 0 0 5.4 0 12c0 9 12 20 12 20s12-11 12-20c0-6.6-5.4-12-12-12z" fill="${encodeURIComponent(color)}"/></svg>`
+                    }),
+                    text: new ol.style.Text({
+                        text: text,
+                        offsetY: -35,
+                        fill: new ol.style.Fill({ color: '#fff' }),
+                        stroke: new ol.style.Stroke({ color: '#000', width: 3 })
+                    })
+                }));
+                
+                sources.targets.addFeature(marker);
+                return marker.getId();
+            },
+            
+            // Получение информации о карте
+            getMapInfo: function() {
+                const view = map.getView();
+                return {
+                    center: view.getCenter(),
+                    zoom: view.getZoom(),
+                    rotation: view.getRotation(),
+                    extent: view.calculateExtent(map.getSize()),
+                    resolution: view.getResolution(),
+                    size: map.getSize()
+                };
+            }
         };
         
         // Инициализация завершена
-        console.log('OpenLayers map initialized');
-    </script>
-</body>
-</html>
+        console.log('OpenLayers v10.6.0 map initialized successfully');
+        
+        // Тестовые данные для разработки (удалить в продакшене)
+        if (!bridge) {
+            console.log('Running in development mode - adding test data');
+            
+            // Добавляем тестовые Slave SDR
+            setTimeout(() => {
+                updateSlaves([
+                    { id: 'slave1', name: 'SDR-001', x: -100, y: 100, rssi: -45, status: 'online', range: 80 },
+                    { id: 'slave2', name: 'SDR-002', x: 100, y: 100, rssi: -50, status: 'online', range: 80 },
+                    { id: 'slave3', name: 'SDR-003', x: 0, y: -100, rssi: -48, status: 'online', range: 80 }
+                ]);
+                
+                // Добавляем тестовую цель с движением
+                let angle = 0;
+                setInterval(() => {
+                    angle += 0.05;
+                    const x = Math.cos(angle) * 50;
+                    const y = Math.sin(angle) * 50;
+                    updateTargets([{
+                        id: 'target1',
+                        x: x,
+                        y: y,
+                        freq: 433.92,
+                        rssi: -60 + Math.random() * 10,
+                        confidence: 0.75 + Math.random() * 0.2
+                    }]);
+                }, 100);
+            }, 1000);
+        }

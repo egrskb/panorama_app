@@ -330,3 +330,25 @@ class RSSITrilaterationEngine(QObject):
         """
         self.path_loss_exponent = max(1.5, min(6.0, n))
         print(f"[Trilateration] Path loss exponent set to {self.path_loss_exponent}")
+    
+    def set_reference_parameters(self, reference_distance_m: float, reference_power_dbm: float):
+        """
+        Устанавливает опорные параметры для модели распространения.
+        
+        Args:
+            reference_distance_m: Опорное расстояние в метрах
+            reference_power_dbm: Опорная мощность в дБм
+        """
+        self.reference_distance_m = max(0.1, reference_distance_m)
+        self.reference_power_dbm = reference_power_dbm
+        print(f"[Trilateration] Reference parameters set: distance={self.reference_distance_m}m, power={self.reference_power_dbm}dBm")
+    
+    def get_station_positions(self) -> Dict[str, Tuple[float, float, float]]:
+        """
+        Возвращает позиции всех станций.
+        
+        Returns:
+            Словарь {station_id: (x, y, z)}
+        """
+        return {station_id: (station.x, station.y, station.z) 
+                for station_id, station in self.stations.items()}

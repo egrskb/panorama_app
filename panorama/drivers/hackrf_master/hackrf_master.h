@@ -39,13 +39,7 @@ typedef void (*hq_multi_segment_cb)(
     uint64_t center_hz,
     void* user_data);
 
-// Колбэк: «наследие» — весь спектр одним куском
-typedef void (*hq_segment_cb)(
-    const double* freqs_hz,
-    const float*  powers_dbm,
-    int count,
-    uint64_t center_hz,
-    void* user_data);
+
 
 // ================== API ==================
 
@@ -64,7 +58,7 @@ int  hq_configure(double f_start_mhz, double f_stop_mhz, double bin_hz,
 
 // --- Старт/стоп ---
 int  hq_start_multi_segment(hq_multi_segment_cb cb, void* user);
-int  hq_start(hq_segment_cb cb, void* user);
+int  hq_start_no_cb(void);
 int  hq_stop(void);
 
 // --- Доступ к спектру (EMA-сетка) ---

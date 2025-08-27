@@ -28,7 +28,7 @@ class MapUpdate:
     targets: List[Dict] = None
     trajectories: List[Dict] = None
     heatmap_points: List[Dict] = None
-    coverage: List[Dict] = None
+    coverage: List[Dict] = Non          
     remove: List[str] = None
     
     def to_dict(self) -> Dict:
