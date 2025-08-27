@@ -1,0 +1,1005 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Panorama RSSI Map</title>
+    
+    <!-- OpenLayers 9.x -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@9.2.4/ol.css">
+    <script src="https://cdn.jsdelivr.net/npm/ol@9.2.4/dist/ol.js"></script>
+    
+    <!-- Qt WebChannel -->
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+    
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #1a1a1a;
+            color: #fff;
+            overflow: hidden;
+        }
+        
+        #map {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+        
+        /* Современный UI для контролов */
+        .map-controls {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(30, 30, 30, 0.95);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 15px;
+            min-width: 280px;
+            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+            z-index: 1000;
+        }
+        
+        .control-group {
+            margin-bottom: 15px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .control-group:last-child {
+            margin-bottom: 0;
+            padding-bottom: 0;
+            border-bottom: none;
+        }
+        
+        .control-title {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #888;
+            margin-bottom: 10px;
+        }
+        
+        .control-button {
+            display: inline-block;
+            padding: 8px 16px;
+            margin: 2px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border: none;
+            border-radius: 8px;
+            color: white;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .control-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+        
+        .control-button.active {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }
+        
+        .control-toggle {
+            display: flex;
+            align-items: center;
+            margin: 8px 0;
+            cursor: pointer;
+        }
+        
+        .toggle-switch {
+            width: 42px;
+            height: 24px;
+            background: #444;
+            border-radius: 12px;
+            position: relative;
+            margin-right: 10px;
+            transition: background 0.3s ease;
+        }
+        
+        .toggle-switch.active {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        
+        .toggle-switch::after {
+            content: '';
+            width: 18px;
+            height: 18px;
+            background: white;
+            border-radius: 50%;
+            position: absolute;
+            top: 3px;
+            left: 3px;
+            transition: transform 0.3s ease;
+        }
+        
+        .toggle-switch.active::after {
+            transform: translateX(18px);
+        }
+        
+        /* Статус и информация */
+        .status-panel {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(30, 30, 30, 0.95);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 15px;
+            max-width: 400px;
+            z-index: 1000;
+        }
+        
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            margin: 8px 0;
+            font-size: 14px;
+        }
+        
+        .status-label {
+            color: #888;
+        }
+        
+        .status-value {
+            color: #fff;
+            font-weight: 500;
+        }
+        
+        .status-value.success {
+            color: #4ade80;
+        }
+        
+        .status-value.warning {
+            color: #fbbf24;
+        }
+        
+        .status-value.error {
+            color: #f87171;
+        }
+        
+        /* Легенда */
+        .legend {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(30, 30, 30, 0.95);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 15px;
+            z-index: 1000;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin: 8px 0;
+            font-size: 14px;
+        }
+        
+        .legend-icon {
+            width: 20px;
+            height: 20px;
+            margin-right: 10px;
+            border-radius: 50%;
+        }
+        
+        /* Координатная сетка */
+        .coordinates {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(30, 30, 30, 0.95);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+            padding: 10px 15px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            z-index: 1000;
+        }
+        
+        /* Анимации */
+        @keyframes pulse {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.5); opacity: 0.5; }
+            100% { transform: scale(2); opacity: 0; }
+        }
+        
+        .pulse-animation {
+            animation: pulse 2s infinite;
+        }
+        
+        /* Tooltip */
+        .tooltip {
+            position: absolute;
+            background: rgba(30, 30, 30, 0.95);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            padding: 10px;
+            font-size: 12px;
+            pointer-events: none;
+            z-index: 2000;
+            display: none;
+        }
+        
+        .tooltip.visible {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    
+    <!-- Панель управления -->
+    <div class="map-controls">
+        <div class="control-group">
+            <div class="control-title">Слои визуализации</div>
+            <div class="control-toggle" onclick="toggleLayer('slaves')">
+                <div class="toggle-switch active" id="toggle-slaves"></div>
+                <span>Slave SDR</span>
+            </div>
+            <div class="control-toggle" onclick="toggleLayer('targets')">
+                <div class="toggle-switch active" id="toggle-targets"></div>
+                <span>Цели</span>
+            </div>
+            <div class="control-toggle" onclick="toggleLayer('heatmap')">
+                <div class="toggle-switch" id="toggle-heatmap"></div>
+                <span>Тепловая карта</span>
+            </div>
+            <div class="control-toggle" onclick="toggleLayer('coverage')">
+                <div class="toggle-switch" id="toggle-coverage"></div>
+                <span>Зоны покрытия</span>
+            </div>
+            <div class="control-toggle" onclick="toggleLayer('trajectories')">
+                <div class="toggle-switch active" id="toggle-trajectories"></div>
+                <span>Траектории</span>
+            </div>
+        </div>
+        
+        <div class="control-group">
+            <div class="control-title">Режим отображения</div>
+            <button class="control-button active" onclick="setMode('2d')">2D</button>
+            <button class="control-button" onclick="setMode('3d')">3D</button>
+        </div>
+        
+        <div class="control-group">
+            <div class="control-title">Управление</div>
+            <button class="control-button" onclick="centerMap()">Центрировать</button>
+            <button class="control-button" onclick="clearTargets()">Очистить цели</button>
+        </div>
+    </div>
+    
+    <!-- Легенда -->
+    <div class="legend">
+        <div class="control-title">Легенда</div>
+        <div class="legend-item">
+            <div class="legend-icon" style="background: #4ade80;"></div>
+            <span>Slave SDR</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-icon" style="background: #f87171;"></div>
+            <span>Активная цель</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-icon" style="background: #fbbf24;"></div>
+            <span>Отслеживание</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-icon" style="background: #60a5fa;"></div>
+            <span>История</span>
+        </div>
+    </div>
+    
+    <!-- Статус -->
+    <div class="status-panel">
+        <div class="control-title">Статус системы</div>
+        <div class="status-item">
+            <span class="status-label">Slave устройств:</span>
+            <span class="status-value success" id="slaves-count">0</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Активных целей:</span>
+            <span class="status-value warning" id="targets-count">0</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Частота обновления:</span>
+            <span class="status-value" id="update-rate">0 Гц</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Режим:</span>
+            <span class="status-value" id="mode-status">2D</span>
+        </div>
+    </div>
+    
+    <!-- Координаты курсора -->
+    <div class="coordinates" id="coordinates">X: 0.0 м | Y: 0.0 м</div>
+    
+    <!-- Tooltip -->
+    <div class="tooltip" id="tooltip"></div>
+    
+    <script>
+        // ==================== Инициализация карты ====================
+        
+        // Проекция в метрах для локальной системы координат
+        const projection = new ol.proj.Projection({
+            code: 'local-meters',
+            units: 'meters',
+            extent: [-500, -500, 500, 500] // 1км x 1км область
+        });
+        
+        // Стили для различных элементов
+        const styles = {
+            // Стиль для Slave SDR
+            slaveSDR: new ol.style.Style({
+                image: new ol.style.Circle({
+                    radius: 10,
+                    fill: new ol.style.Fill({ color: 'rgba(74, 222, 128, 0.8)' }),
+                    stroke: new ol.style.Stroke({ 
+                        color: 'rgba(74, 222, 128, 1)', 
+                        width: 2 
+                    })
+                }),
+                text: new ol.style.Text({
+                    font: '12px sans-serif',
+                    fill: new ol.style.Fill({ color: '#ffffff' }),
+                    stroke: new ol.style.Stroke({ color: '#000000', width: 3 }),
+                    offsetY: -20
+                })
+            }),
+            
+            // Стиль для активных целей
+            activeTarget: new ol.style.Style({
+                image: new ol.style.RegularShape({
+                    points: 3,
+                    radius: 12,
+                    rotation: 0,
+                    fill: new ol.style.Fill({ color: 'rgba(248, 113, 113, 0.8)' }),
+                    stroke: new ol.style.Stroke({ 
+                        color: 'rgba(248, 113, 113, 1)', 
+                        width: 2 
+                    })
+                })
+            }),
+            
+            // Стиль для траекторий
+            trajectory: new ol.style.Style({
+                stroke: new ol.style.Stroke({
+                    color: 'rgba(96, 165, 250, 0.8)',
+                    width: 2,
+                    lineDash: [4, 4]
+                })
+            }),
+            
+            // Стиль для зон покрытия
+            coverage: new ol.style.Style({
+                fill: new ol.style.Fill({
+                    color: 'rgba(102, 126, 234, 0.1)'
+                }),
+                stroke: new ol.style.Stroke({
+                    color: 'rgba(102, 126, 234, 0.5)',
+                    width: 1,
+                    lineDash: [10, 5]
+                })
+            }),
+            
+            // Стиль для iso-кругов дальности
+            rangeCircle: new ol.style.Style({
+                stroke: new ol.style.Stroke({
+                    color: 'rgba(251, 191, 36, 0.6)',
+                    width: 1,
+                    lineDash: [5, 5]
+                })
+            })
+        };
+        
+        // Источники данных
+        const sources = {
+            slaves: new ol.source.Vector(),
+            targets: new ol.source.Vector(),
+            trajectories: new ol.source.Vector(),
+            coverage: new ol.source.Vector(),
+            heatmap: new ol.source.Vector(),
+            webglPoints: new ol.source.Vector()
+        };
+        
+        // Слои карты
+        const layers = {
+            // Базовая сетка
+            grid: new ol.layer.Graticule({
+                strokeStyle: new ol.style.Stroke({
+                    color: 'rgba(255, 255, 255, 0.1)',
+                    width: 1,
+                    lineDash: [2, 4]
+                }),
+                showLabels: true,
+                wrapX: false,
+                visible: true
+            }),
+            
+            // Слой Slave SDR устройств
+            slaves: new ol.layer.Vector({
+                source: sources.slaves,
+                style: styles.slaveSDR,
+                zIndex: 100
+            }),
+            
+            // Слой целей
+            targets: new ol.layer.Vector({
+                source: sources.targets,
+                style: styles.activeTarget,
+                zIndex: 90
+            }),
+            
+            // Слой траекторий
+            trajectories: new ol.layer.Vector({
+                source: sources.trajectories,
+                style: styles.trajectory,
+                zIndex: 80
+            }),
+            
+            // Слой зон покрытия
+            coverage: new ol.layer.Vector({
+                source: sources.coverage,
+                style: styles.coverage,
+                zIndex: 70
+            }),
+            
+            // Тепловая карта вероятности
+            heatmap: new ol.layer.Heatmap({
+                source: sources.heatmap,
+                blur: 15,
+                radius: 20,
+                weight: function(feature) {
+                    return feature.get('confidence') || 0.5;
+                },
+                visible: false,
+                zIndex: 60
+            })
+        };
+        
+        // WebGL слой для больших объемов точек
+        if (ol.layer.WebGLPoints) {
+            layers.webglPoints = new ol.layer.WebGLPoints({
+                source: sources.webglPoints,
+                style: {
+                    symbol: {
+                        symbolType: 'circle',
+                        size: 8,
+                        color: 'rgba(255, 0, 0, 0.5)',
+                        opacity: 0.8
+                    }
+                },
+                visible: false,
+                zIndex: 85
+            });
+        }
+        
+        // Создание карты
+        const map = new ol.Map({
+            target: 'map',
+            layers: Object.values(layers).filter(l => l),
+            view: new ol.View({
+                projection: projection,
+                center: [0, 0],
+                zoom: 14,
+                maxZoom: 20,
+                minZoom: 10
+            }),
+            controls: ol.control.defaults({
+                attribution: false
+            }).extend([
+                new ol.control.ScaleLine({
+                    units: 'metric'
+                })
+            ])
+        });
+        
+        // ==================== WebChannel для связи с Python ====================
+        
+        let bridge = null;
+        let updateBuffer = [];
+        let lastUpdate = Date.now();
+        const UPDATE_RATE = 50; // ms (20Hz max)
+        
+        // Инициализация Qt WebChannel
+        new QWebChannel(qt.webChannelTransport, function(channel) {
+            bridge = channel.objects.bridge;
+            console.log('WebChannel connected');
+            
+            // Подписка на обновления от Python
+            if (bridge.dataUpdated) {
+                bridge.dataUpdated.connect(function(data) {
+                    handleDataUpdate(JSON.parse(data));
+                });
+            }
+        });
+        
+        // ==================== Обработчики данных ====================
+        
+        function handleDataUpdate(data) {
+            // Батчинг обновлений для производительности
+            updateBuffer.push(data);
+            
+            const now = Date.now();
+            if (now - lastUpdate >= UPDATE_RATE) {
+                processBatchedUpdates();
+                lastUpdate = now;
+            }
+        }
+        
+        function processBatchedUpdates() {
+            if (updateBuffer.length === 0) return;
+            
+            // Объединяем все обновления
+            const combined = {
+                slaves: [],
+                targets: [],
+                trajectories: [],
+                heatmapPoints: [],
+                coverage: [],
+                remove: []
+            };
+            
+            updateBuffer.forEach(update => {
+                if (update.slaves) combined.slaves.push(...update.slaves);
+                if (update.targets) combined.targets.push(...update.targets);
+                if (update.trajectories) combined.trajectories.push(...update.trajectories);
+                if (update.heatmapPoints) combined.heatmapPoints.push(...update.heatmapPoints);
+                if (update.coverage) combined.coverage.push(...update.coverage);
+                if (update.remove) combined.remove.push(...update.remove);
+            });
+            
+            // Применяем обновления
+            updateSlaves(combined.slaves);
+            updateTargets(combined.targets);
+            updateTrajectories(combined.trajectories);
+            updateHeatmap(combined.heatmapPoints);
+            updateCoverage(combined.coverage);
+            removeFeatures(combined.remove);
+            
+            // Обновляем статистику
+            updateStats();
+            
+            // Очищаем буфер
+            updateBuffer = [];
+        }
+        
+        // ==================== Функции обновления элементов ====================
+        
+        function updateSlaves(slaves) {
+            if (!slaves || slaves.length === 0) return;
+            
+            slaves.forEach(slave => {
+                const feature = sources.slaves.getFeatureById(slave.id);
+                
+                if (feature) {
+                    // Обновляем существующий
+                    feature.getGeometry().setCoordinates([slave.x, slave.y]);
+                    feature.set('rssi', slave.rssi);
+                    feature.set('status', slave.status);
+                } else {
+                    // Создаем новый
+                    const newFeature = new ol.Feature({
+                        geometry: new ol.geom.Point([slave.x, slave.y]),
+                        id: slave.id,
+                        name: slave.name,
+                        rssi: slave.rssi,
+                        status: slave.status
+                    });
+                    newFeature.setId(slave.id);
+                    
+                    // Добавляем iso-круги дальности
+                    if (slave.range) {
+                        const rangeCircle = new ol.Feature({
+                            geometry: ol.geom.Polygon.circular([slave.x, slave.y], slave.range, 64)
+                        });
+                        rangeCircle.setStyle(styles.rangeCircle);
+                        sources.coverage.addFeature(rangeCircle);
+                    }
+                    
+                    sources.slaves.addFeature(newFeature);
+                }
+            });
+        }
+        
+        function updateTargets(targets) {
+            if (!targets || targets.length === 0) return;
+            
+            targets.forEach(target => {
+                const feature = sources.targets.getFeatureById(target.id);
+                
+                if (feature) {
+                    // Анимация перемещения
+                    const oldCoords = feature.getGeometry().getCoordinates();
+                    const newCoords = [target.x, target.y];
+                    
+                    animateMovement(feature, oldCoords, newCoords, 200);
+                    
+                    feature.set('freq', target.freq);
+                    feature.set('rssi', target.rssi);
+                    feature.set('confidence', target.confidence);
+                    feature.set('lastUpdate', Date.now());
+                } else {
+                    // Создаем новую цель
+                    const newFeature = new ol.Feature({
+                        geometry: new ol.geom.Point([target.x, target.y]),
+                        id: target.id,
+                        freq: target.freq,
+                        rssi: target.rssi,
+                        confidence: target.confidence,
+                        lastUpdate: Date.now()
+                    });
+                    newFeature.setId(target.id);
+                    
+                    // Анимация появления
+                    animateAppearance(newFeature);
+                    
+                    sources.targets.addFeature(newFeature);
+                }
+                
+                // Добавляем в тепловую карту если confidence высокий
+                if (target.confidence > 0.7) {
+                    const heatPoint = new ol.Feature({
+                        geometry: new ol.geom.Point([target.x, target.y]),
+                        confidence: target.confidence
+                    });
+                    sources.heatmap.addFeature(heatPoint);
+                }
+            });
+        }
+        
+        function updateTrajectories(trajectories) {
+            if (!trajectories || trajectories.length === 0) return;
+            
+            trajectories.forEach(traj => {
+                const feature = sources.trajectories.getFeatureById(traj.id);
+                
+                if (feature) {
+                    // Обновляем существующую траекторию
+                    const coords = traj.points.map(p => [p.x, p.y]);
+                    feature.getGeometry().setCoordinates(coords);
+                } else {
+                    // Создаем новую траекторию
+                    const coords = traj.points.map(p => [p.x, p.y]);
+                    const newFeature = new ol.Feature({
+                        geometry: new ol.geom.LineString(coords),
+                        id: traj.id,
+                        targetId: traj.targetId
+                    });
+                    newFeature.setId(traj.id);
+                    sources.trajectories.addFeature(newFeature);
+                }
+            });
+        }
+        
+        function updateHeatmap(points) {
+            if (!points || points.length === 0) return;
+            
+            // Для больших объемов используем WebGL если доступен
+            if (points.length > 1000 && layers.webglPoints) {
+                const features = points.map(p => new ol.Feature({
+                    geometry: new ol.geom.Point([p.x, p.y]),
+                    confidence: p.confidence
+                }));
+                sources.webglPoints.addFeatures(features);
+                layers.webglPoints.setVisible(true);
+                layers.heatmap.setVisible(false);
+            } else {
+                const features = points.map(p => new ol.Feature({
+                    geometry: new ol.geom.Point([p.x, p.y]),
+                    confidence: p.confidence
+                }));
+                sources.heatmap.addFeatures(features);
+            }
+        }
+        
+        function updateCoverage(coverage) {
+            if (!coverage || coverage.length === 0) return;
+            
+            sources.coverage.clear();
+            
+            coverage.forEach(zone => {
+                let geometry;
+                
+                if (zone.type === 'circle') {
+                    geometry = ol.geom.Polygon.circular([zone.x, zone.y], zone.radius, 64);
+                } else if (zone.type === 'ellipse') {
+                    // Эллипс для направленных антенн
+                    geometry = createEllipse(zone.x, zone.y, zone.radiusX, zone.radiusY, zone.rotation);
+                } else if (zone.type === 'polygon') {
+                    const coords = zone.points.map(p => [p.x, p.y]);
+                    geometry = new ol.geom.Polygon([coords]);
+                }
+                
+                if (geometry) {
+                    const feature = new ol.Feature({ geometry });
+                    feature.setStyle(styles.coverage);
+                    sources.coverage.addFeature(feature);
+                }
+            });
+        }
+        
+        function removeFeatures(ids) {
+            if (!ids || ids.length === 0) return;
+            
+            ids.forEach(id => {
+                Object.values(sources).forEach(source => {
+                    const feature = source.getFeatureById(id);
+                    if (feature) {
+                        source.removeFeature(feature);
+                    }
+                });
+            });
+        }
+        
+        // ==================== Анимации ====================
+        
+        function animateMovement(feature, from, to, duration) {
+            const start = Date.now();
+            const geom = feature.getGeometry();
+            
+            function animate() {
+                const elapsed = Date.now() - start;
+                const progress = Math.min(elapsed / duration, 1);
+                
+                // Easing function для плавности
+                const easeProgress = 0.5 - Math.cos(progress * Math.PI) / 2;
+                
+                const x = from[0] + (to[0] - from[0]) * easeProgress;
+                const y = from[1] + (to[1] - from[1]) * easeProgress;
+                
+                geom.setCoordinates([x, y]);
+                
+                if (progress < 1) {
+                    requestAnimationFrame(animate);
+                }
+            }
+            
+            animate();
+        }
+        
+        function animateAppearance(feature) {
+            const originalStyle = feature.getStyle() || styles.activeTarget;
+            let opacity = 0;
+            
+            function animate() {
+                opacity += 0.05;
+                if (opacity > 1) opacity = 1;
+                
+                const style = originalStyle.clone();
+                const image = style.getImage();
+                if (image) {
+                    const fill = image.getFill();
+                    if (fill) {
+                        const color = fill.getColor();
+                        if (typeof color === 'string') {
+                            // Парсим и меняем альфу
+                            const rgba = ol.color.asArray(color);
+                            rgba[3] = opacity;
+                            fill.setColor(rgba);
+                        }
+                    }
+                }
+                
+                feature.setStyle(style);
+                
+                if (opacity < 1) {
+                    requestAnimationFrame(animate);
+                }
+            }
+            
+            animate();
+        }
+        
+        // ==================== Вспомогательные функции ====================
+        
+        function createEllipse(centerX, centerY, radiusX, radiusY, rotation) {
+            const points = [];
+            const angleStep = Math.PI / 32; // 64 точки
+            
+            for (let angle = 0; angle < 2 * Math.PI; angle += angleStep) {
+                const x = radiusX * Math.cos(angle);
+                const y = radiusY * Math.sin(angle);
+                
+                // Поворот
+                const rotX = x * Math.cos(rotation) - y * Math.sin(rotation);
+                const rotY = x * Math.sin(rotation) + y * Math.cos(rotation);
+                
+                points.push([centerX + rotX, centerY + rotY]);
+            }
+            
+            points.push(points[0]); // Замыкаем
+            return new ol.geom.Polygon([points]);
+        }
+        
+        // ==================== Интерактивность ====================
+        
+        // Отображение координат курсора
+        map.on('pointermove', function(evt) {
+            const coords = evt.coordinate;
+            document.getElementById('coordinates').textContent = 
+                `X: ${coords[0].toFixed(1)} м | Y: ${coords[1].toFixed(1)} м`;
+        });
+        
+        // Tooltip при наведении
+        const tooltip = document.getElementById('tooltip');
+        
+        map.on('pointermove', function(evt) {
+            const feature = map.forEachFeatureAtPixel(evt.pixel, function(feature) {
+                return feature;
+            });
+            
+            if (feature) {
+                const props = feature.getProperties();
+                let content = '';
+                
+                if (props.name) {
+                    content += `<strong>${props.name}</strong><br>`;
+                }
+                if (props.freq) {
+                    content += `Частота: ${props.freq.toFixed(1)} МГц<br>`;
+                }
+                if (props.rssi) {
+                    content += `RSSI: ${props.rssi.toFixed(1)} дБм<br>`;
+                }
+                if (props.confidence) {
+                    content += `Уверенность: ${(props.confidence * 100).toFixed(0)}%<br>`;
+                }
+                if (props.status) {
+                    content += `Статус: ${props.status}<br>`;
+                }
+                
+                if (content) {
+                    tooltip.innerHTML = content;
+                    tooltip.style.left = evt.pixel[0] + 10 + 'px';
+                    tooltip.style.top = evt.pixel[1] - 10 + 'px';
+                    tooltip.classList.add('visible');
+                } else {
+                    tooltip.classList.remove('visible');
+                }
+            } else {
+                tooltip.classList.remove('visible');
+            }
+        });
+        
+        // Клик по объектам
+        map.on('click', function(evt) {
+            const feature = map.forEachFeatureAtPixel(evt.pixel, function(feature) {
+                return feature;
+            });
+            
+            if (feature && bridge) {
+                const props = feature.getProperties();
+                bridge.featureClicked(JSON.stringify(props));
+            }
+        });
+        
+        // ==================== Управление слоями ====================
+        
+        function toggleLayer(layerName) {
+            const layer = layers[layerName];
+            if (layer) {
+                const visible = !layer.getVisible();
+                layer.setVisible(visible);
+                
+                const toggle = document.getElementById(`toggle-${layerName}`);
+                if (toggle) {
+                    if (visible) {
+                        toggle.classList.add('active');
+                    } else {
+                        toggle.classList.remove('active');
+                    }
+                }
+            }
+        }
+        
+        function setMode(mode) {
+            document.getElementById('mode-status').textContent = mode.toUpperCase();
+            
+            // Переключение между 2D и 3D (псевдо-3D через стили)
+            if (mode === '3d') {
+                map.getView().animate({
+                    rotation: Math.PI / 6,
+                    duration: 500
+                });
+            } else {
+                map.getView().animate({
+                    rotation: 0,
+                    duration: 500
+                });
+            }
+            
+            // Обновляем активную кнопку
+            document.querySelectorAll('.control-button').forEach(btn => {
+                if (btn.textContent.toLowerCase() === mode) {
+                    btn.classList.add('active');
+                } else if (btn.textContent === '2D' || btn.textContent === '3D') {
+                    btn.classList.remove('active');
+                }
+            });
+        }
+        
+        function centerMap() {
+            map.getView().animate({
+                center: [0, 0],
+                zoom: 14,
+                duration: 500
+            });
+        }
+        
+        function clearTargets() {
+            sources.targets.clear();
+            sources.trajectories.clear();
+            sources.heatmap.clear();
+            if (sources.webglPoints) {
+                sources.webglPoints.clear();
+            }
+            updateStats();
+        }
+        
+        // ==================== Обновление статистики ====================
+        
+        function updateStats() {
+            const slavesCount = sources.slaves.getFeatures().length;
+            const targetsCount = sources.targets.getFeatures().length;
+            
+            document.getElementById('slaves-count').textContent = slavesCount;
+            document.getElementById('targets-count').textContent = targetsCount;
+            
+            // Цветовая индикация
+            const slavesEl = document.getElementById('slaves-count');
+            const targetsEl = document.getElementById('targets-count');
+            
+            slavesEl.className = slavesCount > 0 ? 'status-value success' : 'status-value error';
+            targetsEl.className = targetsCount > 0 ? 'status-value warning' : 'status-value';
+        }
+        
+        // Счетчик FPS
+        let frameCount = 0;
+        let lastFpsUpdate = Date.now();
+        
+        function updateFPS() {
+            frameCount++;
+            const now = Date.now();
+            if (now - lastFpsUpdate >= 1000) {
+                document.getElementById('update-rate').textContent = `${frameCount} Гц`;
+                frameCount = 0;
+                lastFpsUpdate = now;
+            }
+            requestAnimationFrame(updateFPS);
+        }
+        updateFPS();
+        
+        // ==================== Экспорт функций для Python ====================
+        
+        window.mapAPI = {
+            updateSlaves: updateSlaves,
+            updateTargets: updateTargets,
+            updateTrajectories: updateTrajectories,
+            updateHeatmap: updateHeatmap,
+            updateCoverage: updateCoverage,
+            removeFeatures: removeFeatures,
+            centerMap: centerMap,
+            clearTargets: clearTargets,
+            toggleLayer: toggleLayer,
+            setMode: setMode
+        };
+        
+        // Инициализация завершена
+        console.log('OpenLayers map initialized');
+    </script>
+</body>
+</html>

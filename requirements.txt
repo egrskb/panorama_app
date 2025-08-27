@@ -18,6 +18,8 @@ PyYAML>=5.4.0
 # RSSI Trilateration dependencies
 scipy>=1.7.0
 
+PyQtWebEngine
+
 # Development dependencies (optional)
 # Uncomment for development
 # pytest>=7.0.0

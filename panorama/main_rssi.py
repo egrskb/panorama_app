@@ -25,7 +25,7 @@ from panorama.features.orchestrator.core import Orchestrator
 from panorama.features.calibration.manager import CalibrationManager
 
 # Импортируем существующие модули для совместимости
-from panorama.features.map3d import MapView
+from panorama.features.map import OpenLayersMapWidget
 from panorama.features.spectrum import SpectrumView
 from panorama.features.settings.dialog import SettingsDialog
 from panorama.features.settings.manager_improved import ImprovedDeviceManagerDialog
@@ -305,7 +305,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
         tab_widget = QTabWidget()
         
         # Вкладка карты
-        self.map_view = MapView()
+        self.map_view = OpenLayersMapWidget()
         try:
             if hasattr(self, 'sdr_settings') and self.sdr_settings:
                 self.map_view.update_stations_from_config(self.sdr_settings)
@@ -904,7 +904,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
         self.trilateration_coordinator.target_detected.connect(
             self.map_view.add_target_from_detector
         )
-        # TODO: Добавить метод update_target_position в MapView
+        # TODO: Добавить метод update_target_position в OpenLayersMapWidget
         # self.trilateration_coordinator.target_updated.connect(
         #     self.map_view.update_target_position
         # )
