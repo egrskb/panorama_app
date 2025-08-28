@@ -559,17 +559,33 @@ class ImprovedSlavesView(QWidget):
         for row, data in enumerate(watchlist_data):
             # Заполняем колонки
             self.watchlist_table.setItem(row, 0, QTableWidgetItem(data.get('id', '')))
-            self.watchlist_table.setItem(row, 1, QTableWidgetItem(f"{data.get('freq', 0):.1f}"))
-            self.watchlist_table.setItem(row, 2, QTableWidgetItem(f"{data.get('span', 0):.1f}"))
+            try:
+                freq_val = float(data.get('freq', 0) or 0)
+                span_val = float(data.get('span', 0) or 0)
+            except Exception:
+                freq_val, span_val = 0.0, 0.0
+            self.watchlist_table.setItem(row, 1, QTableWidgetItem(f"{freq_val:.1f}"))
+            self.watchlist_table.setItem(row, 2, QTableWidgetItem(f"{span_val:.1f}"))
             
             # RSSI для каждого slave
             for i in range(3):
                 rssi_key = f'rssi_{i+1}'
-                if rssi_key in data:
-                    rssi_item = QTableWidgetItem(f"{data[rssi_key]:.1f}")
-                    rssi_item.setTextAlignment(Qt.AlignCenter)
-                    rssi_item.setBackground(QBrush(self._get_rssi_color(data[rssi_key])))
-                    self.watchlist_table.setItem(row, 3 + i, rssi_item)
+                val = data.get(rssi_key, None)
+                if val is None:
+                    item = QTableWidgetItem("—")
+                    item.setTextAlignment(Qt.AlignCenter)
+                    self.watchlist_table.setItem(row, 3 + i, item)
+                else:
+                    try:
+                        fv = float(val)
+                        rssi_item = QTableWidgetItem(f"{fv:.1f}")
+                        rssi_item.setTextAlignment(Qt.AlignCenter)
+                        rssi_item.setBackground(QBrush(self._get_rssi_color(fv)))
+                        self.watchlist_table.setItem(row, 3 + i, rssi_item)
+                    except Exception:
+                        item = QTableWidgetItem("—")
+                        item.setTextAlignment(Qt.AlignCenter)
+                        self.watchlist_table.setItem(row, 3 + i, item)
             
             # Время обновления
             self.watchlist_table.setItem(row, 6, QTableWidgetItem(data.get('updated', '')))
@@ -691,6 +707,67 @@ class ImprovedSlavesView(QWidget):
                 self.send_to_map.emit(tx_data)
             except Exception:
                 pass
+
+    def add_transmitter(self, result):
+        """Добавляет обнаруженный передатчик в таблицу передатчиков."""
+        try:
+            # Обязательные поля с безопасными значениями по умолчанию
+            peak_id = getattr(result, 'peak_id', getattr(result, 'id', 'unknown'))
+            freq_mhz = getattr(result, 'freq_mhz', getattr(result, 'center_hz', 0.0) / 1e6)
+            power_dbm = getattr(result, 'power_dbm', 0.0)
+            x = getattr(result, 'x', 0.0)
+            y = getattr(result, 'y', 0.0)
+            confidence = getattr(result, 'confidence', 0.0)
+            # Ищем существующую строку с таким peak_id
+            row = -1
+            for r in range(self.transmitters_table.rowCount()):
+                itm = self.transmitters_table.item(r, 0)
+                if itm and itm.text() == str(peak_id):
+                    row = r
+                    break
+            if row == -1:
+                row = self.transmitters_table.rowCount()
+                self.transmitters_table.insertRow(row)
+            self.transmitters_table.setItem(row, 0, QTableWidgetItem(str(peak_id)))
+            self.transmitters_table.setItem(row, 1, QTableWidgetItem(f"{float(freq_mhz):.1f}"))
+            self.transmitters_table.setItem(row, 2, QTableWidgetItem(f"{float(power_dbm):.1f}"))
+            self.transmitters_table.setItem(row, 3, QTableWidgetItem("Video"))
+            self.transmitters_table.setItem(row, 4, QTableWidgetItem(f"{float(x):.1f}"))
+            self.transmitters_table.setItem(row, 5, QTableWidgetItem(f"{float(y):.1f}"))
+            self.transmitters_table.setItem(row, 6, QTableWidgetItem(f"{float(confidence)*100:.0f}%"))
+            self.transmitters_table.setItem(row, 7, QTableWidgetItem(time.strftime("%H:%M:%S")))
+
+            # Кнопка "На карту" в столбце 8
+            btn_widget = QWidget()
+            btn_layout = QHBoxLayout(btn_widget)
+            btn_layout.setContentsMargins(5, 2, 5, 2)
+            btn_to_map = QPushButton("📍 На карту")
+            def _emit_to_map(pid=peak_id, f=freq_mhz, px=x, py=y, conf=confidence):
+                data = {'id': str(pid), 'freq': float(f), 'x': float(px), 'y': float(py), 'confidence': float(conf)}
+                self.send_to_map.emit(data)
+            btn_to_map.clicked.connect(_emit_to_map)
+            btn_layout.addWidget(btn_to_map)
+            self.transmitters_table.setCellWidget(row, 8, btn_widget)
+        except Exception:
+            pass
+
+    def update_transmitter_position(self, result):
+        """Обновляет координаты и время в таблице передатчиков (трекинг)."""
+        try:
+            peak_id = getattr(result, 'peak_id', getattr(result, 'id', 'unknown'))
+            x = getattr(result, 'x', 0.0)
+            y = getattr(result, 'y', 0.0)
+            confidence = getattr(result, 'confidence', 0.0)
+            for r in range(self.transmitters_table.rowCount()):
+                itm = self.transmitters_table.item(r, 0)
+                if itm and itm.text() == str(peak_id):
+                    self.transmitters_table.setItem(r, 4, QTableWidgetItem(f"{float(x):.1f}"))
+                    self.transmitters_table.setItem(r, 5, QTableWidgetItem(f"{float(y):.1f}"))
+                    self.transmitters_table.setItem(r, 6, QTableWidgetItem(f"{float(confidence)*100:.0f}%"))
+                    self.transmitters_table.setItem(r, 7, QTableWidgetItem(time.strftime("%H:%M:%S")))
+                    break
+        except Exception:
+            pass
 
     def _clear_watchlist(self):
         """Очищает watchlist."""

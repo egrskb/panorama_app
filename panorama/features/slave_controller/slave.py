@@ -122,37 +122,60 @@ class SlaveSDR(QObject):
             # чтобы захватить всю полосу, выставим bandwidth ≈ span
             bw = max(200e3, min(span_hz, self.sample_rate * 0.8))
             self.sdr.setBandwidth(SOAPY_SDR_RX, 0, bw)
+            # Небольшая задержка на установление ГКЧ/фильтров
+            time.sleep(0.01)
 
             # Сбор выборки
             n_samp = int(max(1, round(self.sample_rate * (dwell_ms / 1000.0))))
-            buf = np.empty(n_samp, dtype=np.complex64)
-            rc = self.sdr.readStream(self.rx_stream, [buf], len(buf))
-            if isinstance(rc, tuple):
-                got = int(rc[0])
-            else:
-                got = int(rc)
-            if got <= 0:
+            # Читаем потоковыми чанками с ретраями
+            out = np.empty(n_samp, dtype=np.complex64)
+            offset = 0
+            max_attempts = 10
+            attempts = 0
+            # 20мс чанки или меньше, чтобы быстрее получать данные
+            chunk = max(1024, min(int(self.sample_rate * 0.02), n_samp))
+            while offset < n_samp and attempts < max_attempts:
+                tmp = np.empty(chunk, dtype=np.complex64)
+                rc = self.sdr.readStream(self.rx_stream, [tmp], len(tmp))
+                if isinstance(rc, tuple):
+                    got = int(rc[0])
+                else:
+                    try:
+                        got = int(getattr(rc, 'ret', rc))
+                    except Exception:
+                        got = -1
+                if got and got > 0:
+                    take = min(got, n_samp - offset)
+                    out[offset:offset+take] = tmp[:take]
+                    offset += take
+                    attempts = 0
+                else:
+                    attempts += 1
+                    time.sleep(0.005)
+            if offset == 0:
                 raise RuntimeError("readStream returned no data")
 
-            sig = buf[:got]
+            sig = out[:offset]
 
             # спектр
             # окно Хэмминга для RMS оценки
             win = np.hamming(len(sig)).astype(np.float32)
             sig_w = sig * win
-            # FFT
-            sp = np.fft.rfft(sig_w)
+            # FFT для комплексного потока CF32
+            sp = np.fft.fft(sig_w)
+            sp = np.fft.fftshift(sp)
             psd = (np.abs(sp) ** 2) / np.sum(win ** 2)
             psd_dbm = 10.0 * np.log10(psd + 1e-20) - 174.0 + 10.0 * np.log10(self.sample_rate / len(sig_w))
 
-            # частотная ось этого рида
-            freqs = np.fft.rfftfreq(len(sig_w), d=1.0 / self.sample_rate)
-            # центрируем вокруг center_hz
-            freqs = freqs + (center_hz - self.sample_rate / 2.0)
+            # частотная ось этого рида (центрированная вокруг 0), затем к абсолютной частоте
+            freqs = np.fft.fftfreq(len(sig_w), d=1.0 / self.sample_rate)
+            freqs = np.fft.fftshift(freqs)
+            freqs = freqs + 0.0  # базовая полоса вокруг 0 Гц
+            freqs_hz = freqs + center_hz
 
             # ВАЖНО: Вычисляем RMS по всей полосе span_hz
             # Фильтруем только нужный диапазон
-            freq_mask = (freqs >= center_hz - span_hz/2) & (freqs <= center_hz + span_hz/2)
+            freq_mask = (freqs_hz >= center_hz - span_hz/2) & (freqs_hz <= center_hz + span_hz/2)
             band_powers = psd_dbm[freq_mask]
             
             # Вычисляем RMS в линейной шкале
@@ -207,8 +230,13 @@ class SlaveManager(QObject):
             sl = SlaveSDR(slave_id, uri, self.log)
             if not sl.is_initialized:
                 return False
-            sl.measurement_complete.connect(self._on_measurement_complete)
-            sl.measurement_error.connect(self._on_measurement_error)
+            # Обработчики могут использоваться в одиночном режиме измерений
+            # Добавляем no-op/лог-обработчики, чтобы не падать при connect
+            try:
+                sl.measurement_complete.connect(self._on_measurement_complete)
+                sl.measurement_error.connect(self._on_measurement_error)
+            except Exception:
+                pass
             self.slaves[slave_id] = sl
             self.log.info(f"Added slave: {slave_id} ({uri})")
             self._emit_slaves_updated()
@@ -285,5 +313,21 @@ class SlaveManager(QObject):
     def _emit_slaves_updated(self):
         try:
             self.slaves_updated.emit(self.get_slave_status())
+        except Exception:
+            pass
+
+    # --- optional signal handlers for single-shot flows ---
+    def _on_measurement_complete(self, measurement: RSSIMeasurement):
+        """Опциональный обработчик завершения измерения одного слейва (для совместимости)."""
+        try:
+            # Передаём как список для совместимости с сигналом all_measurements_complete
+            self.all_measurements_complete.emit([measurement])
+        except Exception as e:
+            self.log.error(f"_on_measurement_complete error: {e}")
+
+    def _on_measurement_error(self, msg: str):
+        """Опциональный обработчик ошибки измерения."""
+        try:
+            self.measurement_error.emit(str(msg))
         except Exception:
             pass

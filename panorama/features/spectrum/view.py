@@ -1162,6 +1162,12 @@ class SpectrumView(QtWidgets.QWidget):
         )
         self.start_mhz.setValue(max(50.0, min(6000.0, f0 / 1e6)))
         self.stop_mhz.setValue(max(50.0, min(6000.0, f1 / 1e6)))
+
+        # Отладка: текущий сканируемый диапазон
+        try:
+            print(f"[DEBUG] Scanning range: {self.start_mhz.value():.3f}-{self.stop_mhz.value():.3f} MHz")
+        except Exception:
+            pass
         
         # Получаем серийный номер master
         master_serial = None

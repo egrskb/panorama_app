@@ -1,5 +1,5 @@
 """
-HackRF QSA Backend - Fixed version with proper spectrum reading
+HackRF QSA Backend - Fixed DC offset removal and spectrum processing
 """
 
 from __future__ import annotations
@@ -203,10 +203,17 @@ class HackRFQSABackend(SourceBackend):
         f_start_mhz = (f_start_mhz // 20) * 20
         f_stop_mhz = ((f_stop_mhz + 19) // 20) * 20
         
-        if f_start_mhz < 24:
-            f_start_mhz = 24
+        # Ограничиваем диапазон HackRF
+        if f_start_mhz < 1:  # HackRF минимум ~1 МГц
+            f_start_mhz = 0
         if f_stop_mhz > 6000:
             f_stop_mhz = 6000
+        
+        # Проверка для диапазона 5000-6000 МГц
+        if f_start_mhz >= 5000:
+            # Убедимся что диапазон корректный
+            if f_stop_mhz <= f_start_mhz:
+                f_stop_mhz = f_start_mhz + 20  # минимум один шаг 20 МГц
         
         self._c_freq_start_hz = f_start_mhz * 1e6
         self._c_freq_stop_hz = f_stop_mhz * 1e6
@@ -233,8 +240,7 @@ class HackRFQSABackend(SourceBackend):
             self._emit_status(f"hq_set_freq_smoothing unavailable: {e}")
         self._lib.hq_set_ema_alpha(self._ema_alpha)
         
-        # Выравниваем размер буферов Python под фактический шаг бина из C,
-        # чтобы корректно читать полный диапазон без рассинхронизации
+        # Выравниваем размер буферов Python под фактический шаг бина из C
         try:
             eff_step_hz = float(self._lib.hq_get_fft_bin_hz())
             if eff_step_hz > 0:
@@ -251,7 +257,8 @@ class HackRFQSABackend(SourceBackend):
         
         self._running = True
         self.started.emit()
-        # Попробуем запросить фактический шаг и количество точек для логов
+        
+        # Логируем параметры
         try:
             eff_step_hz = float(self._lib.hq_get_fft_bin_hz())
         except Exception:
@@ -390,34 +397,14 @@ class HackRFQSABackend(SourceBackend):
         try:
             if freqs_hz is None or power_dbm is None:
                 return
-                
-            # Фильтруем данные по пользовательскому диапазону
+            
+            # ВАЖНО: НЕ применяем DC offset removal здесь - это делается в C библиотеке!
+            # C код уже применяет окно Hann и корректирует спектр
+            
+            # Просто фильтруем данные по пользовательскому диапазону
             mask = (freqs_hz >= self._user_freq_start_hz) & (freqs_hz <= self._user_freq_stop_hz)
             filtered_freqs = freqs_hz[mask]
             filtered_power = power_dbm[mask]
-
-            # Лёгкое подавление DC offset/спайков: обнулим центральный бин каждого 20-МГц сегмента
-            # (HackRF sweep шаг тюнера 20 МГц). Находим позиции кратные 20 МГц относительно нижней границы.
-            try:
-                if filtered_freqs.size > 5:
-                    f0 = float(self._c_freq_start_hz)
-                    # индексы бинов, близкие к границам 20-МГц окон (±один бин)
-                    seg_pos = np.round((filtered_freqs - f0) / 20e6)
-                    anchors = f0 + seg_pos * 20e6
-                    close = np.isclose(filtered_freqs, anchors, rtol=0.0, atol=max(1.0, np.median(np.diff(filtered_freqs))))
-                    if np.any(close):
-                        # заменим значения на локальную медиану соседей
-                        fp = filtered_power.copy()
-                        idx = np.where(close)[0]
-                        for i in idx:
-                            l = max(0, i-3)
-                            r = min(filtered_power.size, i+4)
-                            neigh = np.delete(filtered_power[l:r], np.where(np.arange(l,r)==i-l))
-                            if neigh.size > 0:
-                                fp[i] = float(np.median(neigh))
-                        filtered_power = fp
-            except Exception:
-                pass
             
             if len(filtered_freqs) > 0:
                 # Эмитим отфильтрованные данные
@@ -567,6 +554,21 @@ class _MasterWorker(QtCore.QThread):
                     # Конвертируем в numpy массивы
                     freqs_hz = np.array([freqs_buf[i] for i in range(n)], dtype=np.float64)
                     power_dbm = np.array([power_buf[i] for i in range(n)], dtype=np.float32)
+                    
+                    # Проверка и корректировка значений
+                    # Убираем NaN/inf
+                    valid_mask = np.isfinite(power_dbm)
+                    if not np.all(valid_mask):
+                        # Заменяем невалидные значения на медиану валидных
+                        valid_values = power_dbm[valid_mask]
+                        if len(valid_values) > 0:
+                            median_val = np.median(valid_values)
+                            power_dbm[~valid_mask] = median_val
+                        else:
+                            power_dbm[~valid_mask] = -120.0
+                    
+                    # Ограничиваем диапазон значений
+                    power_dbm = np.clip(power_dbm, -150.0, 20.0)
                     
                     # Эмитим спектр
                     self.spectrum_ready.emit(freqs_hz, power_dbm)

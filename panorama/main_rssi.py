@@ -147,6 +147,12 @@ class RSSIPanoramaMainWindow(QMainWindow):
             # Загружаем настройки SDR (master/slaves) из JSON
             self.sdr_settings = load_sdr_settings()
 
+            # Инициализируем слейвы из настроек сразу при старте
+            try:
+                self._init_slaves_from_settings()
+            except Exception as e:
+                self.log.error(f"Failed to init slaves from settings: {e}")
+
             # Настраиваем трилатерацию
             self._setup_trilateration()
             
@@ -156,6 +162,24 @@ class RSSIPanoramaMainWindow(QMainWindow):
             self.log.error(f"Error initializing components: {e}")
             QMessageBox.critical(self, "Ошибка инициализации", 
                                f"Не удалось инициализировать компоненты: {e}")
+
+    def _init_slaves_from_settings(self):
+        """Читает конфиг и инициализирует слейвы в SlaveManager."""
+        if not self.slave_manager or not self.sdr_settings:
+            return
+        # Очистим текущих
+        for sid in list(self.slave_manager.slaves.keys()):
+            self.slave_manager.remove_slave(sid)
+        # Добавим из конфига
+        for idx, s in enumerate(self.sdr_settings.get('slaves', []), start=1):
+            sid = s.get('nickname') or (s.get('label') or s.get('serial') or f"slave{idx:02d}")
+            uri = s.get('uri') or s.get('soapy') or (f"driver={s.get('driver')}" if s.get('driver') else '')
+            if (not uri) and s.get('serial'):
+                uri = f"serial={s.get('serial')}"
+            if uri:
+                ok = self.slave_manager.add_slave(sid, uri)
+                if not ok:
+                    self.log.error(f"Failed to init slave {sid} with uri={uri}")
     
     def _check_and_init_master(self):
         """Проверяет наличие конфигурации Master устройства при старте (БЕЗ инициализации SDR)."""
@@ -230,9 +254,9 @@ class RSSIPanoramaMainWindow(QMainWindow):
             
             # Slaves добавляем только те, которые реально настроены
             for s in self.sdr_settings.get('slaves', []):
-                # Проверяем, что устройство реально доступно
+                # Проверяем, что устройство реально настроено
                 ser = s.get('serial', '')
-                uri = s.get('uri', '')
+                uri = s.get('uri') or s.get('soapy') or ''
                 if ser or uri:  # Если есть хотя бы один идентификатор
                     x, y, z = s.get('pos', [0.0, 0.0, 0.0])
                     sid = s.get('nickname') or (s.get('label') or s.get('serial') or 'slave')
@@ -493,9 +517,14 @@ class RSSIPanoramaMainWindow(QMainWindow):
                         self.slave_manager.remove_slave(sid)
                     for idx, s in enumerate(data.get('slaves', []), start=1):
                         sid = s.get('nickname') or (s.get('label') or s.get('serial') or f"slave{idx:02d}")
-                        uri = s.get('uri') or (f"driver={s.get('driver')}" if s.get('driver') else '')
+                        # поддержка форматов: uri, soapy, driver, serial
+                        uri = s.get('uri') or s.get('soapy') or (f"driver={s.get('driver')}" if s.get('driver') else '')
+                        if (not uri) and s.get('serial'):
+                            uri = f"serial={s.get('serial')}"
                         if uri:
-                            self.slave_manager.add_slave(sid, uri)
+                            ok = self.slave_manager.add_slave(sid, uri)
+                            if not ok:
+                                self.log.error(f"Failed to init slave {sid} with uri={uri}")
                 try:
                     self._update_slave_table()
                 except Exception:
@@ -777,6 +806,8 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def _update_tasks_table(self):
         """Обновляет таблицу задач."""
         try:
+            if not hasattr(self, 'tasks_table') or self.tasks_table is None:
+                return
             tasks = self.orchestrator.get_active_tasks()
             
             self.tasks_table.setRowCount(len(tasks))
@@ -809,6 +840,8 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def _update_targets_table(self):
         """Обновляет таблицу целей."""
         try:
+            if not hasattr(self, 'targets_table') or self.targets_table is None:
+                return
             targets = self.trilateration_engine.get_latest_results()
             
             self.targets_table.setRowCount(len(targets))
@@ -1026,6 +1059,19 @@ class RSSIPanoramaMainWindow(QMainWindow):
         self.trilateration_coordinator.target_detected.connect(
             self.map_view.add_target_from_detector
         )
+        # И в UI слейвов — добавлять передатчики
+        try:
+            if hasattr(self, 'slaves_view') and self.slaves_view:
+                self.trilateration_coordinator.target_detected.connect(
+                    self.slaves_view.add_transmitter
+                )
+                # Обновление трекинга — позиция и уверенность
+                if hasattr(self.trilateration_coordinator, 'target_updated'):
+                    self.trilateration_coordinator.target_updated.connect(
+                        self.slaves_view.update_transmitter_position
+                    )
+        except Exception:
+            pass
         # TODO: Добавить метод update_target_position в OpenLayersMapWidget
         # self.trilateration_coordinator.target_updated.connect(
         #     self.map_view.update_target_position
@@ -1091,6 +1137,18 @@ class RSSIPanoramaMainWindow(QMainWindow):
 
 def main():
     """Главная функция приложения."""
+    # WSL/без GPU: отключаем аппаратное ускорение для QtWebEngine/Qt OpenGL
+    try:
+        import os
+        os.environ.setdefault("QT_OPENGL", "software")
+        os.environ.setdefault("QTWEBENGINE_DISABLE_GPU", "1")
+        os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-software-rasterizer --in-process-gpu")
+        os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+        from PyQt5 import QtCore
+        QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_UseSoftwareOpenGL)
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     
     # Настройка приложения

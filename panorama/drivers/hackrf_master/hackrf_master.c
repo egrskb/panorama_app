@@ -518,36 +518,36 @@ static void* worker_thread_fn(void* arg) {
     r = hackrf_set_baseband_filter_bandwidth(master->dev, DEFAULT_BASEBAND_FILTER_BANDWIDTH);
     if (r != HACKRF_SUCCESS) { set_error("hackrf_set_baseband_filter_bandwidth: %s", hackrf_error_name(r)); return NULL; }
 
-    // Выбор FFT (как в прототипе: (N+4)%8==0, без обязательной степени 2)
-    int fft_size = DEFAULT_FFT_SIZE;
-    if (master->fft_size_override > 0) {
-        fft_size = master->fft_size_override;
-        if (fft_size < 4) fft_size = 4;
-        if (fft_size > 8180) fft_size = 8180;
-        while (((fft_size + 4) % 8) != 0 && fft_size < 8180) fft_size++;
-    } else if (master->freq_step_hz > 0) {
-        int auto_size = (int)floor((double)DEFAULT_SAMPLE_RATE_HZ / master->freq_step_hz);
-        if (auto_size < 4) auto_size = 4;
-        if (auto_size > 8180) auto_size = 8180;
-        while (((auto_size + 4) % 8) != 0 && auto_size < 8180) auto_size++;
-        fft_size = auto_size;
-    }
-    // fprintf(stdout, "[HackRF Master] Using FFT size: %d (bin=%.1f kHz)\n",
-    //         fft_size, (DEFAULT_SAMPLE_RATE_HZ/(double)fft_size)/1e3);
+    // Используем уже рассчитанный FFT size из proc
+    int fft_size = master->proc ? master->proc->fft_size : DEFAULT_FFT_SIZE;
+    fprintf(stdout, "[HackRF Master] Using FFT size: %d (bin=%.1f kHz)\n",
+            fft_size, (DEFAULT_SAMPLE_RATE_HZ/(double)fft_size)/1e3);
 
     master->proc = create_processing_context(fft_size, DEFAULT_SAMPLE_RATE_HZ);
     if (!master->proc) { set_error("create_processing_context failed"); return NULL; }
 
-    // Sweep init — диапазоны в МГц кратно 20
+    // Sweep init — диапазоны в МГц кратно 20, c особыми условиями для 5–6 ГГц
     uint32_t fmin_mhz = (uint32_t)(master->freq_start_hz / 1e6);
     uint32_t fmax_mhz = (uint32_t)(master->freq_stop_hz  / 1e6);
+    // Округляем к 20 МГц границам
     fmin_mhz = (fmin_mhz / 20) * 20;
     fmax_mhz = ((fmax_mhz + 19) / 20) * 20;
-    if (fmax_mhz <= fmin_mhz) fmax_mhz = fmin_mhz + 20;
+    // Проверка для высоких частот (>=5 ГГц)
+    if (fmin_mhz >= 5000) {
+        if (fmax_mhz <= fmin_mhz) {
+            fmax_mhz = fmin_mhz + 20;
+        }
+        if (fmax_mhz > 6000) {
+            fmax_mhz = 6000;
+        }
+    }
+    // HackRF поддерживает до 6 ГГц
+    if (fmin_mhz > 6000) fmin_mhz = 6000 - 20;
+    if (fmax_mhz > 6000) fmax_mhz = 6000;
 
     uint16_t freqs_mhz[2] = { (uint16_t)fmin_mhz, (uint16_t)fmax_mhz };
-    // fprintf(stdout, "[HackRF Master] Sweep init: %u–%u MHz, step=%u, offset=%u, interleaved=%d\n",
-    //         freqs_mhz[0], freqs_mhz[1], TUNE_STEP_HZ, OFFSET_HZ, INTERLEAVED);
+    fprintf(stdout, "[HackRF Master] Sweep init: %u–%u MHz, step=%u, offset=%u, interleaved=%d\n",
+            freqs_mhz[0], freqs_mhz[1], TUNE_STEP_HZ, OFFSET_HZ, INTERLEAVED);
 
     r = hackrf_init_sweep(master->dev,
                           freqs_mhz,       // пары [start, stop] в МГц
@@ -569,19 +569,19 @@ static void* worker_thread_fn(void* arg) {
         return NULL;
     }
 
-    // fprintf(stdout, "[HackRF Master] Sweep started\n");
+    fprintf(stdout, "[HackRF Master] Sweep started\n");
 
     while (master->running && !master->stop_requested) {
         usleep(100000);
     }
 
-    // fprintf(stdout, "[HackRF Master] Stopping sweep\n");
+    fprintf(stdout, "[HackRF Master] Stopping sweep\n");
     hackrf_stop_rx(master->dev);
 
     destroy_processing_context(master->proc);
     master->proc = NULL;
 
-    // fprintf(stdout, "[HackRF Master] Worker thread finished\n");
+    fprintf(stdout, "[HackRF Master] Worker thread finished\n");
     return NULL;
 }
 
@@ -725,25 +725,28 @@ int hq_configure(double f_start_mhz, double f_stop_mhz, double bin_hz,
     const double f_start_hz = f_start_mhz * 1e6;
     const double f_stop_hz  = f_stop_mhz  * 1e6;
 
-    // Выбор/уточнение FFT размера относительно bin_hz
+    // ИСПРАВЛЕНИЕ: Правильный расчёт FFT size для заданного bin_hz
     // Если bin_hz == 0, используем дефолтный размер
-    double sr = (double)DEFAULT_SAMPLE_RATE_HZ;
-    int fft_size = m->fft_size_override > 0 ? m->fft_size_override : DEFAULT_FFT_SIZE;
+    double sr = (double)DEFAULT_SAMPLE_RATE_HZ;  // 20 МГц
+    int fft_size = DEFAULT_FFT_SIZE;
     if (bin_hz > 0.0) {
-        // Подгоняем FFT так, чтобы bin ≈ bin_hz (до ближайшей степени двойки)
+        // FFT size = sample_rate / bin_hz
         double ideal_n = sr / bin_hz;
-        int n = 1;
-        while (n < (int)ideal_n && n < MAX_FFT_SIZE) n <<= 1;
-        // Выбираем ближайшую степень двойки
-        int n_prev = n >> 1;
-        if (n_prev >= MIN_FFT_SIZE && fabs(sr/n_prev - bin_hz) < fabs(sr/n - bin_hz)) {
-            fft_size = n_prev;
-        } else {
-            fft_size = n;
-        }
+        fft_size = (int)ideal_n;
+        // Ограничения
         if (fft_size < MIN_FFT_SIZE) fft_size = MIN_FFT_SIZE;
-        if (fft_size > MAX_FFT_SIZE) fft_size = MAX_FFT_SIZE;
+        if (fft_size > 8192) fft_size = 8192;  // Разумный максимум
+        // Корректируем под требования HackRF sweep: (N+4)%8==0
+        while (((fft_size + 4) % 8) != 0 && fft_size < 8192) {
+            fft_size++;
+        }
+    } else if (m->fft_size_override > 0) {
+        fft_size = m->fft_size_override;
     }
+
+    // Для отладки
+    fprintf(stdout, "[HackRF Master] Calculated FFT size: %d for bin_hz=%.1f Hz (bin width=%.1f Hz)\n",
+            fft_size, bin_hz, sr/(double)fft_size);
 
     // Уничтожаем прежний proc (если есть) и создаём новый с указанным FFT size
     if (m->proc) {

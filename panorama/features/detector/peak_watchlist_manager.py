@@ -66,20 +66,20 @@ class PeakWatchlistManager(QObject):
         super().__init__(parent)
         
         # Параметры детектора для видеосигналов
-        self.video_bandwidth_min_mhz = 5.0   # Минимальная ширина видеосигнала
-        self.video_bandwidth_max_mhz = 20.0  # Максимальная ширина видеосигнала
+        self.video_bandwidth_min_mhz = 1.0   # Разрешаем узкие сигналы
+        self.video_bandwidth_max_mhz = 30.0  # Разрешаем широкие сигналы
         self.threshold_mode = "adaptive"      # "adaptive" или "fixed"
-        self.baseline_offset_db = 15.0       # Порог над baseline для adaptive
+        self.baseline_offset_db = 10.0       # Порог над baseline для adaptive
         self.threshold_dbm = -70.0           # Фиксированный порог
-        self.min_snr_db = 10.0               # Минимальный SNR
+        self.min_snr_db = 5.0                # Минимальный SNR
         self.min_peak_width_bins = 5         # Минимальная ширина в бинах
         self.min_peak_distance_bins = 10     # Минимальное расстояние между пиками
         
         # Параметры watchlist
         self.watchlist_span_hz = 10e6        # Окно ±5 МГц вокруг пика по умолчанию
         self.max_watchlist_size = 10         # Максимум целей в watchlist
-        self.peak_timeout_sec = 10.0         # Таймаут неактивных пиков
-        self.min_confirmation_sweeps = 3     # Минимум свипов для подтверждения
+        self.peak_timeout_sec = 120.0        # Увеличенный таймаут, чтобы записи не исчезали быстро
+        self.min_confirmation_sweeps = 1     # Минимум свипов для подтверждения (добавляем сразу)
         
         # Состояние
         self.detected_peaks: Dict[str, VideoSignalPeak] = {}
@@ -87,6 +87,8 @@ class PeakWatchlistManager(QObject):
         self.baseline_history = deque(maxlen=50)  # История для адаптивного порога
         self.last_spectrum: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self._previous_peaks: Set[float] = set()  # Для предотвращения дублирования
+        self._ever_added_centers: Set[float] = set()  # Центры, уже добавленные в watchlist за сессию
+        self.watchlist_entry_retention_sec = 600.0     # Храним записи watchlist не менее 10 минут
         
         # Таймер очистки
         self.cleanup_timer = QTimer(self)
@@ -112,17 +114,35 @@ class PeakWatchlistManager(QObject):
         # Сохраняем для анализа
         self.last_spectrum = (freqs_hz.copy(), power_dbm.copy())
         
+        # Отладка
+        try:
+            print(f"[DEBUG] Processing spectrum: {freqs_hz.size} points, power range: {power_dbm.min():.1f} to {power_dbm.max():.1f} dBm")
+        except Exception:
+            pass
+        
         # Вычисляем baseline
         baseline = self._compute_baseline(power_dbm)
+        try:
+            print(f"[DEBUG] Baseline: {baseline:.1f} dBm")
+        except Exception:
+            pass
         
         # Определяем порог
         if self.threshold_mode == "adaptive":
             threshold = baseline + self.baseline_offset_db
         else:
             threshold = self.threshold_dbm
+        try:
+            print(f"[DEBUG] Threshold: {threshold:.1f} dBm (mode={self.threshold_mode})")
+        except Exception:
+            pass
         
         # Находим пики
         peaks = self._find_video_peaks(freqs_hz, power_dbm, threshold, baseline)
+        try:
+            print(f"[DEBUG] Found {len(peaks)} peaks")
+        except Exception:
+            pass
         
         # Обновляем состояние и watchlist
         new_peaks = []
@@ -137,13 +157,24 @@ class PeakWatchlistManager(QObject):
                     break
             
             if is_duplicate:
-                # Обновляем существующий пик
+                # Обновляем существующий пик и при достижении подтверждения добавляем в watchlist
                 for peak_id, existing_peak in self.detected_peaks.items():
                     if abs(existing_peak.center_freq_hz - peak.center_freq_hz) < 1e6:
                         existing_peak.last_seen = current_time
                         existing_peak.consecutive_detections += 1
-                        existing_peak.peak_power_dbm = max(existing_peak.peak_power_dbm, 
+                        existing_peak.peak_power_dbm = max(existing_peak.peak_power_dbm,
                                                           peak.peak_power_dbm)
+                        try:
+                            print(f"[DEBUG] Peak {peak_id} detections: {existing_peak.consecutive_detections}")
+                        except Exception:
+                            pass
+                        # Если достигнуто требуемое число подтверждений — добавляем в watchlist
+                        if (existing_peak.consecutive_detections >= max(1, self.min_confirmation_sweeps)
+                                and peak_id not in self.watchlist):
+                            # Добавляем только если такой центр ещё не добавлялся ранее
+                            if not any(abs(existing_peak.center_freq_hz - c) < 1e6 for c in self._ever_added_centers):
+                                self._add_to_watchlist(existing_peak, user_span_hz or self.watchlist_span_hz)
+                                self._ever_added_centers.add(existing_peak.center_freq_hz)
                         break
             else:
                 # Новый пик
@@ -151,9 +182,11 @@ class PeakWatchlistManager(QObject):
                 new_peaks.append(peak)
                 self._previous_peaks.add(peak.center_freq_hz)
                 
-                # Добавляем в watchlist если подтвержден
+                # Добавляем в watchlist если подтвержден и ранее не добавляли такой центр
                 if peak.consecutive_detections >= max(1, self.min_confirmation_sweeps):
-                    self._add_to_watchlist(peak, user_span_hz or self.watchlist_span_hz)
+                    if not any(abs(peak.center_freq_hz - c) < 1e6 for c in self._ever_added_centers):
+                        self._add_to_watchlist(peak, user_span_hz or self.watchlist_span_hz)
+                        self._ever_added_centers.add(peak.center_freq_hz)
         
         # Эмитим сигналы для новых пиков
         for peak in new_peaks:
@@ -164,15 +197,18 @@ class PeakWatchlistManager(QObject):
     def _compute_baseline(self, power_dbm: np.ndarray) -> float:
         """
         Вычисляет baseline (шумовой пол) для адаптивного порога.
+        Использует нижний квартиль (25-й перцентиль) для устойчивости к сильным пикам.
         """
+        # Текущее значение baseline по 25-му перцентилю
+        baseline_value = float(np.percentile(power_dbm, 25))
         # Добавляем в историю
-        self.baseline_history.append(np.median(power_dbm))
+        self.baseline_history.append(baseline_value)
         
-        # Используем медиану по истории для стабильности
+        # Используем медиану по истории для сглаживания
         if len(self.baseline_history) > 0:
             return float(np.median(list(self.baseline_history)))
         else:
-            return float(np.median(power_dbm))
+            return baseline_value
     
     def _find_video_peaks(self, freqs_hz: np.ndarray, power_dbm: np.ndarray, 
                          threshold: float, baseline: float) -> List[VideoSignalPeak]:
@@ -201,7 +237,12 @@ class PeakWatchlistManager(QObject):
             bandwidth_mhz = bandwidth_hz / 1e6
             
             # Проверяем, подходит ли под видеосигнал
-            if bandwidth_mhz < self.video_bandwidth_min_mhz:
+            # Для 5.8 ГГц диапазона разрешаем более узкие сигналы
+            if region_freqs[0] > 5000e6:
+                min_width_mhz = 0.5
+            else:
+                min_width_mhz = self.video_bandwidth_min_mhz
+            if bandwidth_mhz < min_width_mhz:
                 continue  # Слишком узкий
             if bandwidth_mhz > self.video_bandwidth_max_mhz:
                 continue  # Слишком широкий
@@ -216,9 +257,8 @@ class PeakWatchlistManager(QObject):
             if snr < self.min_snr_db:
                 continue
             
-            # Уточняем центральную частоту (центр масс по мощности)
-            power_linear = 10.0 ** (region_power / 10.0)
-            center_freq = np.average(region_freqs, weights=power_linear)
+            # Центральная частота: выбираем частоту максимума мощности
+            center_freq = float(peak_freq)
             
             # Создаем объект пика
             peak = VideoSignalPeak(
@@ -335,9 +375,13 @@ class PeakWatchlistManager(QObject):
                 self._previous_peaks.discard(peak.center_freq_hz)
         
         for peak_id in peaks_to_remove:
+            peak = self.detected_peaks.get(peak_id)
             del self.detected_peaks[peak_id]
+            # Не удаляем запись из watchlist, если она моложе retention порога
             if peak_id in self.watchlist:
-                del self.watchlist[peak_id]
+                age = current_time - self.watchlist[peak_id].created_at
+                if age > self.watchlist_entry_retention_sec:
+                    del self.watchlist[peak_id]
         
         # Обновляем watchlist
         if peaks_to_remove:
