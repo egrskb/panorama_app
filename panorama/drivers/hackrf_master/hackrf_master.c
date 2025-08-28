@@ -358,11 +358,18 @@ static void process_sweep_block(MasterContext* master, uint8_t* buffer, int vali
     int samples_available = (valid_length - 16) / 2; // попарно I,Q
     if (samples_available < proc->fft_size) return;
 
-    // окно + нормализация
+    // DC-remove по времени + окно Hann
     const float scale = 1.0f / 128.0f;
+    double sumI = 0.0, sumQ = 0.0;
     for (int i = 0; i < proc->fft_size; i++) {
-        float I = iq[2*i]     * scale;
-        float Q = iq[2*i + 1] * scale;
+        sumI += (double)iq[2*i]     * (double)scale;
+        sumQ += (double)iq[2*i + 1] * (double)scale;
+    }
+    float meanI = (float)(sumI / (double)proc->fft_size);
+    float meanQ = (float)(sumQ / (double)proc->fft_size);
+    for (int i = 0; i < proc->fft_size; i++) {
+        float I = (float)iq[2*i]     * scale - meanI;
+        float Q = (float)iq[2*i + 1] * scale - meanQ;
         proc->in[i][0] = I * proc->window[i];
         proc->in[i][1] = Q * proc->window[i];
     }
@@ -384,6 +391,40 @@ static void process_sweep_block(MasterContext* master, uint8_t* buffer, int vali
         float im = proc->out[i][1] * fft_norm;
         proc->pwr_dbm[i] = calculate_power_dbm(re, im, total_corr);
         proc->freqs_hz[i] = f0 + (i + 0.5) * proc->bin_width; // центр бина
+    }
+
+    // Заполняем центральный guard-band вокруг DC линейной интерполяцией, чтобы избежать провалов на графике
+    int i_mid = proc->fft_size / 2;
+    int guard = 3; // ±3 бина по умолчанию
+    int gL = i_mid - guard;
+    int gR = i_mid + guard;
+    if (gL < 0) gL = 0;
+    if (gR >= proc->fft_size) gR = proc->fft_size - 1;
+
+    // Для интерполяции нужны соседние точки за пределами полосы
+    int left_idx  = gL - 1;
+    int right_idx = gR + 1;
+
+    int have_left  = (left_idx  >= 0);
+    int have_right = (right_idx < proc->fft_size);
+
+    if (have_left && have_right) {
+        float left  = proc->pwr_dbm[left_idx];
+        float right = proc->pwr_dbm[right_idx];
+        float denom = (float)(right_idx - left_idx);
+        if (denom < 1.0f) denom = 1.0f;
+        for (int k = gL; k <= gR; ++k) {
+            float t = (float)(k - left_idx) / denom; // t∈(0,1)
+            proc->pwr_dbm[k] = left + t * (right - left);
+        }
+    } else if (have_left) {
+        float left = proc->pwr_dbm[left_idx];
+        for (int k = gL; k <= gR; ++k) proc->pwr_dbm[k] = left;
+    } else if (have_right) {
+        float right = proc->pwr_dbm[right_idx];
+        for (int k = gL; k <= gR; ++k) proc->pwr_dbm[k] = right;
+    } else {
+        for (int k = gL; k <= gR; ++k) proc->pwr_dbm[k] = -120.0f;
     }
 
     // Частотное сглаживание (перед EMA и колбэками)
