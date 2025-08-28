@@ -10,7 +10,7 @@ extern "C" {
 
 // ================== Константы FFT ==================
 #define MIN_FFT_SIZE       16
-#define DEFAULT_FFT_SIZE   4096   // Увеличено для поддержки 5 кГц бина при 20 МГц SR
+#define DEFAULT_FFT_SIZE   32     // bin ≈ 625 кГц при 20 МГц SR
 #define MAX_FFT_SIZE       65536  // максимум для FFTW
 
 // ================== Константы сегментов ==================
@@ -63,8 +63,6 @@ int  hq_stop(void);
 
 // --- Доступ к спектру (EMA-сетка) ---
 int  hq_get_master_spectrum(double* freqs_hz, float* powers_dbm, int max_points);
-// Возвращает фактическую ширину бина (шаг сетки) в Гц
-double hq_get_fft_bin_hz(void);
 
 // --- Настройки обработки ---
 void hq_set_ema_alpha(float alpha);
