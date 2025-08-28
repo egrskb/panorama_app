@@ -196,31 +196,23 @@ class HackRFQSABackend(SourceBackend):
         self._user_freq_stop_hz = config.freq_end_hz
         self._user_bin_hz = config.bin_hz
         
-        # Округляем для C библиотеки (кратно 20 МГц для HackRF sweep)
-        f_start_mhz = int(self._user_freq_start_hz / 1e6)
-        f_stop_mhz = int(self._user_freq_stop_hz / 1e6)
+        # Используем ровно пользовательские границы, только мягко клипим в допустимый диапазон HackRF
+        f_start_hz = float(self._user_freq_start_hz)
+        f_stop_hz = float(self._user_freq_stop_hz)
+        # Клип 1–6000 МГц
+        min_hz, max_hz = 1e6, 6000e6
+        f_start_hz = max(min_hz, min(max_hz, f_start_hz))
+        f_stop_hz = max(min_hz, min(max_hz, f_stop_hz))
+        # Гарантируем, что правая граница > левой
+        if f_stop_hz <= f_start_hz:
+            f_stop_hz = min(max_hz, f_start_hz + max(1.0, float(self._user_bin_hz)))
         
-        f_start_mhz = (f_start_mhz // 20) * 20
-        f_stop_mhz = ((f_stop_mhz + 19) // 20) * 20
+        self._c_freq_start_hz = f_start_hz
+        self._c_freq_stop_hz = f_stop_hz
         
-        # Ограничиваем диапазон HackRF
-        if f_start_mhz < 1:  # HackRF минимум ~1 МГц
-            f_start_mhz = 0
-        if f_stop_mhz > 6000:
-            f_stop_mhz = 6000
-        
-        # Проверка для диапазона 5000-6000 МГц
-        if f_start_mhz >= 5000:
-            # Убедимся что диапазон корректный
-            if f_stop_mhz <= f_start_mhz:
-                f_stop_mhz = f_start_mhz + 20  # минимум один шаг 20 МГц
-        
-        self._c_freq_start_hz = f_start_mhz * 1e6
-        self._c_freq_stop_hz = f_stop_mhz * 1e6
-        
-        # Вычисляем количество точек спектра
+        # Вычисляем количество точек спектра — без жёсткого капа
         freq_range = self._c_freq_stop_hz - self._c_freq_start_hz
-        self._spectrum_points = min(100000, int(freq_range / self._user_bin_hz) + 1)
+        self._spectrum_points = int(freq_range / self._user_bin_hz) + 1
         
         # Сохраняем параметры усиления
         self._lna_db = config.lna_db
@@ -240,12 +232,12 @@ class HackRFQSABackend(SourceBackend):
             self._emit_status(f"hq_set_freq_smoothing unavailable: {e}")
         self._lib.hq_set_ema_alpha(self._ema_alpha)
         
-        # Выравниваем размер буферов Python под фактический шаг бина из C
+        # Выравниваем размер буферов Python под фактический шаг бина из C (без капа)
         try:
             eff_step_hz = float(self._lib.hq_get_fft_bin_hz())
             if eff_step_hz > 0:
                 freq_range = self._c_freq_stop_hz - self._c_freq_start_hz
-                self._spectrum_points = min(100000, int(freq_range / eff_step_hz) + 1)
+                self._spectrum_points = int(freq_range / eff_step_hz) + 1
         except Exception:
             pass
         

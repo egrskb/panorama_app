@@ -33,7 +33,9 @@
 #define FREQ_ONE_MHZ                       1000000u
 #define BLOCKS_PER_TRANSFER                16
 #define BYTES_PER_BLOCK                    16384
-#define MAX_SPECTRUM_POINTS                100000
+// Увеличиваем максимально допустимое число точек глобальной сетки,
+// чтобы не обрезать широкие диапазоны при мелком bin.
+#define MAX_SPECTRUM_POINTS                2000000
 #define INTERLEAVED                        1
 
 

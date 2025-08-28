@@ -117,6 +117,10 @@ class SpectrumView(QtWidgets.QWidget):
         
         # Среднее окно
         self._avg_queue = deque(maxlen=10)
+
+        # Полные/отображаемые данные спектра
+        self.full_spectrum: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        self.display_spectrum: Optional[Tuple[np.ndarray, np.ndarray]] = None
         
         # Строим интерфейс
         self._build_ui()
@@ -183,16 +187,17 @@ class SpectrumView(QtWidgets.QWidget):
         
         # Адаптивное разрешение для отрисовки
         self._display_cols = MIN_DISPLAY_COLS  # динамическое число колонок для отрисовки
-        self._zoom_debounce = QTimer(self)
-        self._zoom_debounce.setInterval(120)   # мс
-        self._zoom_debounce.setSingleShot(True)
-        self._zoom_debounce.timeout.connect(self._apply_auto_resolution)
+        # Авто-разрешение отключено: используем фиксированный даунсэмпл под ширину виджета
+        self._zoom_debounce = None
         
         # Кеш для перерисовки при смене масштаба
         self._last_freqs_hz: Optional[np.ndarray] = None
         self._last_power_dbm: Optional[np.ndarray] = None
         # Счётчик текущих точек на экране (для плашки)
         self._last_plotted_points: int = 0
+
+        # Целевая ширина водопада (точек по X) для ресемплинга
+        self._wf_target_cols: int = 2048
         
         # Маркеры и ROI
         self._marker_seq = 0
@@ -326,8 +331,7 @@ class SpectrumView(QtWidgets.QWidget):
         self._lut = get_colormap(self._lut_name, 256)
         self._wf_levels = (-110.0, -20.0)
         
-        # Подписываемся на изменение диапазона графика для авто-разрешения и обновления заливки
-        self.plot.getViewBox().sigRangeChanged.connect(lambda *_: self._zoom_debounce.start())
+        # Подписываемся только для обновления заливки
         self.plot.getViewBox().sigRangeChanged.connect(lambda *_: self._update_fill_under_curve())
 
         # Бейдж со span и разрешением
@@ -583,35 +587,12 @@ class SpectrumView(QtWidgets.QWidget):
         return target
 
     def _on_zoom_changed(self):
-        """Обработчик изменения зума для адаптивного разрешения."""
-        if self._last_freqs_hz is None or self._last_freqs_hz.size == 0:
-            return
-            
-        x0, x1 = self.plot.getViewBox().viewRange()[0]
-        span_mhz = max(0.001, x1 - x0)
-        full_span_mhz = (self._last_freqs_hz[-1] - self._last_freqs_hz[0]) * 1e-6
-        zoom_ratio = full_span_mhz / span_mhz
-
-        # Простая шкала: чем глубже зум, тем больше точек
-        new_cols = MIN_DISPLAY_COLS  # базовое значение
-        if zoom_ratio > 4:
-            new_cols = 4096
-        if zoom_ratio > 8:
-            new_cols = 8192
-        if zoom_ratio > 16:
-            new_cols = 16384
-            
-        # Ограничиваем максимальным значением
-        new_cols = min(new_cols, MAX_DISPLAY_COLS)
-        
-        if new_cols != self._display_cols:
-            self._display_cols = new_cols
-            # перерисовать с новым даунсемплом
-            self._refresh_spectrum()
+        """(Отключено) Раньше меняло разрешение при зуме."""
+        return
 
     def _apply_auto_resolution(self):
-        """Вызывается с дебаунсом при каждом зуме/скролле."""
-        self._on_zoom_changed()
+        """(Отключено) Раньше вызывалось с дебаунсом."""
+        return
 
     def set_source(self, src: SourceBackend):
         """Устанавливает источник данных."""
@@ -661,11 +642,16 @@ class SpectrumView(QtWidgets.QWidget):
             if freqs_hz.size == 0:
                 return
 
-        # Инициализируем сетку/водопад как в прототипе
-        if self._model.freqs_hz.size == 0 or self._model.freqs_hz.size != freqs_hz.size or self._model.water is None:
+        # Инициализируем сетку/водопад при первом приходе данных
+        if self._model.freqs_hz.size == 0 or self._model.water is None:
             # В прототипе set_grid создаёт матрицу water и last_row
-            f0 = float(freqs_hz[0])
-            f1 = float(freqs_hz[-1])
+            # Берём желаемые границы из _current_cfg, а не из пришедших данных
+            if self._current_cfg is not None:
+                f0 = float(self._current_cfg.freq_start_hz)
+                f1 = float(self._current_cfg.freq_end_hz)
+            else:
+                f0 = float(freqs_hz[0])
+                f1 = float(freqs_hz[-1])
             # Оценим bin как медианное расстояние
             if freqs_hz.size > 1:
                 bw = float(np.median(np.diff(freqs_hz)))
@@ -673,25 +659,30 @@ class SpectrumView(QtWidgets.QWidget):
                 bw = float(self.bin_khz.value() * 1e3)
             self._model.set_grid(f0, f1, bw)
 
-            # Выставим оси и картинку водопада по фактическим данным (с учётом пользовательских границ)
-            x_mhz = self._model.freqs_hz.astype(np.float64) / 1e6
-            xr0 = float(x_mhz[0])
-            xr1 = float(x_mhz[-1])
-            if self._current_cfg is not None:
-                cfg0 = float(self._current_cfg.freq_start_hz) * 1e-6
-                cfg1 = float(self._current_cfg.freq_end_hz) * 1e-6
-                # Пересекаем реальные данные с запрошенным диапазоном, чтобы избежать «пустого» пространства
-                xr0 = max(xr0, cfg0)
-                xr1 = min(xr1, cfg1)
-            if xr1 <= xr0:
-                xr0, xr1 = float(x_mhz[0]), float(x_mhz[-1])
-            self.plot.setXRange(xr0, xr1, padding=0)
+            # Выставляем оси строго по пользовательским границам
+            cfg0 = float(self._current_cfg.freq_start_hz) * 1e-6 if self._current_cfg else float(f0) * 1e-6
+            cfg1 = float(self._current_cfg.freq_end_hz) * 1e-6 if self._current_cfg else float(f1) * 1e-6
+            if cfg1 <= cfg0:
+                cfg0, cfg1 = float(f0) * 1e-6, float(f1) * 1e-6
+            vb = self.plot.getViewBox()
+            vb.enableAutoRange(x=False, y=False)
+            vb.setLimits(xMin=50.0, xMax=6000.0, minXRange=1e-3, maxXRange=6000.0-50.0)
+            self.water_plot.setLimits(xMin=50.0, xMax=6000.0, minXRange=1e-3, maxXRange=6000.0-50.0)
+            self.plot.setXRange(cfg0, cfg1, padding=0)
             self.plot.setYRange(-110.0, -20.0, padding=0)
-            self.water_plot.setXRange(xr0, xr1, padding=0)
+            self.water_plot.setXRange(cfg0, cfg1, padding=0)
             self.water_plot.setYRange(0, self._model.rows, padding=0)
             if self._model.water is not None:
                 self.water_img.setImage(self._model.water, autoLevels=False, levels=self._wf_levels, lut=self._lut)
+                # Прямоугольник водопада по пользовательской сетке
+                x_mhz = self._model.freqs_hz.astype(np.float64) / 1e6
                 self.water_img.setRect(QtCore.QRectF(float(x_mhz[0]), 0.0, float(x_mhz[-1] - x_mhz[0]), float(self._model.rows)))
+
+        # Сохраняем ПОЛНЫЙ спектр для анализа/детектора и обновляем модель/водопад
+        try:
+            self.full_spectrum = (freqs_hz.astype(np.float64) * 1e-6, power_dbm.astype(np.float32, copy=False))
+        except Exception:
+            self.full_spectrum = (freqs_hz * 1e-6, power_dbm)
 
         # Обновление модели и водопада (матрица со сдвигом)
         self._model.append_row(power_dbm)
@@ -699,6 +690,15 @@ class SpectrumView(QtWidgets.QWidget):
         # Статистика и перерисовка
         self._update_statistics()
         self._refresh_spectrum()
+        # Передаём ПОЛНЫЙ спектр в координатор детектора, если подключен
+        try:
+            if self._orchestrator and self.full_spectrum is not None:
+                fx, fy = self.full_spectrum
+                # fx в МГц → требуются Гц для детектора
+                freqs_hz_full = (fx * 1e6).astype(np.float64, copy=False)
+                self._orchestrator.process_master_spectrum(freqs_hz_full, fy.astype(np.float32, copy=False))
+        except Exception:
+            pass
         self._pending_water_update = True
         if not self._update_timer.isActive():
             self._update_timer.start()
@@ -787,16 +787,20 @@ class SpectrumView(QtWidgets.QWidget):
         if not waterfall_data:
             return
             
-        # Даунсемплируем каждую строку
+        # Даунсемплируем каждую строку до фиксированной ширины водопада
         waterfall_ds = []
         for row in waterfall_data:
-            row_ds = self._downsample_array(row, self._wf_ds_factor, method='max')
-            if row_ds.size != self._wf_cols_ds:
-                if row_ds.size > self._wf_cols_ds:
-                    row_ds = row_ds[:self._wf_cols_ds]
-                else:
-                    row_ds = np.pad(row_ds, (0, self._wf_cols_ds - row_ds.size), mode='edge')
-            waterfall_ds.append(row_ds)
+            # Ресемплинг индексацией до _wf_target_cols
+            target = int(self._wf_target_cols)
+            n = row.size
+            if n <= target:
+                # паддинг до целевой ширины для согласованной матрицы
+                row_ds = np.pad(row, (0, target - n), mode='edge') if n < target else row
+            else:
+                step = float(n) / float(target)
+                idx = (np.arange(target) * step).astype(np.int64)
+                row_ds = row[idx]
+            waterfall_ds.append(row_ds.astype(np.float32, copy=False))
         
         # Создаем матрицу водопада
         if waterfall_ds:
@@ -855,11 +859,11 @@ class SpectrumView(QtWidgets.QWidget):
         except Exception:
             pass
         
-        # Даунсемплинг текущей линии при прямой отрисовке
+        # Сохраняем полные данные и формируем даунсэмпл под ширину виджета
         x_mhz = freqs_hz.astype(np.float64) * 1e-6
-        span_hz = float((freqs_hz[-1] - freqs_hz[0])) if freqs_hz.size > 1 else 0.0
-        target_cols = self._target_display_cols(span_hz)
-        xd, yd = self._downsample_line(x_mhz, y, target_cols)
+        self.full_spectrum = (x_mhz, y.copy())
+        max_pts = max(256, int(self.plot.width()))
+        xd, yd = self._downsample_for_display(x_mhz, y, max_points=max_pts)
         # Доп. защита от случайной подачи Гц в x: если значения слишком большие, нормализуем в МГц
         try:
             if xd.size > 0 and float(np.max(xd)) > 10000.0:
@@ -889,7 +893,10 @@ class SpectrumView(QtWidgets.QWidget):
             self._ema_last = (1.0 - alpha) * self._ema_last + alpha * power_dbm
 
         if self.chk_ema.isChecked():
-            self.curve_avg.setData(freqs_hz * 1e-6, self._ema_last)
+            # Для средней линии применим такой же даунсэмпл под ширину экрана
+            x_avg = freqs_hz.astype(np.float64) * 1e-6
+            xa, ya = self._downsample_for_display(x_avg, self._ema_last, max_points=max_pts)
+            self.curve_avg.setData(xa, ya)
         else:
             self.curve_avg.setData([], [])
 
@@ -1050,6 +1057,19 @@ class SpectrumView(QtWidgets.QWidget):
         idx = np.linspace(0, n - 1, num=max_points).astype(np.int64)
         return x[idx], y[idx]
 
+    def _downsample_for_display(self, x: np.ndarray, y: np.ndarray, max_points: int) -> tuple[np.ndarray, np.ndarray]:
+        """Простой быстрый даунсэмплинг под ширину экрана (шаговая выборка)."""
+        try:
+            if x is None or y is None:
+                return x, y
+            n = int(min(len(x), len(y)))
+            if n <= 0 or max_points <= 0 or n <= max_points:
+                return x, y
+            step = max(1, n // max_points)
+            return x[::step], y[::step]
+        except Exception:
+            return x, y
+
     def _smooth_freq(self, y: np.ndarray) -> np.ndarray:
         """Сглаживание по частоте."""
         if not self.chk_smooth.isChecked() or y.size < 3:
@@ -1178,14 +1198,12 @@ class SpectrumView(QtWidgets.QWidget):
         # Сохраняем конфигурацию
         self._save_config()
         
-        # Корректируем границы и клэмпим в 50–6000 МГц
-        f0, f1, bw = self._snap_bounds(
-            max(50.0, min(6000.0, self.start_mhz.value())),
-            max(50.0, min(6000.0, self.stop_mhz.value())),
-            self.bin_khz.value() * 1e3
-        )
-        self.start_mhz.setValue(max(50.0, min(6000.0, f0 / 1e6)))
-        self.stop_mhz.setValue(max(50.0, min(6000.0, f1 / 1e6)))
+        # Берем ровно то, что ввёл пользователь, только мягко клипим в рабочий диапазон 50–6000 МГц
+        f0 = max(50.0, min(6000.0, float(self.start_mhz.value()))) * 1e6
+        f1 = max(50.0, min(6000.0, float(self.stop_mhz.value()))) * 1e6
+        bw = float(self.bin_khz.value() * 1e3)
+        self.start_mhz.setValue(f0 * 1e-6)
+        self.stop_mhz.setValue(f1 * 1e-6)
 
         # Отладка: текущий сканируемый диапазон
         try:
@@ -1207,9 +1225,9 @@ class SpectrumView(QtWidgets.QWidget):
         
         # Создаем конфигурацию
         cfg = SweepConfig(
-            # Используем частоты из UI вместо захардкоженных
-            freq_start_hz=int(self.start_mhz.value() * 1e6),
-            freq_end_hz=int(self.stop_mhz.value() * 1e6),
+            # Используем ровно пользовательские значения без округления
+            freq_start_hz=int(f0),
+            freq_end_hz=int(f1),
             bin_hz=int(bw),
             lna_db=int(self.lna_db.value()),
             vga_db=int(self.vga_db.value()),
@@ -1226,8 +1244,10 @@ class SpectrumView(QtWidgets.QWidget):
             x0 = float(cfg.freq_start_hz) * 1e-6
             x1 = float(cfg.freq_end_hz) * 1e-6
             if x1 > x0:
-                self.plot.setLimits(xMin=50.0, xMax=6000.0)
-                self.water_plot.setLimits(xMin=50.0, xMax=6000.0)
+                vb = self.plot.getViewBox()
+                vb.enableAutoRange(x=False, y=False)
+                vb.setLimits(xMin=50.0, xMax=6000.0, minXRange=1e-3, maxXRange=6000.0-50.0)
+                self.water_plot.setLimits(xMin=50.0, xMax=6000.0, minXRange=1e-3, maxXRange=6000.0-50.0)
                 self.plot.setXRange(x0, x1, padding=0.0)
                 self.water_plot.setXRange(x0, x1, padding=0.0)
         except Exception:
@@ -1348,6 +1368,9 @@ class SpectrumView(QtWidgets.QWidget):
         """Сброс вида графиков."""
         self.plot.setYRange(-110.0, -20.0, padding=0)
         # Зафиксируем X в пределах 50–6000 МГц и не позволим выходить
+        vb = self.plot.getViewBox()
+        vb.enableAutoRange(x=False, y=False)
+        vb.setLimits(xMin=50.0, xMax=6000.0, minXRange=1e-3, maxXRange=6000.0-50.0)
         self.plot.setXRange(50.0, 6000.0, padding=0)
         self._water_view = None
         self._water_initialized = False
