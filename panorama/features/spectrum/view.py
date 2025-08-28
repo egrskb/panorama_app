@@ -716,21 +716,29 @@ class SpectrumView(QtWidgets.QWidget):
         x_mhz = self._model.freqs_hz / 1e6
         x0, x1 = float(x_mhz[0]), float(x_mhz[-1])
         
-        # Жёсткие глобальные границы 50–6000 МГц вне зависимости от данных
-        x0 = 50.0
-        x1 = 6000.0
+        # Ограничения и видимый диапазон: глобальные пределы остаются 50–6000,
+        # но видим сразу пересечение данных с пользовательским диапазоном, если задан.
+        global_min, global_max = 50.0, 6000.0
+        vis0, vis1 = x0, x1
+        if self._current_cfg is not None:
+            cfg0 = float(self._current_cfg.freq_start_hz) * 1e-6
+            cfg1 = float(self._current_cfg.freq_end_hz) * 1e-6
+            vis0 = max(vis0, cfg0)
+            vis1 = min(vis1, cfg1)
+            if vis1 <= vis0:
+                vis0, vis1 = x0, x1
         
         # Дополнительная проверка размера данных
         if x_mhz.size > 10000:  # Если слишком много точек, принудительно даунсемплируем
             self._wf_max_cols = 512
             waterfall_rows = 50
         
-        self.plot.setLimits(xMin=x0, xMax=x1)
-        self.water_plot.setLimits(xMin=x0, xMax=x1)
+        self.plot.setLimits(xMin=global_min, xMax=global_max)
+        self.water_plot.setLimits(xMin=global_min, xMax=global_max)
         
-        self.plot.setXRange(x0, x1, padding=0.0)
+        self.plot.setXRange(vis0, vis1, padding=0.0)
         self.plot.setYRange(-110.0, -20.0, padding=0)
-        self.water_plot.setXRange(x0, x1, padding=0.0)
+        self.water_plot.setXRange(vis0, vis1, padding=0.0)
         
         # Адаптивный даунсемплинг для больших диапазонов
         # Используем динамическое разрешение для waterfall
@@ -1182,6 +1190,18 @@ class SpectrumView(QtWidgets.QWidget):
         
         # Инициализация модели с пользовательскими границами
         self._model.set_grid(cfg.freq_start_hz, cfg.freq_end_hz, cfg.bin_hz)
+
+        # Немедленно выставляем видимый диапазон в соответствии с выбором пользователя
+        try:
+            x0 = float(cfg.freq_start_hz) * 1e-6
+            x1 = float(cfg.freq_end_hz) * 1e-6
+            if x1 > x0:
+                self.plot.setLimits(xMin=50.0, xMax=6000.0)
+                self.water_plot.setLimits(xMin=50.0, xMax=6000.0)
+                self.plot.setXRange(x0, x1, padding=0.0)
+                self.water_plot.setXRange(x0, x1, padding=0.0)
+        except Exception:
+            pass
         
         # Сброс счетчиков
         self._sweep_count = 0

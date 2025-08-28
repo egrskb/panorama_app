@@ -800,9 +800,19 @@ static int setup_global_spectrum_grid(MasterContext* m, double f_start_hz, doubl
     double span_hz = f_stop_hz - f_start_hz;
     if (span_hz <= 0.0) return -1;
 
+    // Базовые расчёты по желаемому шагу
     size_t points = (size_t)floor(span_hz / freq_step_hz + 1.0);
     if (points < 2) points = 2;
-    if (points > MAX_SPECTRUM_POINTS) points = MAX_SPECTRUM_POINTS;
+
+    // Если требуемых точек больше лимита — увеличиваем эффективный шаг так,
+    // чтобы поместить весь диапазон в MAX_SPECTRUM_POINTS точек.
+    double eff_step_hz = freq_step_hz;
+    if (points > MAX_SPECTRUM_POINTS) {
+        if (MAX_SPECTRUM_POINTS > 1) {
+            eff_step_hz = span_hz / (double)(MAX_SPECTRUM_POINTS - 1);
+        }
+        points = MAX_SPECTRUM_POINTS;
+    }
 
     m->spectrum_points = points;
     m->spectrum_freqs  = (double*)malloc(points * sizeof(double));
@@ -822,15 +832,18 @@ static int setup_global_spectrum_grid(MasterContext* m, double f_start_hz, doubl
 
     // ВАЖНО: Инициализируем правильными значениями
     for (size_t i = 0; i < points; ++i) {
-        m->spectrum_freqs[i]  = f_start_hz + (double)i * freq_step_hz;
+        m->spectrum_freqs[i]  = f_start_hz + (double)i * eff_step_hz;
         m->spectrum_powers[i] = -120.0f;  // Начальное значение шумового пола
         m->spectrum_counts[i] = 0;
     }
 
     pthread_mutex_init(&m->spectrum_mutex, NULL);
-    
+
+    // Обновляем эффективный шаг в контексте (важно для внешнего кода)
+    m->freq_step_hz = eff_step_hz;
+
     fprintf(stdout, "[HackRF Master] Spectrum grid initialized: %.1f-%.1f MHz, %zu points, step=%.3f MHz\n",
-            f_start_hz/1e6, f_stop_hz/1e6, points, freq_step_hz/1e6);
+            f_start_hz/1e6, f_stop_hz/1e6, points, eff_step_hz/1e6);
     
     return 0;
 }
@@ -906,6 +919,12 @@ int hq_get_master_spectrum(double* freqs_hz, float* powers_dbm, int max_points) 
     memcpy(powers_dbm, g_master->spectrum_powers, sizeof(float)  * n);
     pthread_mutex_unlock(&g_master->spectrum_mutex);
     return n;
+}
+
+// Возвращает фактическую ширину бина (Гц) текущего глобального спектра
+double hq_get_fft_bin_hz(void) {
+    if (!g_master) return 0.0;
+    return g_master->freq_step_hz;
 }
 
 // ================== Настройки обработки ==================

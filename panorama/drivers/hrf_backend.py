@@ -115,18 +115,19 @@ class HackRFQSABackend(SourceBackend):
             // Основные функции
             int  hq_open(const char* serial_suffix);
             void hq_close(void);
+            const char* hq_last_error(void);
             int  hq_configure(double f_start_mhz, double f_stop_mhz, double bin_hz,
                               int lna_db, int vga_db, int amp_on);
             int  hq_start_no_cb(void);
             int  hq_stop(void);
-            const char* hq_last_error(void);
             
-            // ВАЖНО: Функция чтения спектра
+            // Доступ к спектру
             int  hq_get_master_spectrum(double* freqs_hz, float* powers_dbm, int max_points);
+            double hq_get_fft_bin_hz(void);
             
+            // Настройки
             void hq_set_ema_alpha(float alpha);
-            void hq_set_detector_params(float threshold_offset_db, int min_width_bins,
-                                       int min_sweeps, float timeout_sec);
+            void hq_set_detector_params(float threshold_offset_db, int min_width_bins, int min_sweeps, float timeout_sec);
             int  hq_set_segment_mode(int mode);
             int  hq_get_segment_mode(void);
             int  hq_set_fft_size(int size);
@@ -142,7 +143,7 @@ class HackRFQSABackend(SourceBackend):
             int  hq_enable_calibration(int enable);
             int  hq_get_calibration_status(void);
             
-            // Перечисление устройств
+            // Диспетчер устройств
             int  hq_device_count(void);
             int  hq_get_device_serial(int idx, char* out, int cap);
         """)
@@ -225,8 +226,22 @@ class HackRFQSABackend(SourceBackend):
             return
         
         # Настраиваем частотное сглаживание
-        self._lib.hq_set_freq_smoothing(1, 5)  # Включено, окно 5 бинов
+        try:
+            if hasattr(self._lib, 'hq_set_freq_smoothing'):
+                self._lib.hq_set_freq_smoothing(1, 5)  # Включено, окно 5 бинов
+        except Exception as e:
+            self._emit_status(f"hq_set_freq_smoothing unavailable: {e}")
         self._lib.hq_set_ema_alpha(self._ema_alpha)
+        
+        # Выравниваем размер буферов Python под фактический шаг бина из C,
+        # чтобы корректно читать полный диапазон без рассинхронизации
+        try:
+            eff_step_hz = float(self._lib.hq_get_fft_bin_hz())
+            if eff_step_hz > 0:
+                freq_range = self._c_freq_stop_hz - self._c_freq_start_hz
+                self._spectrum_points = min(100000, int(freq_range / eff_step_hz) + 1)
+        except Exception:
+            pass
         
         # Запускаем worker для чтения спектра
         self._worker = _MasterWorker(self, config)
@@ -236,7 +251,21 @@ class HackRFQSABackend(SourceBackend):
         
         self._running = True
         self.started.emit()
-        self._emit_status(f"HackRF Master started: {self._user_freq_start_hz/1e6:.1f}-{self._user_freq_stop_hz/1e6:.1f} MHz")
+        # Попробуем запросить фактический шаг и количество точек для логов
+        try:
+            eff_step_hz = float(self._lib.hq_get_fft_bin_hz())
+        except Exception:
+            eff_step_hz = 0.0
+        if eff_step_hz > 0:
+            est_points = int(((self._c_freq_stop_hz - self._c_freq_start_hz) / eff_step_hz) + 1)
+            self._emit_status(
+                f"HackRF Master started: {self._user_freq_start_hz/1e6:.1f}-{self._user_freq_stop_hz/1e6:.1f} MHz, "
+                f"effective bin={eff_step_hz/1e3:.1f} kHz, ~points={est_points}"
+            )
+        else:
+            self._emit_status(
+                f"HackRF Master started: {self._user_freq_start_hz/1e6:.1f}-{self._user_freq_stop_hz/1e6:.1f} MHz"
+            )
     
     def stop(self):
         """Останавливает sweep и закрывает устройство."""
@@ -366,6 +395,29 @@ class HackRFQSABackend(SourceBackend):
             mask = (freqs_hz >= self._user_freq_start_hz) & (freqs_hz <= self._user_freq_stop_hz)
             filtered_freqs = freqs_hz[mask]
             filtered_power = power_dbm[mask]
+
+            # Лёгкое подавление DC offset/спайков: обнулим центральный бин каждого 20-МГц сегмента
+            # (HackRF sweep шаг тюнера 20 МГц). Находим позиции кратные 20 МГц относительно нижней границы.
+            try:
+                if filtered_freqs.size > 5:
+                    f0 = float(self._c_freq_start_hz)
+                    # индексы бинов, близкие к границам 20-МГц окон (±один бин)
+                    seg_pos = np.round((filtered_freqs - f0) / 20e6)
+                    anchors = f0 + seg_pos * 20e6
+                    close = np.isclose(filtered_freqs, anchors, rtol=0.0, atol=max(1.0, np.median(np.diff(filtered_freqs))))
+                    if np.any(close):
+                        # заменим значения на локальную медиану соседей
+                        fp = filtered_power.copy()
+                        idx = np.where(close)[0]
+                        for i in idx:
+                            l = max(0, i-3)
+                            r = min(filtered_power.size, i+4)
+                            neigh = np.delete(filtered_power[l:r], np.where(np.arange(l,r)==i-l))
+                            if neigh.size > 0:
+                                fp[i] = float(np.median(neigh))
+                        filtered_power = fp
+            except Exception:
+                pass
             
             if len(filtered_freqs) > 0:
                 # Эмитим отфильтрованные данные

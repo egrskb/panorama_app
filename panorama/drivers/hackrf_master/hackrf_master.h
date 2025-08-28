@@ -63,6 +63,8 @@ int  hq_stop(void);
 
 // --- Доступ к спектру (EMA-сетка) ---
 int  hq_get_master_spectrum(double* freqs_hz, float* powers_dbm, int max_points);
+// Возвращает фактическую ширину бина (шаг сетки) в Гц
+double hq_get_fft_bin_hz(void);
 
 // --- Настройки обработки ---
 void hq_set_ema_alpha(float alpha);
