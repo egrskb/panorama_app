@@ -150,24 +150,8 @@ class OpenLayersMapWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         
-        # Панель управления
+        # Панель управления (без переключателя режимов — режимы доступны на самой карте)
         control_panel = QHBoxLayout()
-        
-        # Выбор режима карты
-        self.mode_label = QLabel("Режим:")
-        control_panel.addWidget(self.mode_label)
-        
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems([
-            "Детекция",
-            "Трекинг",
-            "Тепловая карта",
-            "Покрытие",
-            "RSSI уровни"
-        ])
-        self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
-        control_panel.addWidget(self.mode_combo)
-        
         control_panel.addStretch()
         
         # Кнопки управления
@@ -225,15 +209,9 @@ class OpenLayersMapWidget(QWidget):
     
     def _on_mode_changed(self, mode_text: str):
         """Изменение режима карты."""
-        mode_map = {
-            "Детекция": "detection",
-            "Трекинг": "tracking",
-            "Тепловая карта": "heatmap",
-            "Покрытие": "coverage",
-            "RSSI уровни": "rssi"
-        }
+        mode_map = {"Тепловая карта": "heatmap", "RSSI уровни": "rssi"}
         
-        mode = mode_map.get(mode_text, "detection")
+        mode = mode_map.get(mode_text, "heatmap")
         self._current_mode = mode
         
         if self._page_loaded:
@@ -257,16 +235,13 @@ class OpenLayersMapWidget(QWidget):
     def update_stations_from_config(self, config: Dict):
         """Обновляет позиции станций из конфигурации."""
         try:
-            # Slave0 всегда в центре
-            self._stations['slave0'] = (0.0, 0.0, 0.0)
-            
-            # Обновляем позиции других slaves
+            # Формируем список станций строго по конфигурации (без заглушек)
+            self._stations = {}
             if 'slaves' in config:
                 for idx, slave in enumerate(config['slaves']):
-                    slave_id = slave.get('nickname', f'slave{idx+1}')
+                    slave_id = slave.get('nickname') or slave.get('label') or slave.get('serial') or f'slave{idx}'
                     pos = slave.get('pos', [0.0, 0.0, 0.0])
                     if len(pos) >= 2:
-                        # Относительно Slave0
                         self._stations[slave_id] = (
                             float(pos[0]),
                             float(pos[1]),
@@ -390,7 +365,7 @@ class OpenLayersMapWidget(QWidget):
     def center_on_slave0(self):
         """Центрирует карту на Slave0."""
         if self._page_loaded:
-            js_code = "if (window.mapAPI) { window.mapAPI.centerOnStation('slave0'); }"
+            js_code = "if (window.mapAPI) { window.mapAPI.centerOnStation('slave0'); } else { if (window.mapAPI && window.mapAPI.centerOnOrigin) { window.mapAPI.centerOnOrigin(); } }"
             self._web_view.page().runJavaScript(js_code)
     
     def center_on_station(self, station_id: str):

@@ -181,7 +181,10 @@ class SpectrumModel(QObject if _HAS_QT else object):
         self.freqs_hz: np.ndarray = np.array([], dtype=np.float32)
         self.power_dbm: np.ndarray = np.array([], dtype=np.float32)
 
+        # Для обратной совместимости сохраняем deque, но основным буфером водопада
+        # делаем фиксированную матрицу, как в прототипе.
         self.waterfall: deque[np.ndarray] = deque(maxlen=self._rows_limit)
+        self.water: np.ndarray | None = None  # (rows, n_bins)
         self._last_row: Optional[np.ndarray] = None
 
         # Загружаем параметры детектора из настроек
@@ -213,8 +216,11 @@ class SpectrumModel(QObject if _HAS_QT else object):
 
         # Сбрасываем текущие данные
         self.power_dbm = np.full_like(self.freqs_hz, -120.0, dtype=np.float32)
-        self.waterfall.clear()
         self._last_row = None
+
+        # Буферы водопада: совместимость и основная матрица
+        self.waterfall = deque(maxlen=self._rows_limit)
+        self.water = np.full((self._rows_limit, n_bins), -120.0, dtype=np.float32)
 
         self._emit_spectrum()
         self._emit_waterfall()
@@ -241,6 +247,7 @@ class SpectrumModel(QObject if _HAS_QT else object):
         self.freqs_hz = np.array([], dtype=np.float32)
         self.power_dbm = np.array([], dtype=np.float32)
         self.waterfall.clear()
+        self.water = None
         self._last_row = None
         self._emit_spectrum()
         self._emit_waterfall()
@@ -306,7 +313,29 @@ class SpectrumModel(QObject if _HAS_QT else object):
         if row.ndim != 1 or row.size != self.freqs_hz.size:
             return
         self._last_row = row
-        self.waterfall.append(row)
+        # Совместимость: поддерживаем deque
+        self.waterfall.append(row.copy())
+        # Основной путь: матрица водопада со сдвигом
+        if self.water is not None and self.water.shape[1] == row.size:
+            self.water[:-1, :] = self.water[1:, :]
+            self.water[-1, :] = row
+        self._emit_waterfall()
+
+    # --- Реализация как в прототипе ---
+    def append_row(self, row_dbm: np.ndarray) -> None:
+        """Добавляет строку в водопад (матрица со сдвигом), обновляет last_row/power_dbm."""
+        if self.water is None or self.freqs_hz.size == 0:
+            return
+        row = np.asarray(row_dbm, dtype=np.float32)
+        if row.ndim != 1 or row.size != self.freqs_hz.size:
+            return
+        self._last_row = row
+        self.power_dbm = row.copy()
+        # Сдвиг и запись последней строки
+        self.water[:-1, :] = self.water[1:, :]
+        self.water[-1, :] = row
+        # Для совместимости также поддержим deque
+        self.waterfall.append(row.copy())
         self._emit_waterfall()
 
     def detect_peaks(self) -> List[DetectedPeak]:

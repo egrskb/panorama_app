@@ -249,13 +249,10 @@
 <body>
     <div id="map"></div>
     
-    <!-- Панель режимов карты -->
+    <!-- Панель режимов карты (упрощенная) -->
     <div class="map-modes">
         <div class="mode-title">Режимы карты</div>
-        <button class="mode-button active" onclick="setMapMode('detection')">🎯 Детекция</button>
-        <button class="mode-button" onclick="setMapMode('tracking')">📡 Трекинг</button>
-        <button class="mode-button" onclick="setMapMode('heatmap')">🔥 Тепловая карта</button>
-        <button class="mode-button" onclick="setMapMode('coverage')">📶 Покрытие</button>
+        <button class="mode-button active" onclick="setMapMode('heatmap')">🔥 Тепловая карта</button>
         <button class="mode-button" onclick="setMapMode('rssi')">📊 RSSI уровни</button>
     </div>
     
@@ -280,26 +277,7 @@
         </div>
     </div>
     
-    <!-- Легенда для дронов -->
-    <div class="drone-legend">
-        <div class="mode-title">Легенда</div>
-        <div class="legend-item">
-            <div class="legend-icon">🔴</div>
-            <span>Активный дрон</span>
-        </div>
-        <div class="legend-item">
-            <div class="legend-icon">🟡</div>
-            <span>Отслеживаемый</span>
-        </div>
-        <div class="legend-item">
-            <div class="legend-icon">🔵</div>
-            <span>SDR Slave</span>
-        </div>
-        <div class="legend-item">
-            <div class="legend-icon">⚪</div>
-            <span>История</span>
-        </div>
-    </div>
+    <!-- Легенда скрыта по требованию -->
     
     <!-- Статус детекции -->
     <div class="detection-status">
@@ -333,7 +311,7 @@
         });
         
         // Текущий режим отображения
-        let currentMapMode = 'detection';
+        let currentMapMode = 'heatmap';
         
         // Стили для различных режимов
         const mapStyles = {
@@ -539,39 +517,9 @@
         // ==================== Инициализация станций ====================
         
         function initializeStations() {
-            // Slave0 в центре (0, 0)
-            const slave0 = new ol.Feature({
-                geometry: new ol.geom.Point([0, 0]),
-                id: 'slave0',
-                name: 'Slave0 (Center)',
-                type: 'sdr_station'
-            });
-            
-            // Другие станции
-            const slave1 = new ol.Feature({
-                geometry: new ol.geom.Point([200, 200]),
-                id: 'slave1',
-                name: 'Slave1',
-                type: 'sdr_station'
-            });
-            
-            const slave2 = new ol.Feature({
-                geometry: new ol.geom.Point([-200, 200]),
-                id: 'slave2',
-                name: 'Slave2',
-                type: 'sdr_station'
-            });
-            
-            sources.stations.addFeatures([slave0, slave1, slave2]);
-            
-            // Добавляем круги дальности для каждой станции
-            [slave0, slave1, slave2].forEach(station => {
-                const coords = station.getGeometry().getCoordinates();
-                const rangeCircle = new ol.Feature({
-                    geometry: new ol.geom.Circle(coords, 300) // 300м радиус
-                });
-                sources.coverage.addFeature(rangeCircle);
-            });
+            // Не создаём станций по умолчанию. Ждём данные от Python.
+            sources.stations.clear();
+            sources.coverage.clear();
         }
         
         // ==================== WebChannel для связи с Python ====================
@@ -630,10 +578,27 @@
         }
         
         function updateStations(stations) {
-            // Обновляем позиции станций если нужно
+            // Пере-синхронизация списка станций: добавляем/обновляем те, что пришли,
+            // удаляем отсутствующие
+            const incomingIds = new Set(stations.map(s => s.id));
+            // Удаляем отсутствующие
+            sources.stations.getFeatures().forEach(f => {
+                if (!incomingIds.has(f.get('id'))) {
+                    sources.stations.removeFeature(f);
+                }
+            });
+            // Добавляем/обновляем
             stations.forEach(station => {
-                const feature = sources.stations.getFeatureById(station.id);
-                if (feature) {
+                let feature = sources.stations.getFeatureById(station.id);
+                if (!feature) {
+                    feature = new ol.Feature({
+                        geometry: new ol.geom.Point([station.x, station.y]),
+                        id: station.id,
+                        name: station.id,
+                        type: 'sdr_station'
+                    });
+                    sources.stations.addFeature(feature);
+                } else {
                     feature.getGeometry().setCoordinates([station.x, station.y]);
                 }
             });
@@ -688,22 +653,6 @@
             
             // Настраиваем видимость слоев
             switch(mode) {
-                case 'detection':
-                    layers.drones.setVisible(true);
-                    layers.trajectories.setVisible(true);
-                    layers.coverage.setVisible(false);
-                    layers.heatmap.setVisible(false);
-                    document.getElementById('current-mode').textContent = 'Детекция';
-                    break;
-                    
-                case 'tracking':
-                    layers.drones.setVisible(true);
-                    layers.trajectories.setVisible(true);
-                    layers.coverage.setVisible(false);
-                    layers.heatmap.setVisible(false);
-                    document.getElementById('current-mode').textContent = 'Трекинг';
-                    break;
-                    
                 case 'heatmap':
                     layers.drones.setVisible(false);
                     layers.trajectories.setVisible(false);
@@ -711,15 +660,7 @@
                     layers.heatmap.setVisible(true);
                     document.getElementById('current-mode').textContent = 'Тепловая карта';
                     break;
-                    
-                case 'coverage':
-                    layers.drones.setVisible(true);
-                    layers.trajectories.setVisible(false);
-                    layers.coverage.setVisible(true);
-                    layers.heatmap.setVisible(false);
-                    document.getElementById('current-mode').textContent = 'Покрытие';
-                    break;
-                    
+                
                 case 'rssi':
                     layers.drones.setVisible(true);
                     layers.trajectories.setVisible(false);
@@ -813,15 +754,20 @@
             },
             
             centerOnStation: function(stationId) {
+                const view = map.getView();
                 const feature = sources.stations.getFeatureById(stationId);
                 if (feature) {
                     const coords = feature.getGeometry().getCoordinates();
-                    map.getView().animate({
-                        center: coords,
-                        zoom: 16,
-                        duration: 500
-                    });
+                    view.animate({ center: coords, zoom: 16, duration: 500 });
+                } else {
+                    // Фолбэк: центрируемся на начале локальной системы координат
+                    view.setCenter([0, 0]);
                 }
+            },
+
+            centerOnOrigin: function() {
+                const view = map.getView();
+                view.animate({ center: [0, 0], duration: 500 });
             },
             
             getMapInfo: function() {

@@ -171,6 +171,11 @@ class TrilaterationCoordinator(QObject):
         # Останавливаем компоненты
         self.rssi_collector.stop()
         self.update_timer.stop()
+        try:
+            if self.rssi_collector.isRunning():
+                self.rssi_collector.wait(500)
+        except Exception:
+            pass
         
         # Очищаем состояние
         self.peak_manager.clear_watchlist()
@@ -187,13 +192,19 @@ class TrilaterationCoordinator(QObject):
             positions: Словарь {slave_id: (x, y, z)} в метрах
         """
         self.slave_positions = positions.copy()
+        # Гарантируем, что slave0 находится в (0,0,0)
+        if 'slave0' not in self.slave_positions:
+            self.slave_positions['slave0'] = (0.0, 0.0, 0.0)
+        else:
+            sx, sy, sz = self.slave_positions['slave0']
+            self.slave_positions['slave0'] = (0.0, 0.0, float(sz))
         
         # Обновляем в движке трилатерации
-        for slave_id, (x, y, z) in positions.items():
+        for slave_id, (x, y, z) in self.slave_positions.items():
             self.trilateration_engine.add_station(slave_id, x, y, z)
         
-        print(f"[Coordinator] Updated {len(positions)} slave positions")
-        self.status_message.emit(f"Обновлено позиций slave: {len(positions)}")
+        print(f"[Coordinator] Updated {len(self.slave_positions)} slave positions")
+        self.status_message.emit(f"Обновлено позиций slave: {len(self.slave_positions)}")
     
     def set_user_span(self, span_mhz: float):
         """Устанавливает пользовательский span для watchlist."""
@@ -285,6 +296,8 @@ class TrilaterationCoordinator(QObject):
         
         if result:
             print(f"[Coordinator] Position calculated: ({result.x:.1f}, {result.y:.1f}, {result.z:.1f}) m")
+            # транслируем наружу
+            self.target_detected.emit(result)
     
     def _on_target_calculated(self, result: TrilaterationResult):
         """Обработка вычисленной позиции цели."""

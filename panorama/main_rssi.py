@@ -18,10 +18,10 @@ from PyQt5.QtWidgets import QSplitter, QFrame, QMessageBox, QFileDialog, QFormLa
 import numpy as np
 
 # Импортируем наши модули
-from panorama.features.spectrum.master import MasterSweepController
-from panorama.features.slave_sdr.slave import SlaveManager
+from panorama.features.spectrum.master_adapter import MasterSourceAdapter
+from panorama.features.slave_controller.slave import SlaveManager
 from panorama.features.trilateration import RSSITrilaterationEngine
-from panorama.features.orchestrator.core import Orchestrator
+from panorama.features.slave_controller.orchestrator import Orchestrator
 from panorama.features.calibration.manager import CalibrationManager
 
 # Импортируем существующие модули для совместимости
@@ -31,8 +31,10 @@ from panorama.features.settings.dialog import SettingsDialog
 from panorama.features.settings.manager_improved import ImprovedDeviceManagerDialog
 from panorama.features.settings.storage import load_sdr_settings, save_sdr_settings
 from panorama.features.spectrum.master_adapter import MasterSourceAdapter
-from panorama.features.detector.settings_dialog import DetectorSettingsDialog, DetectorSettings
-from panorama.features.slaves import ImprovedSlavesView
+from panorama.features.detector.settings_dialog import (
+    DetectorSettingsDialog, DetectorSettings, load_detector_settings, apply_settings_to_watchlist_manager
+)
+from panorama.features.watchlist.view import ImprovedSlavesView
 from panorama.features.detector.peak_watchlist_manager import PeakWatchlistManager
 from panorama.features.trilateration.coordinator import TrilaterationCoordinator
 
@@ -106,8 +108,8 @@ class RSSIPanoramaMainWindow(QMainWindow):
             # Менеджер slave SDR
             self.slave_manager = SlaveManager(self.log)
             
-            # Контроллер Master sweep
-            self.master_controller = MasterSweepController()
+            # Контроллер Master sweep больше не используется напрямую
+            self.master_controller = None
             
             # Оркестратор
             self.orchestrator = Orchestrator(self.log)
@@ -128,6 +130,19 @@ class RSSIPanoramaMainWindow(QMainWindow):
             
             # Подключаем координатор трилатерации к оркестратору
             self.orchestrator.set_trilateration_coordinator(self.trilateration_coordinator)
+
+            # Применяем сохранённые настройки детектора к менеджеру пиков и оркестратору
+            try:
+                det_settings = load_detector_settings()
+                if det_settings:
+                    apply_settings_to_watchlist_manager(det_settings, self.trilateration_coordinator.peak_manager)
+                    self.orchestrator.set_global_parameters(
+                        span_hz=det_settings.watchlist_span_mhz * 1e6,
+                        dwell_ms=int(det_settings.watchlist_dwell_ms)
+                    )
+                    self.trilateration_coordinator.set_user_span(float(det_settings.watchlist_span_mhz))
+            except Exception:
+                pass
             
             # Загружаем настройки SDR (master/slaves) из JSON
             self.sdr_settings = load_sdr_settings()
@@ -287,6 +302,11 @@ class RSSIPanoramaMainWindow(QMainWindow):
                     if self.orchestrator:
                         self.orchestrator.set_global_parameters(span_hz=s.watchlist_span_mhz * 1e6,
                                                                 dwell_ms=int(s.watchlist_dwell_ms))
+                    if self.trilateration_coordinator:
+                        self.trilateration_coordinator.set_user_span(float(s.watchlist_span_mhz))
+                    # Применяем параметры детектора к менеджеру пиков
+                    if self.trilateration_coordinator:
+                        apply_settings_to_watchlist_manager(s, self.trilateration_coordinator.peak_manager)
                 except Exception:
                     pass
             dlg.settingsChanged.connect(_on_changed)
@@ -315,10 +335,9 @@ class RSSIPanoramaMainWindow(QMainWindow):
         
         # Вкладка спектра
         self.spectrum_view = SpectrumView(orchestrator=self.orchestrator)
-        # Привязываем источник к мастеру через адаптер, чтобы старт сразу запускал C-свип
+        # Привязываем источник через адаптер, чтобы старт сразу запускал C-свип
         try:
-            if self.master_controller:
-                self.spectrum_view.set_source(MasterSourceAdapter(self.log))
+            self.spectrum_view.set_source(MasterSourceAdapter(self.log))
         except Exception:
             pass
         tab_widget.addTab(self.spectrum_view, "📊 Спектр")
@@ -392,12 +411,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def _create_toolbar(self):
         """Создает панель инструментов."""
         toolbar = self.addToolBar('Основная панель')
-        
-        # Кнопка старт/стоп оркестратора
-        self.toolbar_orch_action = toolbar.addAction('▶ Контроль')
-        self.toolbar_orch_action.triggered.connect(self._toggle_orchestrator)
-        
-        toolbar.addSeparator()
+        # Убираем кнопку управления оркестратором — управление автоматически при наличии 1 master + >=2 slaves
         
         # Только новый диспетчер устройств
         toolbar.addAction('🧭 Диспетчер устройств', self._open_device_manager)
@@ -993,6 +1007,13 @@ class RSSIPanoramaMainWindow(QMainWindow):
         self.spectrum_view.newRowReady.connect(
             self.trilateration_coordinator.process_master_spectrum
         )
+        # Пересылка задач watchlist в оркестратор для измерений слейвами
+        try:
+            self.trilateration_coordinator.peak_manager.watchlist_task_ready.connect(
+                self.orchestrator.enqueue_watchlist_task
+            )
+        except Exception as e:
+            self.log.error(f"Failed to connect watchlist tasks: {e}")
         
         # Обновления позиций slave из настроек
         self.trilateration_coordinator.set_slave_positions({
@@ -1009,11 +1030,47 @@ class RSSIPanoramaMainWindow(QMainWindow):
         # self.trilateration_coordinator.target_updated.connect(
         #     self.map_view.update_target_position
         # )
+        # Подписка карты на живой список слейвов
+        try:
+            if self.slave_manager and hasattr(self.slave_manager, 'slaves_updated'):
+                def _on_slaves_updated(status: dict):
+                    # Преобразуем в список станций
+                    stations = []
+                    for sid, st in status.items():
+                        pos = (0.0, 0.0, 0.0)
+                        for cfg in self.sdr_settings.get('slaves', []):
+                            cid = cfg.get('nickname') or cfg.get('label') or cfg.get('serial')
+                            if cid == sid:
+                                p = cfg.get('pos', [0.0, 0.0, 0.0])
+                                if len(p) >= 2:
+                                    pos = (float(p[0]), float(p[1]), float(p[2]) if len(p) > 2 else 0.0)
+                                break
+                        stations.append({'id': sid, 'x': pos[0], 'y': pos[1], 'z': pos[2]})
+                    # Обновляем карту
+                    try:
+                        self.map_view.update_stations_from_config({'slaves': [{'nickname': s['id'], 'pos': [s['x'], s['y'], s['z']]} for s in stations]})
+                    except Exception:
+                        pass
+                self.slave_manager.slaves_updated.connect(_on_slaves_updated)
+                # Инициализация: отразить отсутствие слейвов
+                self.slave_manager.slaves_updated.emit(self.slave_manager.get_slave_status())
+        except Exception:
+            pass
+        # Запуск координатора
+        try:
+            self.trilateration_coordinator.start()
+        except Exception as e:
+            self.log.error(f"Failed to start TrilaterationCoordinator: {e}")
     
     def closeEvent(self, event):
         """Обрабатывает закрытие приложения."""
         try:
             # Останавливаем все компоненты в правильном порядке
+            if hasattr(self, 'trilateration_coordinator') and self.trilateration_coordinator:
+                try:
+                    self.trilateration_coordinator.stop()
+                except Exception:
+                    pass
             if self.master_controller:
                 self.master_controller.stop_sweep()
                 self.master_controller.cleanup()

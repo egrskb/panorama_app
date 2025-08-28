@@ -102,17 +102,15 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         basic_tab = self._create_basic_tab()
         tabs.addTab(basic_tab, "Основные")
         
-        # Вкладка порогов
+        # Вкладка параметров (ранее: Пороги)
         threshold_tab = self._create_threshold_tab()
-        tabs.addTab(threshold_tab, "Пороги")
+        tabs.addTab(threshold_tab, "Параметры")
         
         # Вкладка параметров для Slave
         slave_tab = self._create_slave_tab()
         tabs.addTab(slave_tab, "Slave Watchlist")
         
-        # Вкладка фильтров частот
-        filter_tab = self._create_filter_tab()
-        tabs.addTab(filter_tab, "Фильтры частот")
+        # Удаляем вкладку фильтров частот (сканируем весь мастер-диапазон)
         
         layout.addWidget(tabs)
         
@@ -162,29 +160,6 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         # Разделитель
         layout.addRow(QtWidgets.QLabel())
         
-        # Временные параметры
-        layout.addRow(QtWidgets.QLabel("<b>Временные параметры:</b>"))
-        
-        self.spin_peak_timeout = QtWidgets.QDoubleSpinBox()
-        self.spin_peak_timeout.setRange(1.0, 60.0)
-        self.spin_peak_timeout.setValue(self.settings.peak_timeout_sec)
-        self.spin_peak_timeout.setSuffix(" сек")
-        self.spin_peak_timeout.setToolTip("Время, после которого неактивный пик удаляется")
-        layout.addRow("Таймаут пика:", self.spin_peak_timeout)
-        
-        self.spin_measurement_interval = QtWidgets.QDoubleSpinBox()
-        self.spin_measurement_interval.setRange(0.1, 10.0)
-        self.spin_measurement_interval.setValue(self.settings.measurement_interval_sec)
-        self.spin_measurement_interval.setSuffix(" сек")
-        self.spin_measurement_interval.setToolTip("Интервал между измерениями RSSI")
-        layout.addRow("Интервал измерений:", self.spin_measurement_interval)
-        
-        self.spin_confirmation_sweeps = QtWidgets.QSpinBox()
-        self.spin_confirmation_sweeps.setRange(1, 10)
-        self.spin_confirmation_sweeps.setValue(self.settings.min_confirmation_sweeps)
-        self.spin_confirmation_sweeps.setToolTip("Минимум свипов для подтверждения пика")
-        layout.addRow("Подтверждение:", self.spin_confirmation_sweeps)
-        
         # Информация
         info_label = QtWidgets.QLabel(
             "<i>Детектор автоматически обнаруживает пики в спектре от Master sweep "
@@ -215,6 +190,13 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         mode_layout.addWidget(self.radio_adaptive)
         mode_layout.addWidget(self.radio_fixed)
         layout.addWidget(mode_group)
+        # Пояснение
+        mode_info = QtWidgets.QLabel(
+            "<i>Адаптивный: порог вычисляется как baseline + offset. \n"
+            "Фиксированный: используется заданное значение в дБм независимо от окружения.</i>"
+        )
+        mode_info.setWordWrap(True)
+        layout.addWidget(mode_info)
         
         # Параметры адаптивного порога
         adaptive_group = QtWidgets.QGroupBox("Адаптивный порог")
@@ -226,6 +208,9 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         self.spin_baseline_offset.setSuffix(" дБ")
         self.spin_baseline_offset.setToolTip("Порог = baseline + это значение")
         adaptive_layout.addRow("Offset над baseline:", self.spin_baseline_offset)
+        adaptive_expl = QtWidgets.QLabel("<i>Насколько выше шумового пола (baseline) должен быть сигнал, чтобы считаться кандидатом.</i>")
+        adaptive_expl.setWordWrap(True)
+        adaptive_layout.addRow("", adaptive_expl)
         
         adaptive_info = QtWidgets.QLabel(
             "<i>Baseline вычисляется как медиана последних N свипов. "
@@ -246,6 +231,9 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         self.spin_fixed_threshold.setValue(self.settings.fixed_threshold_dbm)
         self.spin_fixed_threshold.setSuffix(" дБм")
         fixed_layout.addRow("Порог:", self.spin_fixed_threshold)
+        fixed_expl = QtWidgets.QLabel("<i>Абсолютный уровень мощности, при превышении которого считается, что есть сигнал.</i>")
+        fixed_expl.setWordWrap(True)
+        fixed_layout.addRow("", fixed_expl)
         
         layout.addWidget(fixed_group)
         
@@ -259,6 +247,9 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         self.spin_min_snr.setSuffix(" дБ")
         self.spin_min_snr.setToolTip("Минимальное отношение сигнал/шум для детекции")
         detection_layout.addRow("Минимальный SNR:", self.spin_min_snr)
+        lbl_snr = QtWidgets.QLabel("<i>Минимальная разница между пиковым уровнем и baseline для учета пика (в дБ).</i>")
+        lbl_snr.setWordWrap(True)
+        detection_layout.addRow("", lbl_snr)
         
         self.spin_min_width = QtWidgets.QSpinBox()
         self.spin_min_width.setRange(1, 20)
@@ -266,6 +257,9 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         self.spin_min_width.setSuffix(" бинов")
         self.spin_min_width.setToolTip("Минимальная ширина пика в бинах")
         detection_layout.addRow("Минимальная ширина:", self.spin_min_width)
+        lbl_width = QtWidgets.QLabel("<i>Минимальное число соседних бинов над порогом, чтобы регион считался сигналом.</i>")
+        lbl_width.setWordWrap(True)
+        detection_layout.addRow("", lbl_width)
         
         self.spin_min_distance = QtWidgets.QSpinBox()
         self.spin_min_distance.setRange(1, 50)
@@ -273,6 +267,23 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         self.spin_min_distance.setSuffix(" бинов")
         self.spin_min_distance.setToolTip("Минимальное расстояние между пиками")
         detection_layout.addRow("Минимальное расстояние:", self.spin_min_distance)
+        lbl_dist = QtWidgets.QLabel("<i>Минимальный зазор между пиками (в бинах), чтобы они не сливались в один.</i>")
+        lbl_dist.setWordWrap(True)
+        detection_layout.addRow("", lbl_dist)
+
+        # Подтверждение детекции (перенесено сюда из Основных)
+        confirm_group = QtWidgets.QGroupBox("Подтверждение")
+        confirm_layout = QtWidgets.QFormLayout(confirm_group)
+        self.spin_confirmation_sweeps = QtWidgets.QSpinBox()
+        self.spin_confirmation_sweeps.setRange(1, 10)
+        self.spin_confirmation_sweeps.setValue(self.settings.min_confirmation_sweeps)
+        self.spin_confirmation_sweeps.setSuffix(" свипов")
+        self.spin_confirmation_sweeps.setToolTip("Сколько свипов подряд сигнал должен наблюдаться для подтверждения")
+        confirm_layout.addRow("Свипов для подтверждения:", self.spin_confirmation_sweeps)
+        lbl_conf = QtWidgets.QLabel("<i>Значение повышает надежность детекции, уменьшая ложные пуски.</i>")
+        lbl_conf.setWordWrap(True)
+        confirm_layout.addRow("", lbl_conf)
+        layout.addWidget(confirm_group)
         
         layout.addWidget(detection_group)
         layout.addStretch()
@@ -297,6 +308,9 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         self.spin_watchlist_span.setSuffix(" МГц")
         self.spin_watchlist_span.setToolTip("Ширина полосы для измерения RSSI на Slave (рекомендуется 2-5 МГц)")
         watchlist_layout.addRow("Span для RSSI:", self.spin_watchlist_span)
+        lbl_span = QtWidgets.QLabel("<i>Полная ширина диапазона вокруг пика, где Slaves измеряют среднеквадратичный RSSI.</i>")
+        lbl_span.setWordWrap(True)
+        watchlist_layout.addRow("", lbl_span)
         
         self.spin_watchlist_dwell = QtWidgets.QSpinBox()
         self.spin_watchlist_dwell.setRange(10, 1000)
@@ -304,12 +318,18 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         self.spin_watchlist_dwell.setSuffix(" мс")
         self.spin_watchlist_dwell.setToolTip("Время накопления для измерения RSSI")
         watchlist_layout.addRow("Dwell time:", self.spin_watchlist_dwell)
+        lbl_dwell = QtWidgets.QLabel("<i>Время накопления в каждой частотной полосе для усреднения RSSI.</i>")
+        lbl_dwell.setWordWrap(True)
+        watchlist_layout.addRow("", lbl_dwell)
         
         self.spin_max_watchlist = QtWidgets.QSpinBox()
         self.spin_max_watchlist.setRange(1, 100)
         self.spin_max_watchlist.setValue(self.settings.max_watchlist_size)
         self.spin_max_watchlist.setToolTip("Максимальное количество целей в watchlist")
         watchlist_layout.addRow("Макс. размер списка:", self.spin_max_watchlist)
+        lbl_max = QtWidgets.QLabel("<i>Максимальное число одновременно отслеживаемых целей (последние имеют приоритет).</i>")
+        lbl_max.setWordWrap(True)
+        watchlist_layout.addRow("", lbl_max)
         
         layout.addWidget(watchlist_group)
         
@@ -584,19 +604,27 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         self.spin_watchlist_dwell.setValue(self.settings.watchlist_dwell_ms)
         self.spin_max_watchlist.setValue(self.settings.max_watchlist_size)
         
-        # Временные параметры
-        self.spin_peak_timeout.setValue(self.settings.peak_timeout_sec)
-        self.spin_measurement_interval.setValue(self.settings.measurement_interval_sec)
+        # Временные параметры (таймаут/интервал убраны из UI — сохраняем только подтверждение)
         self.spin_confirmation_sweeps.setValue(self.settings.min_confirmation_sweeps)
         
-        # Фильтры
-        self._load_filters()
+        # Фильтры отключены – сканируем весь мастер-диапазон
         
         # Обновляем визуализацию
         self._update_example_plot()
     
     def _gather_settings(self) -> DetectorSettings:
         """Собирает настройки из UI."""
+        freq_ranges = []
+        excl_ranges = []
+        try:
+            if hasattr(self, 'include_table') and self.include_table is not None:
+                freq_ranges = self._get_ranges_from_table(self.include_table)
+            if hasattr(self, 'exclude_table') and self.exclude_table is not None:
+                excl_ranges = self._get_ranges_from_table(self.exclude_table)
+        except Exception:
+            freq_ranges = []
+            excl_ranges = []
+
         s = DetectorSettings(
             enabled=self.chk_enabled.isChecked(),
             auto_start=self.chk_auto_start.isChecked(),
@@ -609,11 +637,12 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
             watchlist_span_mhz=self.spin_watchlist_span.value(),
             watchlist_dwell_ms=int(self.spin_watchlist_dwell.value()),
             max_watchlist_size=int(self.spin_max_watchlist.value()),
-            peak_timeout_sec=self.spin_peak_timeout.value(),
-            measurement_interval_sec=self.spin_measurement_interval.value(),
+            # Таймаут и интервал остаются прежними (не редактируются в UI)
+            peak_timeout_sec=self.settings.peak_timeout_sec,
+            measurement_interval_sec=self.settings.measurement_interval_sec,
             min_confirmation_sweeps=int(self.spin_confirmation_sweeps.value()),
-            frequency_ranges=self._get_ranges_from_table(self.include_table),
-            exclude_ranges=self._get_ranges_from_table(self.exclude_table),
+            frequency_ranges=freq_ranges,
+            exclude_ranges=excl_ranges,
         )
         return s
     

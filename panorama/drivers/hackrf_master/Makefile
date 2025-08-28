@@ -31,7 +31,7 @@ $(TARGET): $(OBJECT)
 # Компиляция объектного файла
 $(OBJECT): $(SOURCE) $(HEADER)
 	@echo "Компиляция $(SOURCE)..."
-	$(CC) -c $(SOURCE) -o $@ $(HACKRF_CFLAGS) $(FFTW_CFLAGS)
+	$(CC) -c -fPIC $(SOURCE) -o $@ $(HACKRF_CFLAGS) $(FFTW_CFLAGS)
 
 # Установка
 install: $(TARGET)

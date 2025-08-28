@@ -14,8 +14,6 @@ from PyQt5 import QtCore
 
 # наш backend
 from panorama.drivers.hrf_backend import HackRFQSABackend, SweepConfig
-# контроллер поиска пиков
-from panorama.features.spectrum.master import MasterSweepController
 
 
 class MasterSourceAdapter(QtCore.QObject):
@@ -42,7 +40,7 @@ class MasterSourceAdapter(QtCore.QObject):
         else:
             self.log = None
         self.backend: Optional[HackRFQSABackend] = None
-        self.master: Optional[MasterSweepController] = None
+        self.master = None
         self.running: bool = False
         
         # Загружаем настройки SDR
@@ -66,21 +64,12 @@ class MasterSourceAdapter(QtCore.QObject):
             # Создаем backend
             self.backend = HackRFQSABackend(logger=self.log)
             
-            # Создаем master controller
-            self.master = MasterSweepController(self)
-            
             # ВАЖНО: Правильно подключаем сигналы backend'а
             self.backend.fullSweepReady.connect(self._on_full_sweep_from_backend)
             self.backend.error.connect(self._relay_error)
             self.backend.status.connect(self._relay_status)
             self.backend.started.connect(self._on_backend_started)
             self.backend.finished.connect(self._on_backend_stopped)
-            
-            # Подключаем сигналы master controller'а
-            self.master.spectrumReady.connect(self._on_master_spectrum)
-            self.master.peak_detected.connect(self._on_peak_detected)
-            self.master.status.connect(self._relay_status)
-            self.master.error.connect(self._relay_error)
             
             # Запускаем backend
             self.backend.start(cfg)
@@ -101,8 +90,7 @@ class MasterSourceAdapter(QtCore.QObject):
             if self.backend:
                 self.backend.stop()
             self.running = False
-            if self.master:
-                self.master.stop()
+            # master контроллер больше не используется
             self.stopped.emit()
             self.finished.emit(0)  # Для совместимости
             self._relay_status("MasterSourceAdapter stopped")
@@ -119,10 +107,6 @@ class MasterSourceAdapter(QtCore.QObject):
             if not isinstance(dbm, np.ndarray):
                 dbm = np.array(dbm, dtype=np.float32)
             
-            # Обновляем master controller
-            if self.master:
-                self.master.handle_full_sweep(freqs, dbm)
-            
             # Эмитим для SpectrumView
             self.spectrumReady.emit(freqs, dbm)
             self.fullSweepReady.emit(freqs, dbm)  # Для совместимости
@@ -132,19 +116,7 @@ class MasterSourceAdapter(QtCore.QObject):
             import traceback
             traceback.print_exc()
     
-    @QtCore.pyqtSlot(object, object)
-    def _on_master_spectrum(self, freqs, dbm):
-        """Прокидывает спектр от master controller'а."""
-        try:
-            self.spectrumReady.emit(freqs, dbm)
-            self.fullSweepReady.emit(freqs, dbm)
-        except Exception as e:
-            self._relay_error(f"Error in _on_master_spectrum: {e}")
-    
-    @QtCore.pyqtSlot(object)
-    def _on_peak_detected(self, peak_obj):
-        """Прокидывает обнаруженный пик."""
-        self.peak_detected.emit(peak_obj)
+    # Пики детектируются только в detector/, адаптер их не формирует
     
     def _on_backend_started(self):
         """Обрабатывает запуск backend'а."""
@@ -174,3 +146,30 @@ class MasterSourceAdapter(QtCore.QObject):
             except Exception:
                 pass
         self.error.emit(msg)
+
+    # ───────────── runtime processing settings from GUI ─────────────
+    def set_freq_smoothing(self, enabled: bool, window_bins: int):
+        """Обновляет частотное сглаживание в C-бэкенде по настройкам GUI."""
+        try:
+            if self.backend and hasattr(self.backend, "_lib"):
+                w = int(window_bins)
+                if w < 1:
+                    w = 1
+                self.backend._lib.hq_set_freq_smoothing(1 if enabled else 0, w)
+                self._relay_status(f"Freq smoothing: {'on' if enabled else 'off'} (W={w})")
+        except Exception as e:
+            self._relay_error(f"Failed to set freq smoothing: {e}")
+
+    def set_ema_alpha(self, alpha: float):
+        """Обновляет коэффициент EMA в C-бэкенде по настройкам GUI."""
+        try:
+            if self.backend and hasattr(self.backend, "_lib"):
+                a = float(alpha)
+                if a < 0.01:
+                    a = 0.01
+                if a > 1.0:
+                    a = 1.0
+                self.backend._lib.hq_set_ema_alpha(a)
+                self._relay_status(f"EMA alpha set to {a:.2f}")
+        except Exception as e:
+            self._relay_error(f"Failed to set EMA alpha: {e}")

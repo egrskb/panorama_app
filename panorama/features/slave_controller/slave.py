@@ -194,6 +194,7 @@ class SlaveSDR(QObject):
 class SlaveManager(QObject):
     all_measurements_complete = pyqtSignal(list)  # List[RSSIMeasurement]
     measurement_error = pyqtSignal(str)
+    slaves_updated = pyqtSignal(dict)  # {slave_id: {"uri": str, "is_initialized": bool}}
 
     def __init__(self, logger: logging.Logger):
         super().__init__()
@@ -210,6 +211,7 @@ class SlaveManager(QObject):
             sl.measurement_error.connect(self._on_measurement_error)
             self.slaves[slave_id] = sl
             self.log.info(f"Added slave: {slave_id} ({uri})")
+            self._emit_slaves_updated()
             return True
         except Exception as e:
             self.log.error(f"Add slave failed: {e}")
@@ -220,6 +222,7 @@ class SlaveManager(QObject):
             if slave_id in self.slaves:
                 self.slaves[slave_id].close()
                 del self.slaves[slave_id]
+                self._emit_slaves_updated()
         except Exception as e:
             self.log.error(f"Remove slave error: {e}")
 
@@ -271,3 +274,16 @@ class SlaveManager(QObject):
                 self.shutdown()
             except Exception:
                 pass
+
+    def get_slave_status(self) -> Dict[str, Dict[str, object]]:
+        """Snapshot for UI/map: {id: {uri, is_initialized}}"""
+        out: Dict[str, Dict[str, object]] = {}
+        for sid, sl in self.slaves.items():
+            out[sid] = {"uri": sl.uri, "is_initialized": bool(sl.is_initialized)}
+        return out
+
+    def _emit_slaves_updated(self):
+        try:
+            self.slaves_updated.emit(self.get_slave_status())
+        except Exception:
+            pass

@@ -18,12 +18,13 @@ from PyQt5.QtCore import QTimer
 from panorama.drivers.base import SweepConfig, SourceBackend
 from panorama.features.spectrum.model import SpectrumModel
 from panorama.shared.palettes import get_colormap
+from panorama.features.spectrum.master_adapter import MasterSourceAdapter
 
 # Константы оптимизации для плавного отображения 50-6000 МГц
 # Адаптивное разрешение с авто-детализацией при зуме
 MIN_DISPLAY_COLS = 1024   # Минимум колонок для отображения (панорама)
 MAX_DISPLAY_COLS = 8192   # Максимум колонок для отображения (детализация)
-WATER_ROWS_DEFAULT = 100  # Строк водопада по умолчанию
+WATER_ROWS_DEFAULT = 400  # Строк водопада по умолчанию (как в прототипе)
 MAX_SPECTRUM_POINTS = 8192  # Максимум точек для линий спектра (увеличено для широких диапазонов)
 
 
@@ -32,7 +33,7 @@ class SDRConfig:
     def __init__(self):
         self.freq_start_mhz = 50.0
         self.freq_stop_mhz = 6000.0
-        self.bin_khz = 800.0  # Минимальный bin 800 кГц для производительности
+        self.bin_khz = 5.0  # Базовый bin 5 кГц
         self.lna_db = 24
         self.vga_db = 20
         self.amp_on = False
@@ -162,9 +163,17 @@ class SpectrumView(QtWidgets.QWidget):
         
         # Таймер обновления водопада
         self._update_timer = QtCore.QTimer(self)
-        self._update_timer.setInterval(100)
+        self._update_timer.setInterval(80)
         self._update_timer.timeout.connect(self._refresh_water)
         self._pending_water_update = False
+        
+        # Таймер короткой анимации «плавного опускания» водопада
+        self._wf_anim_timer = QtCore.QTimer(self)
+        self._wf_anim_timer.setInterval(16)  # ~60 FPS
+        self._wf_anim_timer.timeout.connect(self._wf_anim_step)
+        self._wf_anim_active = False
+        self._wf_anim_steps = 6
+        self._wf_anim_i = 0
         
         # Накопители для линий
         self._avg_queue: Deque[np.ndarray] = deque(maxlen=8)
@@ -182,6 +191,8 @@ class SpectrumView(QtWidgets.QWidget):
         # Кеш для перерисовки при смене масштаба
         self._last_freqs_hz: Optional[np.ndarray] = None
         self._last_power_dbm: Optional[np.ndarray] = None
+        # Счётчик текущих точек на экране (для плашки)
+        self._last_plotted_points: int = 0
         
         # Маркеры и ROI
         self._marker_seq = 0
@@ -196,21 +207,21 @@ class SpectrumView(QtWidgets.QWidget):
         
         # Параметры частоты
         self.start_mhz = QtWidgets.QDoubleSpinBox()
-        self.start_mhz.setRange(50, 6000)  # Ограничиваем диапазон 50-6000 МГц
-        self.start_mhz.setDecimals(1)
-        self.start_mhz.setValue(50.0)
+        self.start_mhz.setRange(50, 6000)
+        self.start_mhz.setDecimals(3)
+        self.start_mhz.setValue(2400.000)
         self.start_mhz.setSuffix(" МГц")
         
         self.stop_mhz = QtWidgets.QDoubleSpinBox()
-        self.stop_mhz.setRange(50, 6000)  # Ограничиваем диапазон 50-6000 МГц
-        self.stop_mhz.setDecimals(1)
-        self.stop_mhz.setValue(6000.0)
+        self.stop_mhz.setRange(50, 6000)
+        self.stop_mhz.setDecimals(3)
+        self.stop_mhz.setValue(2483.500)
         self.stop_mhz.setSuffix(" МГц")
         
         self.bin_khz = QtWidgets.QDoubleSpinBox()
-        self.bin_khz.setRange(500, 5000)  # Минимальный bin ограничен 500 кГц для производительности
+        self.bin_khz.setRange(1, 5000)
         self.bin_khz.setDecimals(0)
-        self.bin_khz.setValue(800)
+        self.bin_khz.setValue(5)
         self.bin_khz.setSuffix(" кГц")
         
         # Параметры усиления
@@ -226,16 +237,7 @@ class SpectrumView(QtWidgets.QWidget):
         
         self.amp_on = QtWidgets.QCheckBox("AMP")
         
-        # Параметры для оркестратора (если используется)
-        self.spanSpin = QtWidgets.QDoubleSpinBox()
-        self.spanSpin.setRange(1, 1000)
-        self.spanSpin.setValue(5)
-        self.spanSpin.setSuffix(" МГц")
-        
-        self.dwellSpin = QtWidgets.QSpinBox()
-        self.dwellSpin.setRange(100, 10000)
-        self.dwellSpin.setValue(1000)
-        self.dwellSpin.setSuffix(" мс")
+        # Параметры span/dwell перенесены в раздел слейвов/детектора
         
         # Кнопки управления
         self.btn_start = QtWidgets.QPushButton("▶ Старт")
@@ -260,8 +262,7 @@ class SpectrumView(QtWidgets.QWidget):
         self.top_layout.addLayout(add_param("LNA", self.lna_db))
         self.top_layout.addLayout(add_param("VGA", self.vga_db))
         self.top_layout.addWidget(self.amp_on)
-        self.top_layout.addLayout(add_param("Span", self.spanSpin))
-        self.top_layout.addLayout(add_param("Dwell", self.dwellSpin))
+        # Span/Dwell удалены из спектра (управляются из раздела слейвов)
         self.top_layout.addStretch(1)
         self.top_layout.addWidget(self.btn_start)
         self.top_layout.addWidget(self.btn_stop)
@@ -271,6 +272,10 @@ class SpectrumView(QtWidgets.QWidget):
         """Создает графики спектра и водопада."""
         # График спектра
         self.plot = pg.PlotWidget()
+        try:
+            self.plot.setAntialiasing(True)
+        except Exception:
+            pass
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.setLabel("bottom", "Частота (МГц)")
         self.plot.setLabel("left", "Мощность (дБм)")
@@ -279,6 +284,8 @@ class SpectrumView(QtWidgets.QWidget):
         vb = self.plot.getViewBox()
         vb.enableAutoRange(x=False, y=False)
         vb.setMouseEnabled(x=True, y=False)
+        # Жёсткие границы частот 50–6000 МГц и запрет выхода за них
+        vb.setLimits(xMin=50.0, xMax=6000.0, maxXRange=6000.0-50.0)
         
         # Линии спектра
         self.curve_now = pg.PlotCurveItem([], [], pen=pg.mkPen('#FFFFFF', width=1))
@@ -304,8 +311,9 @@ class SpectrumView(QtWidgets.QWidget):
         self.water_plot = pg.PlotItem()
         self.water_plot.setLabel("bottom", "Частота (МГц)")
         self.water_plot.setLabel("left", "Время →")
-        self.water_plot.invertY(True)  # Новые данные внизу
+        self.water_plot.invertY(False)  # Свежие сверху, как в прототипе
         self.water_plot.setMouseEnabled(x=True, y=False)
+        self.water_plot.setLimits(xMin=50.0, xMax=6000.0, maxXRange=6000.0-50.0)
         
         self.water_img = pg.ImageItem(axisOrder="row-major")
         self.water_img.setAutoDownsample(False)
@@ -319,6 +327,36 @@ class SpectrumView(QtWidgets.QWidget):
         
         # Подписываемся на изменение диапазона графика для авто-разрешения
         self.plot.getViewBox().sigRangeChanged.connect(lambda *_: self._zoom_debounce.start())
+
+        # Бейдж со span и разрешением
+        self._span_badge = pg.TextItem(text="", color=pg.mkColor(180, 220, 255), anchor=(1, 1),
+                                       border=pg.mkPen(color=(60, 90, 140), width=1),
+                                       fill=pg.mkBrush(color=(20, 30, 50, 160)))
+        self.plot.addItem(self._span_badge)
+
+        # Значки/бейджи
+        if not hasattr(self, '_resolution_badge'):
+            self._resolution_badge = pg.TextItem(
+                text="",
+                color=pg.mkColor(255, 255, 255),
+                anchor=(1, 0),
+                border=pg.mkPen(color=(100, 100, 100), width=1),
+                fill=pg.mkBrush(color=(50, 50, 50, 180))
+            )
+            self.plot.addItem(self._resolution_badge)
+            # размещаем бейдж в правом верхнем углу текущего видимого диапазона
+            vr = self.plot.getViewBox().viewRange()
+            if vr:
+                self._resolution_badge.setPos(vr[0][1], vr[1][0])
+        if not hasattr(self, '_points_badge'):
+            self._points_badge = pg.TextItem(
+                text="",
+                color=pg.mkColor(200, 200, 255),
+                anchor=(1, 0),
+                border=pg.mkPen(color=(80, 80, 120), width=1),
+                fill=pg.mkBrush(color=(40, 40, 80, 160))
+            )
+            self.plot.addItem(self._points_badge)
 
     def _build_right_panel(self) -> QtWidgets.QWidget:
         """Создает правую панель настроек."""
@@ -354,7 +392,8 @@ class SpectrumView(QtWidgets.QWidget):
         gs = QtWidgets.QFormLayout(grp_smooth)
         
         self.chk_smooth = QtWidgets.QCheckBox("По частоте")
-        self.chk_smooth.setChecked(True)
+        # По умолчанию сглаживание пользователь включает сам (как в прототипе)
+        self.chk_smooth.setChecked(False)
         
         self.smooth_win = QtWidgets.QSpinBox()
         self.smooth_win.setRange(3, 301)
@@ -369,14 +408,12 @@ class SpectrumView(QtWidgets.QWidget):
         self.alpha.setSingleStep(0.05)
         self.alpha.setValue(0.30)
         
-        self.chk_interpolation = QtWidgets.QCheckBox("Интерполяция")
-        self.chk_interpolation.setChecked(True)
-        
         gs.addRow(self.chk_smooth)
         gs.addRow("Окно:", self.smooth_win)
         gs.addRow(self.chk_ema)
         gs.addRow("α:", self.alpha)
-        gs.addRow(self.chk_interpolation)
+
+        # (убрано) отдельная анимация линий
         
         # Группа водопада
         grp_wf = QtWidgets.QGroupBox("Водопад")
@@ -398,14 +435,15 @@ class SpectrumView(QtWidgets.QWidget):
         
         self.btn_auto_levels = QtWidgets.QPushButton("Авто уровни")
         
-        self.chk_wf_invert = QtWidgets.QCheckBox("Инверт. (новые снизу)")
-        self.chk_wf_invert.setChecked(True)
+        self.chk_wf_invert = QtWidgets.QCheckBox("Инвертировать (свежие снизу)")
+        self.chk_wf_invert.setChecked(False)
         
         gw.addRow("Палитра:", self.cmb_cmap)
         gw.addRow("Мин:", self.sp_wf_min)
         gw.addRow("Макс:", self.sp_wf_max)
         gw.addRow(self.chk_wf_invert)
         gw.addRow(self.btn_auto_levels)
+
         
         # Группа маркеров
         grp_mrk = QtWidgets.QGroupBox("Маркеры")
@@ -451,10 +489,24 @@ class SpectrumView(QtWidgets.QWidget):
         
         self.chk_smooth.toggled.connect(self._save_config)
         self.chk_ema.toggled.connect(self._save_config)
-        self.chk_interpolation.toggled.connect(self._save_config)
         self.smooth_win.valueChanged.connect(self._ensure_odd_window)
         self.smooth_win.valueChanged.connect(self._save_config)
         self.alpha.valueChanged.connect(self._save_config)
+        # (убрано) переключатель анимации линий
+
+        # Проброс настроек сглаживания и EMA в бэкенд HackRF
+        def _apply_backend_processing():
+            try:
+                if isinstance(self._source, MasterSourceAdapter):
+                    self._source.set_freq_smoothing(self.chk_smooth.isChecked(), int(self.smooth_win.value()))
+                    self._source.set_ema_alpha(float(self.alpha.value()) if self.chk_ema.isChecked() else 1.0)
+            except Exception:
+                pass
+
+        self.chk_smooth.toggled.connect(lambda _: _apply_backend_processing())
+        self.smooth_win.valueChanged.connect(lambda _: _apply_backend_processing())
+        self.chk_ema.toggled.connect(lambda _: _apply_backend_processing())
+        self.alpha.valueChanged.connect(lambda _: _apply_backend_processing())
         
         # Водопад
         self.cmb_cmap.currentTextChanged.connect(self._on_cmap_changed)
@@ -482,7 +534,6 @@ class SpectrumView(QtWidgets.QWidget):
         self.smooth_win.setValue(self.config.smoothing_window)
         self.chk_ema.setChecked(self.config.ema_enabled)
         self.alpha.setValue(self.config.ema_alpha)
-        self.chk_interpolation.setChecked(self.config.interpolation_enabled)
 
     def _save_config(self):
         """Сохраняет текущую конфигурацию."""
@@ -497,7 +548,6 @@ class SpectrumView(QtWidgets.QWidget):
         self.config.smoothing_window = self.smooth_win.value()
         self.config.ema_enabled = self.chk_ema.isChecked()
         self.config.ema_alpha = self.alpha.value()
-        self.config.interpolation_enabled = self.chk_interpolation.isChecked()
         
         self.config.save_to_file(self.config_path)
 
@@ -585,62 +635,72 @@ class SpectrumView(QtWidgets.QWidget):
         self._source.finished.connect(self._on_finished)
 
     def _on_full_sweep(self, freqs_hz: np.ndarray, power_dbm: np.ndarray):
-        """Обработка полного свипа данных."""
-        # Проверка входных данных
+        """Обработка полного свипа данных (логика как в прототипе для водопада/спектра)."""
         if freqs_hz is None or power_dbm is None:
             return
-        
-        # Конвертируем в numpy если нужно
         if not isinstance(freqs_hz, np.ndarray):
             freqs_hz = np.asarray(freqs_hz, dtype=np.float64)
         if not isinstance(power_dbm, np.ndarray):
             power_dbm = np.asarray(power_dbm, dtype=np.float32)
-        
         if freqs_hz.size == 0 or power_dbm.size == 0 or freqs_hz.size != power_dbm.size:
             return
-        
-        # Фильтруем невалидные значения и ограничиваем диапазон пользовательскими границами
+
+        # Очистка NaN/inf и калибровка в допустимые пределы
         valid_mask = np.isfinite(power_dbm) & np.isfinite(freqs_hz)
-        
-        # Используем текущую конфигурацию для фильтрации
+        if not np.all(valid_mask):
+            power_dbm = power_dbm.copy()
+            power_dbm[~valid_mask] = -120.0
+
+        # Приведение к пользовательскому диапазону (если задан)
         if self._current_cfg:
             freq_mask = (freqs_hz >= self._current_cfg.freq_start_hz) & (freqs_hz <= self._current_cfg.freq_end_hz)
-        else:
-            # Fallback на разумные границы если конфигурация не задана
-            freq_mask = (freqs_hz >= 50e6) & (freqs_hz <= 6000e6)
-        
-        valid_mask = valid_mask & freq_mask
-        
-        if not np.all(valid_mask):
-            freqs_hz = freqs_hz[valid_mask]
-            power_dbm = power_dbm[valid_mask]
+            freqs_hz = freqs_hz[freq_mask]
+            power_dbm = power_dbm[freq_mask]
             if freqs_hz.size == 0:
                 return
-        
-        # Инициализация при первом запуске или изменении размера
-        if (self._model.freqs_hz is None or 
-            self._model.freqs_hz.size != freqs_hz.size or 
-            self._water_view is None or 
-            not self._water_initialized):
-            self._initialize_display(freqs_hz, power_dbm)
-            self._water_initialized = True
-        
-        # Обновляем модель
-        self._model.freqs_hz = freqs_hz.astype(np.float64, copy=True)
-        self._model.power_dbm = power_dbm.astype(np.float32, copy=True)
-        self._model._last_row = power_dbm.astype(np.float32, copy=True)
-        
-        if hasattr(self._model, 'waterfall'):
-            self._model.waterfall.append(power_dbm.astype(np.float32, copy=True))
-        
-        # Обновляем счетчики
+
+        # Инициализируем сетку/водопад как в прототипе
+        if self._model.freqs_hz.size == 0 or self._model.freqs_hz.size != freqs_hz.size or self._model.water is None:
+            # В прототипе set_grid создаёт матрицу water и last_row
+            f0 = float(freqs_hz[0])
+            f1 = float(freqs_hz[-1])
+            # Оценим bin как медианное расстояние
+            if freqs_hz.size > 1:
+                bw = float(np.median(np.diff(freqs_hz)))
+            else:
+                bw = float(self.bin_khz.value() * 1e3)
+            self._model.set_grid(f0, f1, bw)
+
+            # Выставим оси и картинку водопада по фактическим данным (с учётом пользовательских границ)
+            x_mhz = self._model.freqs_hz.astype(np.float64) / 1e6
+            xr0 = float(x_mhz[0])
+            xr1 = float(x_mhz[-1])
+            if self._current_cfg is not None:
+                cfg0 = float(self._current_cfg.freq_start_hz) * 1e-6
+                cfg1 = float(self._current_cfg.freq_end_hz) * 1e-6
+                # Пересекаем реальные данные с запрошенным диапазоном, чтобы избежать «пустого» пространства
+                xr0 = max(xr0, cfg0)
+                xr1 = min(xr1, cfg1)
+            if xr1 <= xr0:
+                xr0, xr1 = float(x_mhz[0]), float(x_mhz[-1])
+            self.plot.setXRange(xr0, xr1, padding=0)
+            self.plot.setYRange(-110.0, -20.0, padding=0)
+            self.water_plot.setXRange(xr0, xr1, padding=0)
+            self.water_plot.setYRange(0, self._model.rows, padding=0)
+            if self._model.water is not None:
+                self.water_img.setImage(self._model.water, autoLevels=False, levels=self._wf_levels, lut=self._lut)
+                self.water_img.setRect(QtCore.QRectF(float(x_mhz[0]), 0.0, float(x_mhz[-1] - x_mhz[0]), float(self._model.rows)))
+
+        # Обновление модели и водопада (матрица со сдвигом)
+        self._model.append_row(power_dbm)
+
+        # Статистика и перерисовка
         self._update_statistics()
-        
-        # Обновляем отображение
         self._refresh_spectrum()
-        self._update_waterfall_display()
-        
-        # Эмитим для внешних обработчиков
+        self._pending_water_update = True
+        if not self._update_timer.isActive():
+            self._update_timer.start()
+
         self.newRowReady.emit(freqs_hz, power_dbm)
 
     def _initialize_display(self, freqs_hz: np.ndarray, power_dbm: np.ndarray):
@@ -656,16 +716,9 @@ class SpectrumView(QtWidgets.QWidget):
         x_mhz = self._model.freqs_hz / 1e6
         x0, x1 = float(x_mhz[0]), float(x_mhz[-1])
         
-        # Используем пользовательские границы для стабильности
-        if self._current_cfg:
-            user_x0 = self._current_cfg.freq_start_hz / 1e6
-            user_x1 = self._current_cfg.freq_end_hz / 1e6
-            x0 = max(user_x0, x0)
-            x1 = min(user_x1, x1)
-        else:
-            # Fallback на разумные границы если конфигурация не задана
-            x0 = max(50.0, x0)
-            x1 = min(6000.0, x1)
+        # Жёсткие глобальные границы 50–6000 МГц вне зависимости от данных
+        x0 = 50.0
+        x1 = 6000.0
         
         # Дополнительная проверка размера данных
         if x_mhz.size > 10000:  # Если слишком много точек, принудительно даунсемплируем
@@ -738,14 +791,19 @@ class SpectrumView(QtWidgets.QWidget):
         # Создаем матрицу водопада
         if waterfall_ds:
             waterfall_matrix = np.array(waterfall_ds, dtype=np.float32)
-            # Обновляем изображение из накопленного массива
+            
+            # Клипируем значения для лучшего отображения
+            waterfall_matrix = np.clip(waterfall_matrix, -120, -20)
+            
+            # Обновляем изображение
             self.water_img.setImage(waterfall_matrix, autoLevels=False)
             
             # Устанавливаем правильный прямоугольник водопада
-            if self._last_freqs_hz is not None and self._last_freqs_hz.size > 0:
+            if self._model.freqs_hz is not None and self._model.freqs_hz.size > 0:
+                x_mhz = self._model.freqs_hz / 1e6
                 self.water_img.setRect(QtCore.QRectF(
-                    self._last_freqs_hz[0]*1e-6, 0.0,
-                    (self._last_freqs_hz[-1]-self._last_freqs_hz[0])*1e-6,
+                    float(x_mhz[0]), 0.0,
+                    float(x_mhz[-1] - x_mhz[0]),
                     float(waterfall_matrix.shape[0])
                 ))
         
@@ -762,11 +820,13 @@ class SpectrumView(QtWidgets.QWidget):
         if freqs_hz is None or power_dbm is None or freqs_hz.size == 0:
             return
             
-        # первый валидный свип — фиксируем обзорный диапазон
+        # первый валидный свип — устанавливаем видимый диапазон, не меняя глобальные границы 50–6000 МГц
         if not hasattr(self, '_last_freqs_hz') or self._last_freqs_hz is None:
             vb = self.plot.getViewBox()
-            vb.setLimits(xMin=freqs_hz[0]*1e-6, xMax=freqs_hz[-1]*1e-6)  # запретить выход за края
-            vb.setXRange(freqs_hz[0]*1e-6, freqs_hz[-1]*1e-6, padding=0)
+            try:
+                vb.setXRange(freqs_hz[0]*1e-6, freqs_hz[-1]*1e-6, padding=0)
+            except Exception:
+                pass
         
         x_mhz = freqs_hz.astype(np.float64) / 1e6
         y = power_dbm.astype(np.float32, copy=False)
@@ -774,12 +834,39 @@ class SpectrumView(QtWidgets.QWidget):
         # Применяем сглаживание
         if self.chk_smooth.isChecked():
             y = self._smooth_freq(y)
-        
         if self.chk_ema.isChecked():
             y = self._smooth_time_ema(y)
         
-        # Просто обновляем данные без полного reset
-        self.curve_now.setData(freqs_hz * 1e-6, power_dbm)
+        # Подавление зубчатого шума: вычитаем baseline, если выбран режим SNR
+        try:
+            if getattr(self, 'chk_snr_mode', None) and self.chk_snr_mode.isChecked():
+                base = self._rolling_median(y, int(self.spin_base_win.value())) if getattr(self, 'spin_base_win', None) else self._rolling_median(y, 31)
+                y = (y - base).astype(np.float32)
+        except Exception:
+            pass
+        
+        # Даунсемплинг текущей линии при прямой отрисовке
+        x_mhz = freqs_hz.astype(np.float64) * 1e-6
+        span_hz = float((freqs_hz[-1] - freqs_hz[0])) if freqs_hz.size > 1 else 0.0
+        target_cols = self._target_display_cols(span_hz)
+        xd, yd = self._downsample_line(x_mhz, y, target_cols)
+        # Доп. защита от случайной подачи Гц в x: если значения слишком большие, нормализуем в МГц
+        try:
+            if xd.size > 0 and float(np.max(xd)) > 10000.0:
+                xd = (xd * 1e-6).astype(np.float64, copy=False)
+        except Exception:
+            pass
+
+        # Плавная визуализация без таймера — экспоненциальное визуальное сглаживание
+        try:
+            self._last_plotted_points = int(yd.size)
+            if not hasattr(self, '_smooth_display_y') or self._smooth_display_y is None or self._smooth_display_y.shape != yd.shape:
+                self._smooth_display_y = yd.copy()
+            alpha_viz = 0.28  # чуть плавнее визуально
+            self._smooth_display_y = (1.0 - alpha_viz) * self._smooth_display_y + alpha_viz * yd
+            self.curve_now.setData(xd, self._smooth_display_y.astype(np.float32, copy=False))
+        except Exception:
+            self.curve_now.setData(xd, yd)
 
         # EMA, min/max считаем на полных данных:
         if getattr(self, "_ema_last", None) is None:
@@ -817,9 +904,78 @@ class SpectrumView(QtWidgets.QWidget):
         self._update_resolution_badge()
 
     def _refresh_spectrum(self):
-        """Обновление линий спектра (совместимость)."""
-        if self._model.freqs_hz is not None and self._model.power_dbm is not None:
-            self._render_spectrum(self._model.freqs_hz, self._model.power_dbm)
+        """Обновление линий спектра."""
+        if self._model.freqs_hz is None or self._model.power_dbm is None:
+            return
+        
+        x_mhz = self._model.freqs_hz / 1e6
+        
+        # Адаптивное разрешение и даунсемплинг для линий
+        span_hz = float((self._model.freqs_hz[-1] - self._model.freqs_hz[0])) if self._model.freqs_hz.size > 1 else 0.0
+        target_cols = self._target_display_cols(span_hz)
+
+        # Текущая линия
+        if self.chk_now.isChecked():
+            y = self._model.power_dbm
+            # Применяем сглаживание если включено
+            if self.chk_smooth.isChecked():
+                y = self._smooth_freq(y)
+            # Даунсемплинг линии
+            xd, yd = self._downsample_line(x_mhz, y, target_cols)
+            # Плавная визуализация без таймера — экспоненциальное сглаживание
+            try:
+                self._last_plotted_points = int(yd.size)
+                if not hasattr(self, '_smooth_display_y') or self._smooth_display_y is None or self._smooth_display_y.shape != yd.shape:
+                    self._smooth_display_y = yd.copy()
+                alpha_viz = 0.35
+                self._smooth_display_y = (1.0 - alpha_viz) * self._smooth_display_y + alpha_viz * yd
+                self.curve_now.setData(xd, self._smooth_display_y.astype(np.float32, copy=False))
+            except Exception:
+                self.curve_now.setData(xd, yd)
+        else:
+            self.curve_now.setData([], [])
+        
+        # Средняя линия
+        if self.chk_avg.isChecked() and len(self._avg_queue) > 0:
+            # Вычисляем среднее из очереди
+            avg_window = min(self.avg_win.value(), len(self._avg_queue))
+            if avg_window > 0:
+                # Берем последние N свипов
+                recent_sweeps = list(self._avg_queue)[-avg_window:]
+                avg_power = np.mean(recent_sweeps, axis=0)
+                
+                # Применяем сглаживание если включено
+                if self.chk_smooth.isChecked():
+                    avg_power = self._smooth_freq(avg_power)
+                # Даунсемплинг средней линии
+                xd, yd = self._downsample_line(x_mhz, avg_power, target_cols)
+                self.curve_avg.setData(xd, yd)
+        else:
+            self.curve_avg.setData([], [])
+        
+        # Min hold
+        if self.chk_min.isChecked():
+            if self._minhold is None:
+                self._minhold = self._model.power_dbm.copy()
+            else:
+                self._minhold = np.minimum(self._minhold, self._model.power_dbm)
+            xd, yd = self._downsample_line(x_mhz, self._minhold, target_cols)
+            self.curve_min.setData(xd, yd)
+        else:
+            self.curve_min.setData([], [])
+        
+        # Max hold
+        if self.chk_max.isChecked():
+            if self._maxhold is None:
+                self._maxhold = self._model.power_dbm.copy()
+            else:
+                self._maxhold = np.maximum(self._maxhold, self._model.power_dbm)
+            xd, yd = self._downsample_line(x_mhz, self._maxhold, target_cols)
+            self.curve_max.setData(xd, yd)
+        else:
+            self.curve_max.setData([], [])
+        
+        self._update_cursor_label()
 
     def _downsample_array(self, arr: np.ndarray, factor: int, method: str = 'max') -> np.ndarray:
         """Универсальный даунсемплинг массива."""
@@ -884,6 +1040,33 @@ class SpectrumView(QtWidgets.QWidget):
         
         return smoothed.astype(np.float32)
 
+    def _rolling_median(self, y: np.ndarray, window: int) -> np.ndarray:
+        """Быстрая скользящая медиана (окно нечетное)."""
+        try:
+            import numpy as _np
+            if window < 3:
+                return y
+            if (window % 2) == 0:
+                window += 1
+            pad = window // 2
+            yp = np.pad(y, (pad, pad), mode='edge')
+            # построим матрицу сдвигов и возьмем медиану по оси
+            strides = (yp.strides[0], yp.strides[0])
+            shape = (y.size, window)
+            as_strided = np.lib.stride_tricks.as_strided
+            M = as_strided(yp, shape=shape, strides=strides)
+            return np.median(M, axis=1).astype(np.float32)
+        except Exception:
+            # запасной вариант: свертка по частям
+            w = max(3, window | 1)
+            out = y.copy()
+            half = w // 2
+            for i in range(y.size):
+                l = max(0, i - half)
+                r = min(y.size, i + half + 1)
+                out[i] = float(np.median(y[l:r]))
+            return out.astype(np.float32)
+
     def _smooth_time_ema(self, y: np.ndarray) -> np.ndarray:
         """EMA сглаживание по времени."""
         if not self.chk_ema.isChecked():
@@ -912,13 +1095,28 @@ class SpectrumView(QtWidgets.QWidget):
         
         # Вычисляем текущее разрешение
         if self._last_freqs_hz is not None and self._last_freqs_hz.size > 1:
-            span_hz = self._last_freqs_hz[-1] - self._last_freqs_hz[0]
-            bin_width_khz = span_hz / self._display_cols / 1e3
-            resolution_text = f"Разрешение: {bin_width_khz:.1f} кГц/бин"
+            span_hz = (self.plot.getViewBox().viewRange()[0][1] - self.plot.getViewBox().viewRange()[0][0]) * 1e6
+            bin_width_khz = span_hz / max(1, self._last_plotted_points) / 1e3
+            resolution_text = f"Разрешение: {bin_width_khz:.2f} кГц/точка"
         else:
-            resolution_text = f"Точек: {self._display_cols}"
+            resolution_text = f"Разрешение: —"
         
         self._resolution_badge.setText(resolution_text)
+        # Позиционируем бейдж в правом верхнем углу текущего видимого окна
+        try:
+            vb = self.plot.getViewBox()
+            if vb is not None:
+                (x0, x1), (y0, y1) = vb.viewRange()
+                self._resolution_badge.setPos(x1, y1)
+                # Плашка с числом точек
+                self._points_badge.setText(f"Точек: {self._last_plotted_points}")
+                self._points_badge.setPos(x1, y1 - 3)
+                # Обновляем бейдж span
+                span_mhz = max(0.0, x1 - x0)
+                self._span_badge.setText(f"Span: {span_mhz:.1f} МГц")
+                self._span_badge.setPos(x1, y0)
+        except Exception:
+            pass
 
     def _update_statistics(self):
         """Обновление статистики."""
@@ -948,14 +1146,14 @@ class SpectrumView(QtWidgets.QWidget):
         # Сохраняем конфигурацию
         self._save_config()
         
-        # Корректируем границы
+        # Корректируем границы и клэмпим в 50–6000 МГц
         f0, f1, bw = self._snap_bounds(
-            self.start_mhz.value(),
-            self.stop_mhz.value(),
+            max(50.0, min(6000.0, self.start_mhz.value())),
+            max(50.0, min(6000.0, self.stop_mhz.value())),
             self.bin_khz.value() * 1e3
         )
-        self.start_mhz.setValue(f0 / 1e6)
-        self.stop_mhz.setValue(f1 / 1e6)
+        self.start_mhz.setValue(max(50.0, min(6000.0, f0 / 1e6)))
+        self.stop_mhz.setValue(max(50.0, min(6000.0, f1 / 1e6)))
         
         # Получаем серийный номер master
         master_serial = None
@@ -978,8 +1176,6 @@ class SpectrumView(QtWidgets.QWidget):
             lna_db=int(self.lna_db.value()),
             vga_db=int(self.vga_db.value()),
             amp_on=bool(self.amp_on.isChecked()),
-            # локальное окно только для детектора/слейвов, мастер его игнорирует
-            detector_span_hz=int(self.spanSpin.value() * 1e6),
             serial=master_serial
         )
         self._current_cfg = cfg
@@ -997,11 +1193,7 @@ class SpectrumView(QtWidgets.QWidget):
         self._ema_last = None
         self._water_initialized = False
         
-        # Параметры для оркестратора
-        if self._orchestrator:
-            span_mhz = float(self.spanSpin.value())
-            dwell_ms = int(self.dwellSpin.value())
-            self._orchestrator.set_global_parameters(span_hz=span_mhz * 1e6, dwell_ms=dwell_ms)
+        # Параметры span/dwell задаются из диалога детектора/слейвов
         
         # Запускаем источник
         self._source.start(cfg)
@@ -1105,6 +1297,8 @@ class SpectrumView(QtWidgets.QWidget):
     def _on_reset_view(self):
         """Сброс вида графиков."""
         self.plot.setYRange(-110.0, -20.0, padding=0)
+        # Зафиксируем X в пределах 50–6000 МГц и не позволим выходить
+        self.plot.setXRange(50.0, 6000.0, padding=0)
         self._water_view = None
         self._water_initialized = False
 
@@ -1180,8 +1374,41 @@ class SpectrumView(QtWidgets.QWidget):
             return
         self._pending_water_update = False
         
-        if self._water_view is not None:
-            self.water_img.setImage(self._water_view, autoLevels=False)
+        # Отрисовываем из основной матрицы модели, как в прототипе
+        z = None
+        if hasattr(self._model, 'water'):
+            z = self._model.water
+        if z is None:
+            return
+        
+        # Включаем короткую анимацию «плавного опускания» — 5-6 кадров
+        self.water_img.setImage(z, autoLevels=False, levels=self._wf_levels, lut=self._lut)
+        self._wf_anim_i = 0
+        if not self._wf_anim_active:
+            self._wf_anim_active = True
+            self._wf_anim_timer.start()
+        # Обновляем прямоугольник по X-координате частот
+        freqs = self._model.freqs_hz
+        if freqs is not None and freqs.size:
+            x_mhz = freqs.astype(np.float64) / 1e6
+            self.water_img.setRect(QtCore.QRectF(float(x_mhz[0]), 0.0, float(x_mhz[-1] - x_mhz[0]), float(z.shape[0])))
+
+    def _wf_anim_step(self):
+        """Небольшая анимация уровня водопада для визуальной плавности."""
+        try:
+            self._wf_anim_i += 1
+            if self._wf_anim_i >= self._wf_anim_steps:
+                self._wf_anim_timer.stop()
+                self._wf_anim_active = False
+                return
+            # Лёгкая интерполяция уровней
+            vmin, vmax = self._wf_levels
+            k = 0.12  # шаг сглаживания
+            self.water_img.setLevels((vmin + k, vmax + k))
+            self.water_img.setLevels((vmin, vmax))
+        except Exception:
+            self._wf_anim_timer.stop()
+            self._wf_anim_active = False
 
     def _on_mouse_moved(self, pos):
         """Движение мыши."""
@@ -1193,6 +1420,9 @@ class SpectrumView(QtWidgets.QWidget):
         fx = float(p.x())
         fy = float(p.y())
         
+        # Защита от ошибочного масштаба: принудительно работаем в МГц
+        if fx > 60000.0:  # если приходят Гц (случайная ошибка), переводим в МГц
+            fx = fx * 1e-6
         self._vline.setPos(fx)
         self._hline.setPos(fy)
         self._update_cursor_label()
@@ -1219,6 +1449,27 @@ class SpectrumView(QtWidgets.QWidget):
         
         self._cursor_text.setText(f"{fx:.3f} МГц, {y_at:.1f} дБм")
         self._cursor_text.setPos(fx, self.plot.getViewBox().viewRange()[1][1] - 5)
+
+    def _line_anim_step(self):
+        """Кадр анимации плавного перехода основной линии спектра."""
+        try:
+            if self._anim_x is None or self._anim_prev_y is None or self._anim_target_y is None:
+                self._line_anim_timer.stop()
+                self._line_anim_active = False
+                return
+            self._line_anim_i += 1
+            t = self._line_anim_i / float(max(1, self._line_anim_steps))
+            # easeOutCubic
+            ease = 1.0 - pow(1.0 - t, 3.0)
+            y_now = (1.0 - ease) * self._anim_prev_y + ease * self._anim_target_y
+            self.curve_now.setData(self._anim_x, y_now)
+            if self._line_anim_i >= self._line_anim_steps:
+                self._line_anim_timer.stop()
+                self._line_anim_active = False
+                self._anim_prev_y = self._anim_target_y.copy()
+        except Exception:
+            self._line_anim_timer.stop()
+            self._line_anim_active = False
 
     def _on_add_marker(self, ev, from_water: bool):
         """Добавление маркера по двойному клику."""
@@ -1284,6 +1535,16 @@ class SpectrumView(QtWidgets.QWidget):
         if mid not in self._markers:
             return
         
+        # Клэмп частоты в глобальные пределы 50–6000 МГц
+        try:
+            new_freq = float(new_freq)
+        except Exception:
+            new_freq = 50.0
+        if new_freq < 50.0:
+            new_freq = 50.0
+        elif new_freq > 6000.0:
+            new_freq = 6000.0
+
         m = self._markers[mid]
         m["freq"] = new_freq
         

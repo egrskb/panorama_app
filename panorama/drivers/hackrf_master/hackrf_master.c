@@ -22,7 +22,7 @@
 #define DEFAULT_FFT_SIZE 32
 #endif
 #ifndef MAX_FFT_SIZE
-#define MAX_FFT_SIZE 256
+#define MAX_FFT_SIZE 8192
 #endif
 
 // ====== Локальные константы ======
@@ -110,6 +110,11 @@ typedef struct {
     int segment_mode;       // 2 или 4
     int fft_size_override;  // 0 = авто
 
+    // Усиления/AMP (для профилей калибровки)
+    int lna_db;
+    int vga_db;
+    int amp_on;
+
     // Колбэки (оставляем только multi_cb на будущее)
     hq_multi_segment_cb multi_cb;
     void* user_data;
@@ -171,8 +176,41 @@ static inline float calculate_power_dbm(float re, float im, float correction_db)
 }
 
 // ================== Калибровка ==================
-static float get_calibration_offset_db(double freq_mhz) {
+static float get_calibration_offset_db_profile(double freq_mhz, int lna_db, int vga_db, int amp_on) {
     if (!g_calibration.enabled || g_calibration.count == 0) return 0.0f;
+
+    // Сначала ищем в профиле с совпадающими усилениями
+    int found_any = 0;
+    float below_f = -1.0f, below_k = 0.0f;
+    float above_f = -1.0f, above_k = 0.0f;
+
+    for (int i = 0; i < g_calibration.count; i++) {
+        if (g_calibration.lna_db[i] == lna_db && g_calibration.vga_db[i] == vga_db && g_calibration.amp_on[i] == amp_on) {
+            found_any = 1;
+            float f = g_calibration.freq_mhz[i];
+            float k = g_calibration.offset_db[i];
+            if (f <= (float)freq_mhz) {
+                if (below_f < 0 || f > below_f) { below_f = f; below_k = k; }
+            }
+            if (f >= (float)freq_mhz) {
+                if (above_f < 0 || f < above_f) { above_f = f; above_k = k; }
+            }
+        }
+    }
+
+    if (found_any) {
+        if (below_f >= 0 && above_f >= 0) {
+            if (fabsf(above_f - below_f) < 1e-6f) return below_k; // одна точка
+            float t = (float)((freq_mhz - below_f) / (above_f - below_f));
+            return below_k + t * (above_k - below_k);
+        } else if (below_f >= 0) {
+            return below_k; // экстраполяция
+        } else if (above_f >= 0) {
+            return above_k; // экстраполяция
+        }
+    }
+
+    // Фолбэк: ближайшая по частоте среди всех записей
     float best = 0.0f;
     float min_d = 1e9f;
     for (int i = 0; i < g_calibration.count; i++) {
@@ -252,8 +290,11 @@ static ProcessingContext* create_processing_context(int fft_size, double sample_
         return NULL;
     }
 
-    for (int i = 0; i < fft_size; i++)
-        ctx->window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / (fft_size - 1)));
+    // Окно Hann для более ровного шума и чётких пиков
+    int N = fft_size;
+    for (int n = 0; n < N; n++) {
+        ctx->window[n] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)n / (float)(N - 1)));
+    }
 
     calculate_window_corrections(ctx->window, fft_size, &ctx->window_loss_db, &ctx->enbw_corr_db);
     ctx->plan = fftwf_plan_dft_1d(fft_size, ctx->in, ctx->out, FFTW_FORWARD, FFTW_ESTIMATE);
@@ -279,9 +320,14 @@ static void destroy_processing_context(ProcessingContext* ctx) {
 
 // ================== Глобальный спектр ==================
 static inline void spectrum_update_ema(MasterContext* m, double freq_hz, float val_dbm, float alpha) {
-    if (!m || !m->spectrum_freqs || !m->spectrum_powers || !m->spectrum_counts) return;  // защита от неинициализированных массивов
+    if (!m || !m->spectrum_freqs || !m->spectrum_powers || !m->spectrum_counts) return;
     if (freq_hz < m->freq_start_hz || freq_hz > m->freq_stop_hz) return;
     if (m->freq_step_hz <= 0) return;
+    
+    // Проверяем валидность значения
+    if (!isfinite(val_dbm) || val_dbm < -200.0f || val_dbm > 50.0f) {
+        val_dbm = -120.0f;  // Заменяем невалидные значения на шумовой пол
+    }
 
     int idx = (int)floor((freq_hz - m->freq_start_hz) / m->freq_step_hz + 0.5);
     if (idx < 0 || (size_t)idx >= m->spectrum_points) return;
@@ -327,7 +373,7 @@ static void process_sweep_block(MasterContext* master, uint8_t* buffer, int vali
     // Коррекции мощности
     const float fft_norm   = 1.0f / proc->fft_size;
     const double center_mhz = (double)center_hz / 1e6;
-    const float cal_off    = get_calibration_offset_db(center_mhz);
+    const float cal_off    = get_calibration_offset_db_profile(center_mhz, master->lna_db, master->vga_db, master->amp_on);
     const float total_corr = proc->window_loss_db + proc->enbw_corr_db + cal_off;
 
     // Заполняем мощности и частоты бинов окна
@@ -357,10 +403,11 @@ static void process_sweep_block(MasterContext* master, uint8_t* buffer, int vali
 
     // Подготовка данных сегментов
     if (master->multi_cb) {
-        int seg_count = (master->segment_mode == HQ_SEGMENT_MODE_2) ? 2 : 4;
         int N = proc->fft_size;
+        double Fs = proc->sample_rate;
 
-        if (seg_count == 4) {
+        if (master->segment_mode == HQ_SEGMENT_MODE_4) {
+            // Старый режим: 4 равные части всего FFT окна
             int Q = N / 4;
             int parts[4][2] = {
                 {0, Q}, {Q, Q}, {2*Q, Q}, {3*Q, N - 3*Q}
@@ -383,31 +430,59 @@ static void process_sweep_block(MasterContext* master, uint8_t* buffer, int vali
                     g_seg_powers[s][i] = pwr_src[start + i];
                 }
             }
-        } else { // seg_count == 2
-            int half = N / 2;
-            int lens[2] = { half, N - half };
-            int starts[2] = { 0, half };
-            for (int s = 0; s < 2; s++) {
-                int len   = lens[s];
-                int start = starts[s];
-                if (g_seg_caps[s] < len) {
-                    double* nf = (double*)realloc(g_seg_freqs[s],  sizeof(double)*len);
-                    float*  np = (float*) realloc(g_seg_powers[s], sizeof(float) *len);
-                    if (!nf || !np) { if (nf) g_seg_freqs[s]=nf; if (np) g_seg_powers[s]=np; len=0; }
-                    else { g_seg_freqs[s]=nf; g_seg_powers[s]=np; g_seg_caps[s]=len; }
+            master->multi_cb(g_segments, 4, proc->bin_width, center_hz, master->user_data);
+        } else {
+            // Прототипный режим: 2 квартальных сегмента с безопасными смещениями
+            int q = N / 4;
+            int ia = 1 + (5 * N) / 8; // начало для сегмента A
+            int ib = 1 + (N / 8);     // начало для сегмента B
+            if (ia + q > N) q = (ia < N) ? (N - ia) : 0;
+            int qa = q;
+            int qb = (ib + q <= N) ? q : ((ib < N) ? (N - ib) : 0);
+
+            // Сегмент A: [f, f+Fs/4]
+            if (qa > 0) {
+                if (g_seg_caps[0] < qa) {
+                    double* nf = (double*)realloc(g_seg_freqs[0],  sizeof(double)*qa);
+                    float*  np = (float*) realloc(g_seg_powers[0], sizeof(float) *qa);
+                    if (!nf || !np) { if (nf) g_seg_freqs[0]=nf; if (np) g_seg_powers[0]=np; qa=0; }
+                    else { g_seg_freqs[0]=nf; g_seg_powers[0]=np; g_seg_caps[0]=qa; }
                 }
-                g_segments[s].segment_id = s;
-                g_segments[s].count      = len;
-                g_segments[s].freqs_hz   = g_seg_freqs[s];
-                g_segments[s].data_dbm   = g_seg_powers[s];
-                for (int i = 0; i < len; i++) {
-                    g_seg_freqs[s][i]  = proc->freqs_hz[start + i];
-                    g_seg_powers[s][i] = pwr_src[start + i];
+                g_segments[0].segment_id = 0;
+                g_segments[0].count      = qa;
+                g_segments[0].freqs_hz   = g_seg_freqs[0];
+                g_segments[0].data_dbm   = g_seg_powers[0];
+                double hz_low = (double)center_hz;
+                for (int i = 0; i < qa; i++) {
+                    g_seg_freqs[0][i]  = hz_low + (i + 0.5) * proc->bin_width;
+                    g_seg_powers[0][i] = pwr_src[ia + i];
                 }
             }
-        }
 
-        master->multi_cb(g_segments, seg_count, proc->bin_width, center_hz, master->user_data);
+            // Сегмент B: [f+Fs/2, f+3/4*Fs]
+            if (qb > 0) {
+                if (g_seg_caps[1] < qb) {
+                    double* nf = (double*)realloc(g_seg_freqs[1],  sizeof(double)*qb);
+                    float*  np = (float*) realloc(g_seg_powers[1], sizeof(float) *qb);
+                    if (!nf || !np) { if (nf) g_seg_freqs[1]=nf; if (np) g_seg_powers[1]=np; qb=0; }
+                    else { g_seg_freqs[1]=nf; g_seg_powers[1]=np; g_seg_caps[1]=qb; }
+                }
+                g_segments[1].segment_id = 1;
+                g_segments[1].count      = qb;
+                g_segments[1].freqs_hz   = g_seg_freqs[1];
+                g_segments[1].data_dbm   = g_seg_powers[1];
+                double hz_low = (double)center_hz + 0.5 * Fs;
+                for (int i = 0; i < qb; i++) {
+                    g_seg_freqs[1][i]  = hz_low + (i + 0.5) * proc->bin_width;
+                    g_seg_powers[1][i] = pwr_src[ib + i];
+                }
+            }
+
+            int seg_count = (qa > 0) + (qb > 0);
+            if (seg_count > 0) {
+                master->multi_cb(g_segments, seg_count, proc->bin_width, center_hz, master->user_data);
+            }
+        }
     }
 
     pthread_mutex_unlock(&master->spectrum_mutex);
@@ -443,16 +518,19 @@ static void* worker_thread_fn(void* arg) {
     r = hackrf_set_baseband_filter_bandwidth(master->dev, DEFAULT_BASEBAND_FILTER_BANDWIDTH);
     if (r != HACKRF_SUCCESS) { set_error("hackrf_set_baseband_filter_bandwidth: %s", hackrf_error_name(r)); return NULL; }
 
-    // Выбор FFT
+    // Выбор FFT (как в прототипе: (N+4)%8==0, без обязательной степени 2)
     int fft_size = DEFAULT_FFT_SIZE;
     if (master->fft_size_override > 0) {
         fft_size = master->fft_size_override;
+        if (fft_size < 4) fft_size = 4;
+        if (fft_size > 8180) fft_size = 8180;
+        while (((fft_size + 4) % 8) != 0 && fft_size < 8180) fft_size++;
     } else if (master->freq_step_hz > 0) {
-        int auto_size = (int)(DEFAULT_SAMPLE_RATE_HZ / master->freq_step_hz);
-        if (auto_size < MIN_FFT_SIZE) auto_size = MIN_FFT_SIZE;
-        if (auto_size > MAX_FFT_SIZE) auto_size = MAX_FFT_SIZE;
-        int p2 = 1; while ((p2 << 1) <= auto_size) p2 <<= 1;
-        fft_size = p2;
+        int auto_size = (int)floor((double)DEFAULT_SAMPLE_RATE_HZ / master->freq_step_hz);
+        if (auto_size < 4) auto_size = 4;
+        if (auto_size > 8180) auto_size = 8180;
+        while (((auto_size + 4) % 8) != 0 && auto_size < 8180) auto_size++;
+        fft_size = auto_size;
     }
     // fprintf(stdout, "[HackRF Master] Using FFT size: %d (bin=%.1f kHz)\n",
     //         fft_size, (DEFAULT_SAMPLE_RATE_HZ/(double)fft_size)/1e3);
@@ -698,6 +776,9 @@ int hq_configure(double f_start_mhz, double f_stop_mhz, double bin_hz,
         hackrf_set_vga_gain(m->dev, vga_db);
         hackrf_set_amp_enable(m->dev, amp_on);
     }
+    m->lna_db = lna_db;
+    m->vga_db = vga_db;
+    m->amp_on = amp_on ? 1 : 0;
 
     return 0;
 }
@@ -720,29 +801,37 @@ static int setup_global_spectrum_grid(MasterContext* m, double f_start_hz, doubl
     if (span_hz <= 0.0) return -1;
 
     size_t points = (size_t)floor(span_hz / freq_step_hz + 1.0);
-    if (points < 2) points = 2; // на всякий случай
-    if (points > MAX_SPECTRUM_POINTS) points = MAX_SPECTRUM_POINTS; // защита
+    if (points < 2) points = 2;
+    if (points > MAX_SPECTRUM_POINTS) points = MAX_SPECTRUM_POINTS;
 
     m->spectrum_points = points;
     m->spectrum_freqs  = (double*)malloc(points * sizeof(double));
     m->spectrum_powers = (float*) malloc(points * sizeof(float));
     m->spectrum_counts = (int*)   malloc(points * sizeof(int));
+    
     if (!m->spectrum_freqs || !m->spectrum_powers || !m->spectrum_counts) {
         if (m->spectrum_freqs)  free(m->spectrum_freqs);
         if (m->spectrum_powers) free(m->spectrum_powers);
         if (m->spectrum_counts) free(m->spectrum_counts);
-        m->spectrum_freqs = NULL; m->spectrum_powers = NULL; m->spectrum_counts = NULL;
+        m->spectrum_freqs = NULL; 
+        m->spectrum_powers = NULL; 
+        m->spectrum_counts = NULL;
         m->spectrum_points = 0;
         return -1;
     }
 
+    // ВАЖНО: Инициализируем правильными значениями
     for (size_t i = 0; i < points; ++i) {
         m->spectrum_freqs[i]  = f_start_hz + (double)i * freq_step_hz;
-        m->spectrum_powers[i] = -INFINITY; // или, например, -200.f
+        m->spectrum_powers[i] = -120.0f;  // Начальное значение шумового пола
         m->spectrum_counts[i] = 0;
     }
 
     pthread_mutex_init(&m->spectrum_mutex, NULL);
+    
+    fprintf(stdout, "[HackRF Master] Spectrum grid initialized: %.1f-%.1f MHz, %zu points, step=%.3f MHz\n",
+            f_start_hz/1e6, f_stop_hz/1e6, points, freq_step_hz/1e6);
+    
     return 0;
 }
 
@@ -849,15 +938,10 @@ int hq_get_segment_mode(void) {
 }
 
 int hq_set_fft_size(int size) {
-    if (size < MIN_FFT_SIZE || size > MAX_FFT_SIZE) {
-        set_error("FFT size out of range [%d..%d]", MIN_FFT_SIZE, MAX_FFT_SIZE);
-        return -1;
-    }
-    // проверим, что степень 2
-    int v = size;
-    while ((v & 1) == 0) v >>= 1;
-    if (v != 1) { set_error("FFT size must be power of 2"); return -1; }
-
+    // Разрешаем любые N при условии (N+4)%8==0 для совместимости с форматами sweep
+    if (size < 4) size = 4;
+    if (size > 8180) size = 8180;
+    while (((size + 4) % 8) != 0 && size < 8180) size++;
     if (g_master) g_master->fft_size_override = size;
     return 0;
 }

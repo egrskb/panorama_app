@@ -13,9 +13,8 @@ from collections import deque, defaultdict
 
 from PyQt5.QtCore import QObject, pyqtSignal, QMutex, QTimer
 
-from panorama.features.spectrum.master import MasterSweepController
 from panorama.features.spectrum.model import DetectedPeak
-from panorama.features.slave_sdr.slave import (
+from panorama.features.slave_controller.slave import (
     RSSIMeasurement,
     MeasurementWindow,
     SlaveManager,
@@ -59,7 +58,7 @@ class Orchestrator(QObject):
         super().__init__()
         self.log = logger
 
-        self.master_controller: Optional[MasterSweepController] = None
+        self.master_controller: Optional[object] = None
         self.slave_manager: Optional[SlaveManager] = None
         self.trilateration_engine: Optional[RSSITrilaterationEngine] = None
         
@@ -81,6 +80,9 @@ class Orchestrator(QObject):
 
         self._mutex = QMutex()
 
+        # Соответствие центра окна (Hz) -> peak_id из watchlist
+        self._center_to_peak_id: Dict[float, str] = {}
+
         self._cleanup_timer = QTimer(self)
         self._cleanup_timer.timeout.connect(self._cleanup_old)
         self._cleanup_timer.start(5000)
@@ -93,7 +95,7 @@ class Orchestrator(QObject):
 
     # ───────────────────────── wiring ─────────────────────────
 
-    def set_master_controller(self, master: MasterSweepController):
+    def set_master_controller(self, master: object):
         self.master_controller = master
         if master:
             master.peak_detected.connect(self._on_peak_detected)
@@ -122,10 +124,17 @@ class Orchestrator(QObject):
     
     def _get_peak_id_for_freq(self, center_hz: float) -> Optional[str]:
         """Извлекает peak_id из watchlist по частоте."""
-        # Простая реализация - можно улучшить
-        for tid, task in self.tasks.items():
-            if abs(task.window.center - center_hz) < 1e3:  # В пределах 1 кГц
-                return tid
+        # Сначала пробуем прямое сопоставление из карты
+        # с допуском по частоте в 1 кГц
+        best_peak_id: Optional[str] = None
+        best_delta = 1e9
+        for c, pid in list(self._center_to_peak_id.items()):
+            d = abs(c - center_hz)
+            if d < best_delta:
+                best_delta = d
+                best_peak_id = pid
+        if best_peak_id is not None and best_delta <= 1e3:
+            return best_peak_id
         return None
 
     # ─────────────────────── public API (UI) ───────────────────────
@@ -218,6 +227,40 @@ class Orchestrator(QObject):
         self._emit_status()
         self._process_queue()
 
+    # ─────────────────────── watchlist → orchestrator ───────────────────────
+
+    def enqueue_watchlist_task(self, task: Dict[str, float]):
+        """
+        Принимает задачу от PeakWatchlistManager: {peak_id, center_freq_hz, span_hz, ...}
+        Ставит окно на измерение всеми слейвами.
+        """
+        if not self.slave_manager:
+            self._emit_error("No slave manager: skip watchlist task")
+            return
+        try:
+            center = float(task.get('center_freq_hz'))
+            span = float(task.get('span_hz', self.global_span_hz))
+            dwell = int(self.global_dwell_ms)
+            peak_id = str(task.get('peak_id', f"peak_{int(center)}"))
+
+            window = MeasurementWindow(center=center, span=span, dwell_ms=dwell, epoch=time.time())
+            task_id = f"{peak_id}_{int(center)}_{int(span)}_{int(window.epoch)}"
+            # Формируем суррогат DetectedPeak для совместимости (минимальный набор полей)
+            dp = DetectedPeak(freq_hz=center, snr_db=0.0, power_dbm=0.0, band_hz=span / 2.0, idx=0,
+                              id=peak_id, f_peak=center, bin_hz=span, t0=window.epoch, last_seen=window.epoch,
+                              span_user=span, status="ACTIVE")
+            mt = MeasurementTask(id=task_id, peak=dp, window=window, status="PENDING", created_at=time.time())
+            self.tasks[task_id] = mt
+            self.queue.append(task_id)
+            # Запоминаем соответствие частоты → peak_id
+            self._center_to_peak_id[center] = peak_id
+            self.task_created.emit(mt)
+            self.log.info(f"Watchlist task queued: {peak_id} f={center/1e6:.3f} MHz span={span/1e6:.3f} MHz")
+            self._emit_status()
+            self._process_queue()
+        except Exception as e:
+            self._emit_error(f"enqueue_watchlist_task error: {e}")
+
     def _process_queue(self):
         if not self.queue or not self.slave_manager:
             return
@@ -283,7 +326,7 @@ class Orchestrator(QObject):
                 # Передаем в координатор трилатерации
                 if self.trilateration_coordinator:
                     for measurement in valid:
-                        # Извлекаем peak_id из watchlist
+                        # Извлекаем peak_id из сопоставления
                         peak_id = self._get_peak_id_for_freq(measurement.center_hz)
                         if peak_id:
                             self.trilateration_coordinator.add_slave_rssi_measurement(
@@ -374,3 +417,71 @@ class Orchestrator(QObject):
             self.target_detected.emit(result)
         except Exception:
             pass
+
+    # ───────────────────────── UI snapshot for SlavesView ─────────────────────────
+    def get_ui_snapshot(self) -> Dict:
+        """
+        Возвращает снимок данных для ImprovedSlavesView:
+          - watchlist: [{id, freq, span, rssi_1, rssi_2, rssi_3, updated}]
+          - tasks:     [{id, range, status, progress, time, priority, timestamp}]
+          - rssi_measurements: [{range, slave_id, rssi_rms}]
+        """
+        snapshot: Dict[str, Any] = {}
+
+        # Watchlist из координатора (если подключен)
+        try:
+            wl_ui = []
+            if self.trilateration_coordinator is not None:
+                pm = self.trilateration_coordinator.peak_manager
+                for entry in pm.watchlist.values():
+                    # entry: WatchlistEntry
+                    rssi_vals = entry.rssi_measurements if entry.rssi_measurements else {}
+                    wl_ui.append({
+                        'id': entry.peak_id,
+                        'freq': entry.center_freq_hz / 1e6,
+                        'span': (entry.freq_stop_hz - entry.freq_start_hz) / 1e6,
+                        'rssi_1': rssi_vals.get('slave0'),
+                        'rssi_2': rssi_vals.get('slave1'),
+                        'rssi_3': rssi_vals.get('slave2'),
+                        'updated': time.strftime('%H:%M:%S', time.localtime(entry.last_update))
+                    })
+            snapshot['watchlist'] = wl_ui
+        except Exception as e:
+            self._emit_error(f"get_ui_snapshot: watchlist error: {e}")
+
+        # Задачи
+        try:
+            tasks_ui = []
+            for t in self.tasks.values():
+                rng = f"{(t.window.center - t.window.span/2)/1e6:.1f}-{(t.window.center + t.window.span/2)/1e6:.1f}"
+                tasks_ui.append({
+                    'id': t.id,
+                    'range': rng,
+                    'status': t.status,
+                    'progress': 100 if t.status == 'COMPLETED' else (50 if t.status == 'RUNNING' else 0),
+                    'time': time.strftime('%H:%M:%S', time.localtime(t.created_at)),
+                    'priority': 'NORMAL',
+                    'timestamp': t.created_at
+                })
+            snapshot['tasks'] = tasks_ui
+        except Exception as e:
+            self._emit_error(f"get_ui_snapshot: tasks error: {e}")
+
+        # RSSI измерения из завершённых задач
+        try:
+            measurements_ui = []
+            for t in self.tasks.values():
+                if not t.measurements:
+                    continue
+                rng = f"{(t.window.center - t.window.span/2)/1e6:.1f}-{(t.window.center + t.window.span/2)/1e6:.1f}"
+                for m in t.measurements:
+                    measurements_ui.append({
+                        'range': rng,
+                        'slave_id': m.slave_id,
+                        'rssi_rms': m.band_rssi_dbm
+                    })
+            snapshot['rssi_measurements'] = measurements_ui
+        except Exception as e:
+            self._emit_error(f"get_ui_snapshot: rssi error: {e}")
+
+        return snapshot

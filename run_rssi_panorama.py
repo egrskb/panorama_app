@@ -46,14 +46,14 @@ def setup_environment():
     
     # Проверяем наличие наших модулей
     try:
-       from panorama.features.spectrum.master import MasterSweepController
-       print("✓ Модуль Master доступен")
+        from panorama.features.spectrum.master_adapter import MasterSourceAdapter
+        print("✓ Модуль Master (source adapter) доступен")
     except ImportError as e:
-        print(f"✗ Модуль Master не найден: {e}")
+        print(f"✗ Модуль Master (source adapter) не найден: {e}")
         return False
     
     try:
-        from panorama.features.slave_sdr.slave import SlaveManager
+        from panorama.features.slave_controller.slave import SlaveManager
         print("✓ Модуль Slave доступен")
     except ImportError as e:
         print(f"✗ Модуль Slave не найден: {e}")
@@ -67,7 +67,7 @@ def setup_environment():
         return False
     
     try:
-        from panorama.features.orchestrator.core import Orchestrator
+        from panorama.features.slave_controller.orchestrator import Orchestrator
         print("✓ Модуль оркестратора доступен")
     except ImportError as e:
         print(f"✗ Модуль оркестратора не найден: {e}")

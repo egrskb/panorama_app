@@ -447,18 +447,7 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
         self.slaves_table.horizontalHeader().setStretchLastSection(False)
         slaves_layout.addWidget(self.slaves_table)
         
-        # Кнопки для предустановленных позиций
-        preset_layout = QtWidgets.QHBoxLayout()
-        btn_triangle = QtWidgets.QPushButton("📐 Треугольник")
-        btn_triangle.clicked.connect(self._preset_triangle)
-        btn_square = QtWidgets.QPushButton("⬜ Квадрат")
-        btn_square.clicked.connect(self._preset_square)
-        btn_line = QtWidgets.QPushButton("📏 Линия")
-        btn_line.clicked.connect(self._preset_line)
-        preset_layout.addWidget(btn_triangle)
-        preset_layout.addWidget(btn_square)
-        preset_layout.addWidget(btn_line)
-        slaves_layout.addLayout(preset_layout)
+        # Убираем предустановленные формы (треугольник/квадрат/линия) — трилатерация на 3 SDR
         
         right_layout.addWidget(slaves_group)
         
@@ -894,6 +883,14 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
                     for device in self.slave_devices
                 ]
             }
+
+            # Гарантируем, что slave0 всегда в (0,0,0) и сохраняется так в конфигурации
+            for s in config.get('slaves', []):
+                try:
+                    if (s.get('nickname') or s.get('label') or '').lower() == 'slave0':
+                        s['pos'] = [0.0, 0.0, float(s['pos'][2]) if isinstance(s.get('pos'), list) and len(s['pos']) > 2 else 0.0]
+                except Exception:
+                    pass
             
             print(f"DEBUG: Auto-saving config: {len(config.get('slaves', []))} slaves")
             
@@ -948,6 +945,14 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
                 for device in self.slave_devices
             ]
         }
+
+        # Гарантируем, что slave0 всегда в (0,0,0)
+        for s in config.get('slaves', []):
+            try:
+                if (s.get('nickname') or s.get('label') or '').lower() == 'slave0':
+                    s['pos'] = [0.0, 0.0, float(s['pos'][2]) if isinstance(s.get('pos'), list) and len(s['pos']) > 2 else 0.0]
+            except Exception:
+                pass
         
         # Эмитим сигнал с конфигурацией
         self.devicesConfigured.emit(config)

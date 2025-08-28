@@ -152,7 +152,7 @@ class PeakWatchlistManager(QObject):
                 self._previous_peaks.add(peak.center_freq_hz)
                 
                 # Добавляем в watchlist если подтвержден
-                if peak.consecutive_detections >= self.min_confirmation_sweeps:
+                if peak.consecutive_detections >= max(1, self.min_confirmation_sweeps):
                     self._add_to_watchlist(peak, user_span_hz or self.watchlist_span_hz)
         
         # Эмитим сигналы для новых пиков

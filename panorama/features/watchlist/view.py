@@ -86,16 +86,20 @@ class ImprovedSlavesView(QWidget):
 
         # Основной сплиттер
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
 
         # Левая панель - RSSI матрица
         left_panel = self._create_rssi_panel()
+        left_panel.setMinimumWidth(500)
+        left_panel.setSizePolicy(left_panel.sizePolicy().horizontalPolicy(), left_panel.sizePolicy().verticalPolicy())
         splitter.addWidget(left_panel)
 
         # Правая панель - Watchlist и задачи
         right_panel = self._create_watchlist_panel()
+        right_panel.setMinimumWidth(400)
         splitter.addWidget(right_panel)
 
-        splitter.setSizes([700, 500])
+        splitter.setSizes([800, 600])
         layout.addWidget(splitter)
 
         # Статус бар
@@ -135,35 +139,13 @@ class ImprovedSlavesView(QWidget):
         group = QGroupBox("📊 Матрица RSSI RMS (дБм)")
         layout = QVBoxLayout(group)
 
-        # Контролы фильтрации
-        filter_layout = QHBoxLayout()
-
-        self.range_filter = QComboBox()
-        self.range_filter.addItem("Все диапазоны")
-        self.range_filter.currentTextChanged.connect(self._filter_rssi_table)
-        filter_layout.addWidget(QLabel("Диапазон:"))
-        filter_layout.addWidget(self.range_filter)
-
-        self.threshold_spin = QSpinBox()
-        self.threshold_spin.setRange(-120, 0)
-        self.threshold_spin.setValue(-70)
-        self.threshold_spin.setSuffix(" дБм")
-        self.threshold_spin.setToolTip("Порог подсветки RSSI")
-        self.threshold_spin.valueChanged.connect(self._update_rssi_colors)
-        filter_layout.addWidget(QLabel("Порог:"))
-        filter_layout.addWidget(self.threshold_spin)
-
-        filter_layout.addStretch()
-
-        self.auto_scroll = QCheckBox("Автопрокрутка")
-        self.auto_scroll.setChecked(True)
-        filter_layout.addWidget(self.auto_scroll)
-
-        layout.addLayout(filter_layout)
+        # Убираем фильтры/порог — диапазоны добавляет мастер автоматически
 
         # Таблица RSSI с правильными заголовками
         self.rssi_table = QTableWidget()
         self.rssi_table.setAlternatingRowColors(True)
+        self.rssi_table.horizontalHeader().setStretchLastSection(True)
+        self.rssi_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
 
         # Инициализация таблицы с правильной структурой
         self._setup_rssi_table()
@@ -215,9 +197,14 @@ class ImprovedSlavesView(QWidget):
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        # Информационная панель
+        # Информационная панель и пояснения
         info_panel = QLabel(
-            "📍 Диапазоны добавляются автоматически через детектор при обнаружении сигналов"
+            "📍 Диапазоны добавляются автоматически через детектор при обнаружении сигналов\n"
+            "\n"
+            "• Частота (МГц): центр обнаруженного сигнала.\n"
+            "• Ширина (МГц): полный диапазон измерения RSSI (пик ± span/2).\n"
+            "• RSSI_1..3: измеренный усреднённый уровень мощности у каждого Slave.\n"
+            "• Обновлено: время последнего поступившего измерения."
         )
         info_panel.setWordWrap(True)
         info_panel.setStyleSheet("""
@@ -393,34 +380,12 @@ class ImprovedSlavesView(QWidget):
         self.rssi_table.setColumnCount(len(headers))
         self.rssi_table.setHorizontalHeaderLabels(headers)
         
-        # Примеры диапазонов (будут заполняться автоматически из детектора)
-        sample_ranges = [
-            "433.0-435.0",
-            "868.0-870.0",
-            "2400.0-2450.0",
-            "2450.0-2500.0",
-            "5725.0-5825.0",
-            "5825.0-5875.0"
-        ]
-        
-        self.rssi_table.setRowCount(len(sample_ranges))
-        
-        for row, range_str in enumerate(sample_ranges):
-            # Диапазон
-            range_item = QTableWidgetItem(range_str)
-            range_item.setFont(QFont("Arial", 10, QFont.Bold))
-            self.rssi_table.setItem(row, 0, range_item)
-            
-            # RSSI для каждого Slave (изначально пустые)
-            for col in range(1, 4):  # Slave0, Slave1, Slave2
-                rssi_item = QTableWidgetItem("—")
-                rssi_item.setTextAlignment(Qt.AlignCenter)
-                self.rssi_table.setItem(row, col, rssi_item)
+        # Без заглушек. Пустая таблица — строки будут добавляться из детектора/оркестратора
+        self.rssi_table.setRowCount(0)
         
         # Настройка ширины колонок
         header = self.rssi_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Fixed)
-        header.resizeSection(0, 150)  # Диапазон
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         for i in range(1, 4):
             header.setSectionResizeMode(i, QHeaderView.Stretch)
 

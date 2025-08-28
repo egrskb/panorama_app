@@ -70,7 +70,6 @@ def load_detector_settings() -> Dict[str, Any]:
         "smoothing_window": 7,
         "ema_enabled": True,         # Включено по умолчанию
         "ema_alpha": 0.3,
-        "interpolation_enabled": True
     }
 
 
@@ -90,7 +89,4 @@ def get_coverage_threshold() -> float:
     return float(settings.get("coverage_threshold", 0.95))
 
 
-def get_interpolation_enabled() -> bool:
-    """Получает значение interpolation_enabled из настроек детектора."""
-    settings = load_detector_settings()
-    return bool(settings.get("interpolation_enabled", True))
+# interpolation setting removed
