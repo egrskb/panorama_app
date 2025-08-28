@@ -288,7 +288,8 @@ class SpectrumView(QtWidgets.QWidget):
         vb.setLimits(xMin=50.0, xMax=6000.0, maxXRange=6000.0-50.0)
         
         # Линии спектра
-        self.curve_now = pg.PlotCurveItem([], [], pen=pg.mkPen('#FFFFFF', width=1))
+        # Текущая линия как PlotDataItem, чтобы включить заливку под кривой
+        self.curve_now = pg.PlotDataItem([], [], pen=pg.mkPen('#FFFFFF', width=1))
         self.curve_avg = pg.PlotCurveItem([], [], pen=pg.mkPen('#00FF00', width=1))
         self.curve_min = pg.PlotCurveItem([], [], pen=pg.mkPen((120, 120, 255), width=1))
         self.curve_max = pg.PlotCurveItem([], [], pen=pg.mkPen('#FFC800', width=1))
@@ -325,8 +326,9 @@ class SpectrumView(QtWidgets.QWidget):
         self._lut = get_colormap(self._lut_name, 256)
         self._wf_levels = (-110.0, -20.0)
         
-        # Подписываемся на изменение диапазона графика для авто-разрешения
+        # Подписываемся на изменение диапазона графика для авто-разрешения и обновления заливки
         self.plot.getViewBox().sigRangeChanged.connect(lambda *_: self._zoom_debounce.start())
+        self.plot.getViewBox().sigRangeChanged.connect(lambda *_: self._update_fill_under_curve())
 
         # Бейдж со span и разрешением
         self._span_badge = pg.TextItem(text="", color=pg.mkColor(180, 220, 255), anchor=(1, 1),
@@ -873,8 +875,11 @@ class SpectrumView(QtWidgets.QWidget):
             alpha_viz = 0.28  # чуть плавнее визуально
             self._smooth_display_y = (1.0 - alpha_viz) * self._smooth_display_y + alpha_viz * yd
             self.curve_now.setData(xd, self._smooth_display_y.astype(np.float32, copy=False))
+            # Включаем красивую заливку под текущей кривой относительно нижней границы графика
+            self._apply_fill_under_curve()
         except Exception:
             self.curve_now.setData(xd, yd)
+            self._apply_fill_under_curve()
 
         # EMA, min/max считаем на полных данных:
         if getattr(self, "_ema_last", None) is None:
@@ -911,6 +916,25 @@ class SpectrumView(QtWidgets.QWidget):
         # Обновляем бейдж с разрешением
         self._update_resolution_badge()
 
+    def _apply_fill_under_curve(self):
+        """Настраивает заливку под текущей кривой с учётом текущего диапазона Y."""
+        try:
+            vb = self.plot.getViewBox()
+            if vb is None:
+                return
+            y0, y1 = vb.viewRange()[1]
+            # Базовая линия для заливки — нижняя граница видимого диапазона
+            base = float(y0)
+            brush = pg.mkBrush(255, 255, 255, 45)  # мягкая белая заливка
+            self.curve_now.setFillLevel(base)
+            self.curve_now.setBrush(brush)
+        except Exception:
+            pass
+
+    def _update_fill_under_curve(self):
+        """Обновляет базовый уровень заливки при изменении масштаба/диапазона."""
+        self._apply_fill_under_curve()
+
     def _refresh_spectrum(self):
         """Обновление линий спектра."""
         if self._model.freqs_hz is None or self._model.power_dbm is None:
@@ -943,21 +967,21 @@ class SpectrumView(QtWidgets.QWidget):
         else:
             self.curve_now.setData([], [])
         
-        # Средняя линия
+        # Средняя линия (исправлено: используем накопитель _avg_queue, актуализируем на каждом свипе)
+        try:
+            # Обновляем очередь усреднения сырыми (несглаженными) данными
+            self._avg_queue.append(self._model.power_dbm.copy())
+        except Exception:
+            pass
+
         if self.chk_avg.isChecked() and len(self._avg_queue) > 0:
-            # Вычисляем среднее из очереди
-            avg_window = min(self.avg_win.value(), len(self._avg_queue))
-            if avg_window > 0:
-                # Берем последние N свипов
-                recent_sweeps = list(self._avg_queue)[-avg_window:]
-                avg_power = np.mean(recent_sweeps, axis=0)
-                
-                # Применяем сглаживание если включено
-                if self.chk_smooth.isChecked():
-                    avg_power = self._smooth_freq(avg_power)
-                # Даунсемплинг средней линии
-                xd, yd = self._downsample_line(x_mhz, avg_power, target_cols)
-                self.curve_avg.setData(xd, yd)
+            avg_window = int(max(1, min(self.avg_win.value(), len(self._avg_queue))))
+            recent_sweeps = list(self._avg_queue)[-avg_window:]
+            avg_power = np.mean(recent_sweeps, axis=0).astype(np.float32, copy=False)
+            if self.chk_smooth.isChecked():
+                avg_power = self._smooth_freq(avg_power)
+            xd, yd = self._downsample_line(x_mhz, avg_power, target_cols)
+            self.curve_avg.setData(xd, yd)
         else:
             self.curve_avg.setData([], [])
         
