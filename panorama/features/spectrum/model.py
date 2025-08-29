@@ -44,116 +44,7 @@ class DetectedPeak:
     status: str = "ACTIVE"  # Статус пика
 
 
-# ---------- Общая реализация детекции (ядро) ----------
-
-def _detect_peaks_core(
-    freqs_hz: np.ndarray,
-    power_dbm: np.ndarray,
-    snr_threshold_db: float = 10.0,
-    min_peak_bins: int = 3,
-    min_peak_distance_bins: int = 5,
-    peak_band_hz: float = 5e6,
-) -> List[DetectedPeak]:
-    """Чистая детекция пиков без зависимостей от Qt/модели."""
-    if freqs_hz is None or power_dbm is None:
-        return []
-    f = np.asarray(freqs_hz, dtype=np.float32)
-    p = np.asarray(power_dbm, dtype=np.float32)
-    if f.ndim != 1 or p.ndim != 1 or f.size == 0 or f.size != p.size:
-        return []
-
-    floor = np.median(p)
-    snr = p - floor
-
-    # локальные максимумы (не смотрим крайние точки)
-    cand = np.where((p[1:-1] > p[:-2]) & (p[1:-1] > p[2:]))[0] + 1
-    if cand.size == 0:
-        return []
-
-    # порог по SNR
-    cand = cand[snr[cand] >= snr_threshold_db]
-    if cand.size == 0:
-        return []
-
-    # грубая оценка ширины на -3 дБ
-    good_idx: List[int] = []
-    for i in cand:
-        left = i
-        right = i
-        half = p[i] - 3.0
-        while left > 0 and p[left] > half:
-            left -= 1
-        while right < p.size - 1 and p[right] > half:
-            right += 1
-        width_bins = right - left + 1
-        if width_bins >= min_peak_bins:
-            good_idx.append(i)
-    if not good_idx:
-        return []
-
-    # подавление близких пиков — оставляем более мощный
-    idxs = np.array(good_idx, dtype=int)
-    if idxs.size > 1:
-        idxs = idxs[np.argsort(p[idxs])[::-1]]  # по убыванию мощности
-        selected: List[int] = []
-        taken = np.zeros_like(p, dtype=bool)
-        for i in idxs:
-            if taken[i]:
-                continue
-            lo = max(0, i - min_peak_distance_bins)
-            hi = min(p.size, i + min_peak_distance_bins + 1)
-            taken[lo:hi] = True
-            selected.append(int(i))
-        idxs = np.array(sorted(selected), dtype=int)
-
-    band = float(peak_band_hz)
-    peaks: List[DetectedPeak] = []
-    for i in idxs:
-        peaks.append(
-            DetectedPeak(
-                freq_hz=float(f[i]),
-                snr_db=float(snr[i]),
-                power_dbm=float(p[i]),
-                band_hz=band,
-                idx=int(i),
-            )
-        )
-    return peaks
-
-
-# ---------- Класс PeakDetector (ожидается другими модулями) ----------
-
-class PeakDetector:
-    """
-    Независимый детектор пиков.
-    Совместим с импортом: from panorama.features.spectrum.model import PeakDetector
-    """
-    def __init__(
-        self,
-        snr_threshold_db: float = 10.0,
-        min_peak_bins: int = 3,
-        min_peak_distance_bins: int = 5,
-        peak_band_hz: float = 5e6,
-    ) -> None:
-        self.snr_threshold_db = float(snr_threshold_db)
-        self.min_peak_bins = int(min_peak_bins)
-        self.min_peak_distance_bins = int(min_peak_distance_bins)
-        self.peak_band_hz = float(peak_band_hz)
-
-    def detect(self, freqs_hz: np.ndarray, power_dbm: np.ndarray) -> List[DetectedPeak]:
-        """Вернуть список пиков по текущим настройкам детектора."""
-        return _detect_peaks_core(
-            freqs_hz=freqs_hz,
-            power_dbm=power_dbm,
-            snr_threshold_db=self.snr_threshold_db,
-            min_peak_bins=self.min_peak_bins,
-            min_peak_distance_bins=self.min_peak_distance_bins,
-            peak_band_hz=self.peak_band_hz,
-        )
-
-    def detect_peaks(self, freqs_hz: np.ndarray, power_dbm: np.ndarray) -> List[DetectedPeak]:
-        """Совместимый метод для обратной совместимости."""
-        return self.detect(freqs_hz, power_dbm)
+# (Удалено) Универсальный детектор пиков и класс PeakDetector
 
 
 # ---------- Модель спектра (для UI + хранение водопада) ----------
@@ -338,15 +229,7 @@ class SpectrumModel(QObject if _HAS_QT else object):
         self.waterfall.append(row.copy())
         self._emit_waterfall()
 
-    def detect_peaks(self) -> List[DetectedPeak]:
-        return _detect_peaks_core(
-            freqs_hz=self.freqs_hz,
-            power_dbm=self.power_dbm,
-            snr_threshold_db=self.snr_threshold_db,
-            min_peak_bins=self.min_peak_bins,
-            min_peak_distance_bins=self.min_peak_distance_bins,
-            peak_band_hz=self.peak_band_hz,
-        )
+    # (Удалено) detect_peaks(): универсальная детекция не используется в активной цепочке
 
     # --- сигналы/статусы ---
     def _emit_spectrum(self) -> None:
