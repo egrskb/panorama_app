@@ -5,38 +5,20 @@
 """
 
 import sys
-import os
 import logging
 import time
-from pathlib import Path
-from PyQt5 import QtWidgets, QtCore, QtGui
-from PyQt5.QtCore import QSettings, QTimer
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout
-from PyQt5.QtWidgets import QTabWidget, QGroupBox, QLabel, QPushButton, QSpinBox, QDoubleSpinBox
-from PyQt5.QtWidgets import QTextEdit, QTableWidget, QTableWidgetItem, QComboBox, QCheckBox
-from PyQt5.QtWidgets import QSplitter, QFrame, QMessageBox, QFileDialog, QFormLayout
-import numpy as np
+from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QTableWidgetItem, QMessageBox, QFileDialog
 
 # Импортируем наши модули
-from panorama.features.spectrum.master_adapter import MasterSourceAdapter
-from panorama.features.slave_controller.slave import SlaveManager
-from panorama.features.trilateration import RSSITrilaterationEngine
-from panorama.features.slave_controller.orchestrator import Orchestrator
-from panorama.features.calibration.manager import CalibrationManager
+from panorama.core.status_manager import SystemStatusManager
+from panorama.core.config_manager import ConfigurationManager
+from panorama.core.components_manager import ComponentsManager
+from panorama.core.error_handler import ErrorHandler, safe_method
+from panorama.ui.main_ui_manager import MainUIManager
 
-# Импортируем существующие модули для совместимости
-from panorama.features.map import OpenLayersMapWidget
-from panorama.features.spectrum import SpectrumView
-from panorama.features.settings.dialog import SettingsDialog
+# Импортируем модули для диалогов
 from panorama.features.settings.manager_improved import ImprovedDeviceManagerDialog
-from panorama.features.settings.storage import load_sdr_settings, save_sdr_settings
-from panorama.features.spectrum.master_adapter import MasterSourceAdapter
-from panorama.features.detector.settings_dialog import (
-    DetectorSettingsDialog, DetectorSettings, load_detector_settings, apply_settings_to_watchlist_manager
-)
-from panorama.features.watchlist.view import ImprovedSlavesView
-from panorama.features.detector.peak_watchlist_manager import PeakWatchlistManager
-from panorama.features.trilateration.coordinator import TrilaterationCoordinator
+from panorama.features.detector.settings_dialog import DetectorSettingsDialog, DetectorSettings
 
 
 class RSSIPanoramaMainWindow(QMainWindow):
@@ -48,36 +30,61 @@ class RSSIPanoramaMainWindow(QMainWindow):
         # Настройка логирования
         self._setup_logging()
         
+        # Обработчик ошибок
+        self.error_handler = ErrorHandler(self.log, self)
+        
+        # Менеджер конфигурации
+        self.config_manager = ConfigurationManager(self, self.log)
+        
+        # Менеджер компонентов
+        self.components_manager = ComponentsManager(self.config_manager, self.log)
+        
         # Инициализация компонентов
-        self._init_components()
+        success = self.components_manager.initialize_all_components()
+        if not success:
+            QMessageBox.critical(self, "Ошибка инициализации", 
+                               "Не удалось инициализировать компоненты системы")
+        
+        # Получаем ссылки на компоненты
+        self._setup_component_references()
+        
+        # Создание UI менеджера
+        self.ui_manager = MainUIManager(self, self.orchestrator, self.log)
         
         # Настройка UI
-        self._setup_ui()
+        self.ui_manager.setup_main_ui()
+        
+        # Получаем ссылки на основные виджеты через UI менеджер
+        self.map_view = self.ui_manager.get_map_view()
+        self.spectrum_view = self.ui_manager.get_spectrum_view()
+        self.slaves_view = self.ui_manager.get_slaves_view()
         
         # Подключение сигналов
         self._connect_signals()
+        
+        # Подключаем сигналы UI менеджера к методам главного окна
+        self._connect_ui_signals()
+        
+        # Подключаем трилатерацию к спектру (после создания UI)
+        self._connect_trilateration()
+        
+        # Обновляем карту с текущими настройками
+        if hasattr(self, 'sdr_settings') and self.sdr_settings:
+            self.ui_manager.update_stations_from_config(self.sdr_settings)
         
         # Загрузка калибровки
         self._load_calibration()
         
         # Проверяем наличие конфигурации Master (БЕЗ инициализации SDR)
-        self.master_ready = self._check_and_init_master()
+        self.master_ready = self.config_manager.is_master_configured()
         
         # Обновляем состояние кнопок в зависимости от наличия конфигурации Master
         self._update_ui_for_master_status()
         
-        # Статус системы
-        self.system_status = {
-            'master_running': False,
-            'orchestrator_running': False,
-            'n_slaves': 0,
-            'n_targets': 0
-        }
-        
-        # Таймер обновления статуса
-        self.status_timer = QTimer()
-        self.status_timer.timeout.connect(self._update_status)
-        self.status_timer.start(1000)  # Каждую секунду
+        # Менеджер статуса системы
+        self.status_manager = SystemStatusManager(self, update_interval_ms=1000)
+        self.status_manager.status_updated.connect(self._on_status_updated)
+        self._setup_status_callbacks()
         
         self.log.info("ПАНОРАМА RSSI initialized")
     
@@ -96,116 +103,51 @@ class RSSIPanoramaMainWindow(QMainWindow):
         
         self.log.addHandler(console_handler)
     
-    def _init_components(self):
-        """Инициализирует основные компоненты системы."""
+    def _setup_status_callbacks(self):
+        """Настраивает callbacks для обновления статуса системы."""
+        # Регистрируем callbacks для получения статуса компонентов
+        if self.master_controller:
+            self.status_manager.register_status_callback(
+                'master_running', 
+                lambda: bool(getattr(self.master_controller, 'is_running', False))
+            )
+        
+        if self.orchestrator:
+            self.status_manager.register_status_callback(
+                'orchestrator_running',
+                lambda: self.orchestrator.is_running if hasattr(self.orchestrator, 'is_running') else False
+            )
+        
+        if self.slave_manager:
+            self.status_manager.register_status_callback(
+                'n_slaves',
+                lambda: len(self.slave_manager.slaves) if self.slave_manager else 0
+            )
+    
+    def _on_status_updated(self, status: dict):
+        """Обрабатывает обновление статуса системы."""
         try:
-            # Менеджер калибровки
-            self.calibration_manager = CalibrationManager(self.log)
-            
-            # Движок трилатерации
-            self.trilateration_engine = RSSITrilaterationEngine()
-            
-            # Менеджер slave SDR
-            self.slave_manager = SlaveManager(self.log)
-            
-            # Контроллер Master sweep больше не используется напрямую
-            self.master_controller = None
-            
-            # Оркестратор
-            self.orchestrator = Orchestrator(self.log)
-            
-            # Создаем менеджер пиков и координатор трилатерации
-            self.peak_watchlist_manager = PeakWatchlistManager()
-            self.trilateration_coordinator = TrilaterationCoordinator()
-            
-            # Устанавливаем span из UI
-            self.trilateration_coordinator.set_user_span(5.0)  # По умолчанию 5 МГц
-            
-            # Подключение к спектру будет выполнено после создания UI
-            
-            # Подключаем компоненты к оркестратору
-            self.orchestrator.set_master_controller(self.master_controller)
-            self.orchestrator.set_slave_manager(self.slave_manager)
-            self.orchestrator.set_trilateration_engine(self.trilateration_engine)
-            
-            # Подключаем координатор трилатерации к оркестратору
-            self.orchestrator.set_trilateration_coordinator(self.trilateration_coordinator)
-
-            # Применяем сохранённые настройки детектора к менеджеру пиков и оркестратору
-            try:
-                det_settings = load_detector_settings()
-                if det_settings:
-                    apply_settings_to_watchlist_manager(det_settings, self.trilateration_coordinator.peak_manager)
-                    self.orchestrator.set_global_parameters(
-                        span_hz=det_settings.watchlist_span_mhz * 1e6,
-                        dwell_ms=int(det_settings.watchlist_dwell_ms)
-                    )
-                    self.trilateration_coordinator.set_user_span(float(det_settings.watchlist_span_mhz))
-            except Exception:
-                pass
-            
-            # Загружаем настройки SDR (master/slaves) из JSON
-            self.sdr_settings = load_sdr_settings()
-
-            # Инициализируем слейвы из настроек сразу при старте
-            try:
-                self._init_slaves_from_settings()
-            except Exception as e:
-                self.log.error(f"Failed to init slaves from settings: {e}")
-
-            # Настраиваем трилатерацию
-            self._setup_trilateration()
-            
-            self.log.info("All components initialized successfully")
+            # Обновляем заголовок окна
+            title = self.status_manager.format_status_title()
+            self.setWindowTitle(title)
             
         except Exception as e:
-            self.log.error(f"Error initializing components: {e}")
-            QMessageBox.critical(self, "Ошибка инициализации", 
-                               f"Не удалось инициализировать компоненты: {e}")
+            self.log.error(f"Error updating UI from status: {e}")
+    
+    def _setup_component_references(self):
+        """Устанавливает ссылки на компоненты из менеджера компонентов."""
+        self.calibration_manager = self.components_manager.calibration_manager
+        self.trilateration_engine = self.components_manager.trilateration_engine
+        self.slave_manager = self.components_manager.slave_manager
+        self.master_controller = self.components_manager.master_controller
+        self.orchestrator = self.components_manager.orchestrator
+        self.peak_watchlist_manager = self.components_manager.peak_watchlist_manager
+        self.trilateration_coordinator = self.components_manager.trilateration_coordinator
+        
+        # Устанавливаем сохранённые настройки для совместимости
+        self.sdr_settings = self.config_manager.get_full_config()
+    
 
-    def _init_slaves_from_settings(self):
-        """Читает конфиг и инициализирует слейвы в SlaveManager."""
-        if not self.slave_manager or not self.sdr_settings:
-            return
-        # Очистим текущих
-        for sid in list(self.slave_manager.slaves.keys()):
-            self.slave_manager.remove_slave(sid)
-        # Добавим из конфига
-        for idx, s in enumerate(self.sdr_settings.get('slaves', []), start=1):
-            sid = s.get('nickname') or (s.get('label') or s.get('serial') or f"slave{idx:02d}")
-            uri = s.get('uri') or s.get('soapy') or (f"driver={s.get('driver')}" if s.get('driver') else '')
-            if (not uri) and s.get('serial'):
-                uri = f"serial={s.get('serial')}"
-            if uri:
-                ok = self.slave_manager.add_slave(sid, uri)
-                if not ok:
-                    self.log.error(f"Failed to init slave {sid} with uri={uri}")
-    
-    def _check_and_init_master(self):
-        """Проверяет наличие конфигурации Master устройства при старте (БЕЗ инициализации SDR)."""
-        try:
-            if not self.sdr_settings or 'master' not in self.sdr_settings:
-                self.log.warning("No SDR settings found - Master device not configured")
-                return False
-            
-            master_config = self.sdr_settings['master']
-            if not master_config or 'serial' not in master_config:
-                self.log.warning("Invalid master configuration - no serial number")
-                return False
-            
-            master_serial = master_config['serial']
-            if not master_serial or len(master_serial) < 16:
-                self.log.warning(f"Invalid master serial: {master_serial}")
-                return False
-            
-            self.log.info(f"Found master configuration: {master_serial}")
-            self.log.info("Master device configured but NOT initialized (will be initialized when needed)")
-            return True
-            
-        except Exception as e:
-            self.log.error(f"Error checking master configuration: {e}")
-            return False
-    
     def _update_ui_for_master_status(self):
         """Обновляет состояние UI в зависимости от наличия конфигурации Master устройства."""
         try:
@@ -230,218 +172,9 @@ class RSSIPanoramaMainWindow(QMainWindow):
         except Exception as e:
             self.log.error(f"Error updating UI for master status: {e}")
     
-    def _setup_trilateration(self):
-        """Настраивает движок трилатерации."""
-        try:
-            # Получаем параметры калибровки
-            cal_params = self.calibration_manager.get_calibration_parameters()
-            
-            if cal_params:
-                self.trilateration_engine.set_path_loss_exponent(cal_params['path_loss_exponent'])
-                self.trilateration_engine.set_reference_parameters(
-                    cal_params['reference_distance'],
-                    cal_params['reference_power']
-                )
-            
-            # Очищаем все станции
-            self.trilateration_engine.stations.clear()
-            
-            # НЕ добавляем Master в трилатерацию - он отвечает только за спектр
-            # Master добавляем только если он настроен
-            # master_config = self.sdr_settings.get('master', {})
-            # if master_config.get('serial') or master_config.get('uri'):
-            #     self.trilateration_engine.add_station("master", 0.0, 0.0, 0.0, 0.0)
-            
-            # Slaves добавляем только те, которые реально настроены
-            for s in self.sdr_settings.get('slaves', []):
-                # Проверяем, что устройство реально настроено
-                ser = s.get('serial', '')
-                uri = s.get('uri') or s.get('soapy') or ''
-                if ser or uri:  # Если есть хотя бы один идентификатор
-                    x, y, z = s.get('pos', [0.0, 0.0, 0.0])
-                    sid = s.get('nickname') or (s.get('label') or s.get('serial') or 'slave')
-                    self.trilateration_engine.add_station(sid, float(x), float(y), float(z), 0.0)
-            
-            stations_count = len(self.trilateration_engine.get_station_positions())
-            self.log.info(f"Trilateration engine configured with {stations_count} stations (Master excluded - spectrum only)")
-            
-        except Exception as e:
-            self.log.error(f"Error setting up trilateration: {e}")
-    
-    def _setup_ui(self):
-        """Настраивает пользовательский интерфейс."""
-        self.setWindowTitle("ПАНОРАМА RSSI - Система трилатерации по RSSI")
-        self.setGeometry(100, 100, 1400, 900)
-        # Современная тёмная тема: qdarkstyle (если доступен), иначе fallback на палитру
-        try:
-            import qdarkstyle  # type: ignore
-            self.setStyleSheet(qdarkstyle.load_stylesheet_pyqt5())
-        except Exception:
-            dark = QtGui.QPalette()
-            dark.setColor(QtGui.QPalette.Window, QtGui.QColor(30, 30, 30))
-            dark.setColor(QtGui.QPalette.WindowText, QtCore.Qt.white)
-            dark.setColor(QtGui.QPalette.Base, QtGui.QColor(25, 25, 25))
-            dark.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor(35, 35, 35))
-            dark.setColor(QtGui.QPalette.ToolTipBase, QtCore.Qt.white)
-            dark.setColor(QtGui.QPalette.ToolTipText, QtCore.Qt.white)
-            dark.setColor(QtGui.QPalette.Text, QtCore.Qt.white)
-            dark.setColor(QtGui.QPalette.Button, QtGui.QColor(45, 45, 45))
-            dark.setColor(QtGui.QPalette.ButtonText, QtCore.Qt.white)
-            dark.setColor(QtGui.QPalette.BrightText, QtCore.Qt.red)
-            dark.setColor(QtGui.QPalette.Link, QtGui.QColor(42, 130, 218))
-            dark.setColor(QtGui.QPalette.Highlight, QtGui.QColor(42, 130, 218))
-            dark.setColor(QtGui.QPalette.HighlightedText, QtCore.Qt.black)
-            self.setPalette(dark)
-            self.setStyleSheet("QToolTip { color: #ffffff; background-color: #2a82da; border: 1px solid white; }")
-        
-        # Центральный виджет
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        
-        # Основной layout - теперь только правая панель
-        main_layout = QVBoxLayout(central_widget)
-        
-        # Правая панель - карта, спектр и управление слейвами
-        right_panel = self._create_right_panel()
-        main_layout.addWidget(right_panel)
-        
-        # Создаем меню
-        self._create_menu()
-        
-        # Создаем панель инструментов
-        self._create_toolbar()
-        
-        # Подключаем трилатерацию к спектру (после создания UI)
-        self._connect_trilateration()
     
 
     
-    def _show_detector_settings(self):
-        """Показывает диалог настроек детектора."""
-        try:
-            dlg = DetectorSettingsDialog(self)
-            def _on_changed(s: DetectorSettings):
-                # Применяем некоторые глобальные параметры к оркестратору
-                try:
-                    if self.orchestrator:
-                        self.orchestrator.set_global_parameters(span_hz=s.watchlist_span_mhz * 1e6,
-                                                                dwell_ms=int(s.watchlist_dwell_ms))
-                    if self.trilateration_coordinator:
-                        self.trilateration_coordinator.set_user_span(float(s.watchlist_span_mhz))
-                    # Применяем параметры детектора к менеджеру пиков
-                    if self.trilateration_coordinator:
-                        apply_settings_to_watchlist_manager(s, self.trilateration_coordinator.peak_manager)
-                except Exception:
-                    pass
-            dlg.settingsChanged.connect(_on_changed)
-            dlg.exec_()
-        except Exception as e:
-            self.log.error(f"Detector settings dialog error: {e}")
-    
-    def _create_right_panel(self):
-        """Создает правую панель с картой, спектром и управлением слейвами."""
-        right_widget = QWidget()
-        layout = QVBoxLayout(right_widget)
-        
-
-        
-        # Создаем вкладки
-        tab_widget = QTabWidget()
-        
-        # Вкладка карты
-        self.map_view = OpenLayersMapWidget()
-        try:
-            if hasattr(self, 'sdr_settings') and self.sdr_settings:
-                self.map_view.update_stations_from_config(self.sdr_settings)
-        except Exception:
-            pass
-        tab_widget.addTab(self.map_view, "🗺️ Карта")
-        
-        # Вкладка спектра
-        self.spectrum_view = SpectrumView(orchestrator=self.orchestrator)
-        # Привязываем источник через адаптер, чтобы старт сразу запускал C-свип
-        try:
-            self.spectrum_view.set_source(MasterSourceAdapter(self.log))
-        except Exception:
-            pass
-        tab_widget.addTab(self.spectrum_view, "📊 Спектр")
-        
-        # Вкладка управления слейвами (объединяет watchlist, результаты и контроль)
-        self.slaves_view = ImprovedSlavesView(orchestrator=self.orchestrator)
-        tab_widget.addTab(self.slaves_view, "🎯 Слейвы")
-        
-        layout.addWidget(tab_widget)
-        
-        return right_widget
-    
-
-    
-    def _create_menu(self):
-        """Создает главное меню."""
-        menubar = self.menuBar()
-        
-        # Меню Файл
-        file_menu = menubar.addMenu('Файл')
-        
-        # Действие загрузки калибровки
-        load_cal_action = file_menu.addAction('Загрузить калибровку...')
-        load_cal_action.triggered.connect(self._load_calibration_dialog)
-        
-        # Действие сохранения калибровки
-        save_cal_action = file_menu.addAction('Сохранить калибровку...')
-        save_cal_action.triggered.connect(self._save_calibration_dialog)
-        
-        file_menu.addSeparator()
-        
-        # Действие выхода
-        exit_action = file_menu.addAction('Выход')
-        exit_action.triggered.connect(self.close)
-        
-        # Меню Настройки
-        settings_menu = menubar.addMenu('Настройки')
-        
-        # Действие настройки калибровки
-        cal_settings_action = settings_menu.addAction('Настройки калибровки...')
-        cal_settings_action.triggered.connect(self._show_calibration_settings)
-
-        # Действие настройки детектора
-        det_settings_action = settings_menu.addAction('Настройки детектора...')
-        det_settings_action.triggered.connect(self._show_detector_settings)
-        
-        # Меню Слейвы
-        slaves_menu = menubar.addMenu('🎯 Слейвы')
-        
-        # Действие обновления данных слейвов
-        refresh_slaves_action = slaves_menu.addAction('🔄 Обновить данные')
-        refresh_slaves_action.triggered.connect(self._refresh_slaves_data)
-        
-        # Действие экспорта состояния слейвов
-        export_slaves_action = slaves_menu.addAction('💾 Экспорт состояния...')
-        export_slaves_action.triggered.connect(self._export_slaves_state)
-        
-        slaves_menu.addSeparator()
-        
-        # Действие очистки данных слейвов
-        clear_slaves_action = slaves_menu.addAction('🗑️ Очистить данные')
-        clear_slaves_action.triggered.connect(self._clear_slaves_data)
-        
-        # Меню Справка
-        help_menu = menubar.addMenu('Справка')
-        
-        # Действие о программе
-        about_action = help_menu.addAction('О программе...')
-        about_action.triggered.connect(self._show_about)
-    
-    def _create_toolbar(self):
-        """Создает панель инструментов."""
-        toolbar = self.addToolBar('Основная панель')
-        # Убираем кнопку управления оркестратором — управление автоматически при наличии 1 master + >=2 slaves
-        
-        # Только новый диспетчер устройств
-        toolbar.addAction('🧭 Диспетчер устройств', self._open_device_manager)
-        
-        
-        # Убираем дублирование кнопки "Измерить" в тулбаре — остаётся кнопка в параметрах
     
     def _connect_signals(self):
         """Подключает сигналы компонентов."""
@@ -478,6 +211,24 @@ class RSSIPanoramaMainWindow(QMainWindow):
             self.log.info("All signals connected successfully")
         except Exception as e:
             self.log.error(f"Error connecting signals: {e}")
+    
+    def _connect_ui_signals(self):
+        """Подключает сигналы UI менеджера к методам главного окна."""
+        try:
+            # Подключаем сигналы UI менеджера к методам главного окна
+            self.ui_manager.load_calibration_requested.connect(self._load_calibration_dialog)
+            self.ui_manager.save_calibration_requested.connect(self._save_calibration_dialog)
+            self.ui_manager.calibration_settings_requested.connect(self._show_calibration_settings)
+            self.ui_manager.detector_settings_requested.connect(self._show_detector_settings)
+            self.ui_manager.refresh_slaves_requested.connect(self._refresh_slaves_data)
+            self.ui_manager.export_slaves_requested.connect(self._export_slaves_state)
+            self.ui_manager.clear_slaves_requested.connect(self._clear_slaves_data)
+            self.ui_manager.about_requested.connect(self._show_about)
+            self.ui_manager.device_manager_requested.connect(self._open_device_manager)
+            
+            self.log.info("UI signals connected successfully")
+        except Exception as e:
+            self.log.error(f"Error connecting UI signals: {e}")
 
     def _open_settings(self):
         # Устаревший диалог — переадресация на новый диспетчер
@@ -486,22 +237,25 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def _open_device_manager(self):
         current = {
             'master': {
-                'nickname': self.sdr_settings.get('master', {}).get('nickname', 'Master'),
-                'serial': self.sdr_settings.get('master', {}).get('serial', ''),
+                'nickname': self.config_manager.get_master_config().get('nickname', 'Master'),
+                'serial': self.config_manager.get_master_config().get('serial', ''),
                 'pos': [0.0, 0.0, 0.0],
             },
-            'slaves': self.sdr_settings.get('slaves', [])
+            'slaves': self.config_manager.get_slaves_config()
         }
         dlg = ImprovedDeviceManagerDialog(self, current)
         # Передаем Master контроллер для сканирования устройств
         if hasattr(dlg, 'set_master_controller'):
             dlg.set_master_controller(self.master_controller)
         def _on_conf(data: dict):
-            # Apply to runtime
-            self.sdr_settings = data
+            # Apply to runtime через конфигурационный менеджер
+            self.config_manager.update_configuration(data)
+            self.sdr_settings = self.config_manager.get_full_config()
+            
             # Master
             try:
-                serial = data.get('master', {}).get('serial')
+                master_config = self.config_manager.get_master_config()
+                serial = master_config.get('serial')
                 if self.master_controller and getattr(self.master_controller, 'sweep_source', None):
                     if not serial:
                         self.master_controller.stop_sweep()
@@ -510,37 +264,19 @@ class RSSIPanoramaMainWindow(QMainWindow):
                         self.master_controller.sweep_source.set_serial(serial)
             except Exception:
                 pass
-            # Rebuild slaves
+            
+            # Rebuild slaves через менеджер компонентов
             try:
-                if self.slave_manager:
-                    for sid in list(self.slave_manager.slaves.keys()):
-                        self.slave_manager.remove_slave(sid)
-                    for idx, s in enumerate(data.get('slaves', []), start=1):
-                        sid = s.get('nickname') or (s.get('label') or s.get('serial') or f"slave{idx:02d}")
-                        # поддержка форматов: uri, soapy, driver, serial
-                        uri = s.get('uri') or s.get('soapy') or (f"driver={s.get('driver')}" if s.get('driver') else '')
-                        if (not uri) and s.get('serial'):
-                            uri = f"serial={s.get('serial')}"
-                        if uri:
-                            ok = self.slave_manager.add_slave(sid, uri)
-                            if not ok:
-                                self.log.error(f"Failed to init slave {sid} with uri={uri}")
+                self.components_manager.refresh_slaves_configuration()
                 try:
                     self._update_slave_table()
                 except Exception:
                     pass
             except Exception:
                 pass
-            # Re-configure trilateration stations
-            try:
-                self.trilateration_engine.stations.clear()
-                self._setup_trilateration()
-            except Exception:
-                pass
             # Update map stations from new config
             try:
-                if hasattr(self, 'map_view') and self.map_view:
-                    self.map_view.update_stations_from_config(self.sdr_settings)
+                self.ui_manager.update_stations_from_config(self.sdr_settings)
             except Exception:
                 pass
         dlg.devicesConfigured.connect(_on_conf)
@@ -604,7 +340,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
                 remove_btn.clicked.connect(lambda checked, sid=slave_id: self._remove_slave(sid))
                 self.slave_table.setCellWidget(row, 3, remove_btn)
             
-            self.system_status['n_slaves'] = len(slaves)
+            self.status_manager.set_status('n_slaves', len(slaves))
             
         except Exception as e:
             self.log.error(f"Error updating slave table: {e}")
@@ -651,7 +387,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
             # Кнопки управления оркестратором находятся в тулбаре
             self.toolbar_orch_action.setText('⏹ Контроль')
             
-            self.system_status['orchestrator_running'] = True
+            self.status_manager.set_status('orchestrator_running', True)
             self.log.info("Orchestrator started")
             
         except Exception as e:
@@ -678,7 +414,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
             # Кнопки управления оркестратором находятся в тулбаре
             self.toolbar_orch_action.setText('▶ Контроль')
             
-            self.system_status['orchestrator_running'] = False
+            self.status_manager.set_status('orchestrator_running', False)
             self.log.info("Orchestrator stopped")
             
         except Exception as e:
@@ -686,11 +422,12 @@ class RSSIPanoramaMainWindow(QMainWindow):
     
     def _toggle_orchestrator(self):
         """Переключает состояние оркестратора."""
-        if self.system_status['orchestrator_running']:
+        if self.status_manager.get_status('orchestrator_running'):
             self._stop_orchestrator()
         else:
             self._start_orchestrator()
     
+    @safe_method("Peak detection handling", default_return=None)
     def _on_peak_detected(self, peak):
         """Обрабатывает обнаружение пика."""
         try:
@@ -734,6 +471,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
         except Exception as e:
             self.log.error(f"Error handling task failed: {e}")
     
+    @safe_method("Target detection handling", default_return=None)
     def _on_target_detected(self, target):
         """Обрабатывает обнаружение цели."""
         try:
@@ -747,7 +485,8 @@ class RSSIPanoramaMainWindow(QMainWindow):
             # Обновляем таблицу целей
             self._update_targets_table()
             
-            self.system_status['n_targets'] += 1
+            current_targets = self.status_manager.get_status('n_targets')
+            self.status_manager.set_status('n_targets', current_targets + 1)
             
         except Exception as e:
             self.log.error(f"Error handling target: {e}")
@@ -867,27 +606,6 @@ class RSSIPanoramaMainWindow(QMainWindow):
             
         except Exception as e:
             self.log.error(f"Error updating targets table: {e}")
-    
-    def _update_status(self):
-        """Обновляет статус системы."""
-        try:
-            # Обновляем статус мастера по факту работы контроллера
-            if self.master_controller is not None:
-                self.system_status['master_running'] = bool(getattr(self.master_controller, 'is_running', False))
-            # Обновляем статус оркестратора (без отображения в UI)
-            if self.orchestrator:
-                orch_status = self.orchestrator.get_system_status()
-                # Статус отображается только в заголовке окна
-            
-            # Обновляем заголовок окна
-            title = f"ПАНОРАМА RSSI - Master: {'ON' if self.system_status['master_running'] else 'OFF'}, "
-            title += f"Orch: {'ON' if self.system_status['orchestrator_running'] else 'OFF'}, "
-            title += f"Slaves: {self.system_status['n_slaves']}, Targets: {self.system_status['n_targets']}"
-            
-            self.setWindowTitle(title)
-            
-        except Exception as e:
-            self.log.error(f"Error updating status: {e}")
     
     def _load_calibration_dialog(self):
         """Показывает диалог загрузки калибровки."""
@@ -1082,7 +800,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
                 def _on_slaves_updated(status: dict):
                     # Преобразуем в список станций
                     stations = []
-                    for sid, st in status.items():
+                    for sid in status.keys():
                         pos = (0.0, 0.0, 0.0)
                         for cfg in self.sdr_settings.get('slaves', []):
                             cid = cfg.get('nickname') or cfg.get('label') or cfg.get('serial')
@@ -1111,21 +829,13 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def closeEvent(self, event):
         """Обрабатывает закрытие приложения."""
         try:
-            # Останавливаем все компоненты в правильном порядке
-            if hasattr(self, 'trilateration_coordinator') and self.trilateration_coordinator:
-                try:
-                    self.trilateration_coordinator.stop()
-                except Exception:
-                    pass
-            if self.master_controller:
-                self.master_controller.stop_sweep()
-                self.master_controller.cleanup()
+            # Останавливаем менеджер статуса
+            if hasattr(self, 'status_manager'):
+                self.status_manager.stop()
             
-            if self.orchestrator:
-                self.orchestrator.stop()
-            
-            if self.slave_manager:
-                self.slave_manager.close_all()
+            # Останавливаем все компоненты через менеджер компонентов
+            if hasattr(self, 'components_manager'):
+                self.components_manager.cleanup_all_components()
             
             self.log.info("Application closed")
             event.accept()
