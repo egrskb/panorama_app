@@ -26,6 +26,7 @@ libhackrf_qsa.so
 .idea/
 .DS_Store
 Thumbs.db
+.claude/
 
 # --- Logs / temp ---
 *.log
