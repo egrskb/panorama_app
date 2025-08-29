@@ -15,20 +15,15 @@ class SDRConfig:
     # Частотный диапазон
     freq_start_mhz: float = 50.0
     freq_stop_mhz: float = 6000.0
-    bin_khz: float = 800.0
+    bin_khz: float = 5.0  # 5 кГц по умолчанию для высокого разрешения
     
     # Параметры усиления
     lna_db: int = 24
     vga_db: int = 20
     amp_on: bool = False
     
-    # Параметры свипа
-    segments: int = 4  # 2 или 4 сегмента
-    fft_size: int = 32  # Размер FFT
-    
     # Параметры отображения
     waterfall_rows: int = 100
-    max_display_points: int = 2048
     
     # Сглаживание
     smoothing_enabled: bool = True
@@ -96,26 +91,6 @@ class SDRConfigManager:
             if hasattr(self.config, key):
                 setattr(self.config, key, value)
     
-    def get_sweep_config(self) -> Dict[str, Any]:
-        """Возвращает параметры для SweepConfig."""
-        return {
-            'freq_start_hz': int(self.config.freq_start_mhz * 1e6),
-            'freq_end_hz': int(self.config.freq_stop_mhz * 1e6),
-            'bin_hz': int(self.config.bin_khz * 1e3),
-            'lna_db': self.config.lna_db,
-            'vga_db': self.config.vga_db,
-            'amp_on': self.config.amp_on,
-        }
+
     
-    def get_c_config(self) -> Dict[str, Any]:
-        """Возвращает параметры для C библиотеки hackrf_master."""
-        return {
-            'f_start_mhz': self.config.freq_start_mhz,
-            'f_stop_mhz': self.config.freq_stop_mhz,
-            'bin_hz': self.config.bin_khz * 1e3,
-            'lna_db': self.config.lna_db,
-            'vga_db': self.config.vga_db,
-            'amp_on': 1 if self.config.amp_on else 0,
-            'segment_mode': self.config.segments,
-            'fft_size': self.config.fft_size,
-        }
+

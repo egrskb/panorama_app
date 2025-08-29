@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Скрипт запуска ПАНОРАМА RSSI - системы трилатерации по RSSI.
+Запускается из виртуального окружения для доступа к OpenGL ускорению.
 """
 
 import sys
@@ -43,6 +44,15 @@ def setup_environment():
     except ImportError:
         print("✗ SciPy не найден. Установите: pip install scipy")
         return False
+    
+    # Проверяем OpenGL ускорение
+    try:
+        import OpenGL_accelerate
+        print("✓ OpenGL ускорение доступно")
+    except ImportError:
+        print("⚠ OpenGL ускорение не найдено (PyOpenGL-accelerate)")
+        print("  Установите: pip install PyOpenGL-accelerate")
+        print("  Примечание: графики будут работать медленнее")
     
     # Проверяем наличие наших модулей
     try:

@@ -8,10 +8,10 @@ from __future__ import annotations
 from typing import Optional, Deque, Dict, Tuple, Any, List
 from collections import deque
 import time
-import json
+
 import numpy as np
 import pyqtgraph as pg
-from pathlib import Path
+
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import QTimer
 
@@ -28,50 +28,7 @@ WATER_ROWS_DEFAULT = 400  # Строк водопада по умолчанию 
 MAX_SPECTRUM_POINTS = 8192  # Максимум точек для линий спектра (увеличено для широких диапазонов)
 
 
-class SDRConfig:
-    """Конфигурация SDR параметров для стабильной работы в диапазоне 50-6000 МГц."""
-    def __init__(self):
-        self.freq_start_mhz = 50.0
-        self.freq_stop_mhz = 6000.0
-        self.bin_khz = 5.0  # Базовый bin 5 кГц
-        self.lna_db = 24
-        self.vga_db = 20
-        self.amp_on = False
-        self.segments = 4
-        self.fft_size = 32
-        self.waterfall_rows = WATER_ROWS_DEFAULT
-        self.max_display_points = MAX_DISPLAY_COLS
-        self.smoothing_enabled = True
-        self.smoothing_window = 7
-        self.ema_enabled = True
-        self.ema_alpha = 0.3
-        self.interpolation_enabled = True
-        
-    def load_from_file(self, path: Path):
-        """Загружает конфигурацию из JSON файла."""
-        try:
-            if path.exists():
-                with open(path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                for key, value in data.items():
-                    if hasattr(self, key):
-                        setattr(self, key, value)
-                return True
-        except Exception as e:
-            print(f"[SDRConfig] Ошибка загрузки: {e}")
-        return False
-    
-    def save_to_file(self, path: Path):
-        """Сохраняет конфигурацию в JSON файл."""
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            data = {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            return True
-        except Exception as e:
-            print(f"[SDRConfig] Ошибка сохранения: {e}")
-        return False
+# Убираем дублирующий SDRConfig - используем основной из sdr_config.py
 
 
 class SpectrumView(QtWidgets.QWidget):
@@ -84,10 +41,26 @@ class SpectrumView(QtWidgets.QWidget):
     def __init__(self, parent=None, orchestrator=None):
         super().__init__(parent)
         
-        # Конфигурация
-        self.config = SDRConfig()
-        self.config_path = Path.home() / ".panorama" / "sdr_config.json"
-        self.config.load_from_file(self.config_path)
+        # Конфигурация - используем основной SDRConfigManager
+        try:
+            from panorama.features.settings.sdr_config import SDRConfigManager
+            self.config_manager = SDRConfigManager()
+            self.config = self.config_manager.config
+        except Exception as e:
+            print(f"[SpectrumView] Ошибка загрузки SDR конфигурации: {e}")
+            # Fallback к дефолтам
+            self.config = type('Config', (), {
+                'freq_start_mhz': 50.0,
+                'freq_stop_mhz': 6000.0,
+                'bin_khz': 5.0,
+                'lna_db': 24,
+                'vga_db': 20,
+                'amp_on': False,
+                'smoothing_enabled': True,
+                'smoothing_window': 7,
+                'ema_enabled': True,
+                'ema_alpha': 0.3
+            })()
         
         # Модель данных
         self._model = SpectrumModel(rows=self.config.waterfall_rows)
@@ -224,9 +197,9 @@ class SpectrumView(QtWidgets.QWidget):
         self.stop_mhz.setSuffix(" МГц")
         
         self.bin_khz = QtWidgets.QDoubleSpinBox()
-        self.bin_khz.setRange(1, 5000)
+        self.bin_khz.setRange(1, 5000)  # Разрешаем от 1 кГц для высокого разрешения (⚠️ мелкий bin может замедлить GUI)
         self.bin_khz.setDecimals(0)
-        self.bin_khz.setValue(5)
+        self.bin_khz.setValue(5)  # 5 кГц по умолчанию для высокого разрешения
         self.bin_khz.setSuffix(" кГц")
         
         # Параметры усиления
@@ -263,7 +236,12 @@ class SpectrumView(QtWidgets.QWidget):
         
         self.top_layout.addLayout(add_param("F нач", self.start_mhz))
         self.top_layout.addLayout(add_param("F кон", self.stop_mhz))
-        self.top_layout.addLayout(add_param("Bin", self.bin_khz))
+        # Добавляем подсказку для bin
+        bin_hint = QtWidgets.QLabel("⚠️ <5 кГц может замедлить GUI")
+        bin_hint.setStyleSheet("color: #FFA500; font-size: 10px;")
+        bin_layout = add_param("Bin", self.bin_khz)
+        bin_layout.addWidget(bin_hint)
+        self.top_layout.addLayout(bin_layout)
         self.top_layout.addLayout(add_param("LNA", self.lna_db))
         self.top_layout.addLayout(add_param("VGA", self.vga_db))
         self.top_layout.addWidget(self.amp_on)
@@ -494,25 +472,20 @@ class SpectrumView(QtWidgets.QWidget):
             widget.toggled.connect(self._apply_visibility)
         
         self.chk_smooth.toggled.connect(self._save_config)
+        self.chk_smooth.toggled.connect(self._on_smoothing_toggled)
         self.chk_ema.toggled.connect(self._save_config)
+        self.chk_ema.toggled.connect(self._on_ema_toggled)
         self.smooth_win.valueChanged.connect(self._ensure_odd_window)
         self.smooth_win.valueChanged.connect(self._save_config)
         self.alpha.valueChanged.connect(self._save_config)
+        
+        # Подключения для проброса настроек в бэкенд
+        self.chk_smooth.toggled.connect(lambda _: self._apply_backend_processing())
+        self.smooth_win.valueChanged.connect(lambda _: self._apply_backend_processing())
+        self.chk_ema.toggled.connect(lambda _: self._apply_backend_processing())
+        self.alpha.valueChanged.connect(lambda _: self._apply_backend_processing())
+        
         # (убрано) переключатель анимации линий
-
-        # Проброс настроек сглаживания и EMA в бэкенд HackRF
-        def _apply_backend_processing():
-            try:
-                if isinstance(self._source, MasterSourceAdapter):
-                    self._source.set_freq_smoothing(self.chk_smooth.isChecked(), int(self.smooth_win.value()))
-                    self._source.set_ema_alpha(float(self.alpha.value()) if self.chk_ema.isChecked() else 1.0)
-            except Exception:
-                pass
-
-        self.chk_smooth.toggled.connect(lambda _: _apply_backend_processing())
-        self.smooth_win.valueChanged.connect(lambda _: _apply_backend_processing())
-        self.chk_ema.toggled.connect(lambda _: _apply_backend_processing())
-        self.alpha.valueChanged.connect(lambda _: _apply_backend_processing())
         
         # Водопад
         self.cmb_cmap.currentTextChanged.connect(self._on_cmap_changed)
@@ -526,6 +499,23 @@ class SpectrumView(QtWidgets.QWidget):
         self.plot.scene().sigMouseClicked.connect(lambda ev: self._on_add_marker(ev, False))
         self.water_plot.scene().sigMouseClicked.connect(lambda ev: self._on_add_marker(ev, True))
         self.list_markers.itemDoubleClicked.connect(self._jump_to_marker)
+
+    def _on_smoothing_toggled(self):
+        """Обработчик переключения сглаживания по частоте."""
+        self.smooth_win.setEnabled(self.chk_smooth.isChecked() and not self._running)
+
+    def _on_ema_toggled(self):
+        """Обработчик переключения EMA по времени."""
+        self.alpha.setEnabled(self.chk_ema.isChecked() and not self._running)
+
+    def _apply_backend_processing(self):
+        """Проброс настроек сглаживания и EMA в бэкенд HackRF."""
+        try:
+            if isinstance(self._source, MasterSourceAdapter):
+                self._source.set_freq_smoothing(self.chk_smooth.isChecked(), int(self.smooth_win.value()))
+                self._source.set_ema_alpha(float(self.alpha.value()) if self.chk_ema.isChecked() else 1.0)
+        except Exception:
+            pass
 
     def _apply_config_to_ui(self):
         """Применяет конфигурацию к UI элементам."""
@@ -543,6 +533,7 @@ class SpectrumView(QtWidgets.QWidget):
 
     def _save_config(self):
         """Сохраняет текущую конфигурацию."""
+        # Обновляем конфигурацию
         self.config.freq_start_mhz = self.start_mhz.value()
         self.config.freq_stop_mhz = self.stop_mhz.value()
         self.config.bin_khz = self.bin_khz.value()
@@ -555,7 +546,11 @@ class SpectrumView(QtWidgets.QWidget):
         self.config.ema_enabled = self.chk_ema.isChecked()
         self.config.ema_alpha = self.alpha.value()
         
-        self.config.save_to_file(self.config_path)
+        # Сохраняем через SDRConfigManager
+        if hasattr(self, 'config_manager'):
+            self.config_manager.save()
+        else:
+            print("[SpectrumView] SDRConfigManager недоступен")
 
     def _target_display_cols(self, span_hz: float) -> int:
         """
@@ -1327,6 +1322,19 @@ class SpectrumView(QtWidgets.QWidget):
         self.amp_on.setEnabled(enabled)
         self.btn_start.setEnabled(enabled)
         self.btn_stop.setEnabled(not enabled)
+        
+        # Блокируем/разблокируем настройки сглаживания
+        self._set_smoothing_controls_enabled(enabled)
+
+    def _set_smoothing_controls_enabled(self, enabled: bool):
+        """Блокирует/разблокирует настройки сглаживания."""
+        # Настройки сглаживания по частоте
+        self.chk_smooth.setEnabled(enabled)
+        self.smooth_win.setEnabled(enabled and self.chk_smooth.isChecked())
+        
+        # Настройки EMA по времени
+        self.chk_ema.setEnabled(enabled)
+        self.alpha.setEnabled(enabled and self.chk_ema.isChecked())
 
     def _on_status(self, msg: object):
         """Обработка статусного сообщения."""

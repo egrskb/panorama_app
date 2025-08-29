@@ -11,10 +11,10 @@ class SweepConfig:
     freq_start_hz: int
     freq_end_hz: int
     # шаг для построения глобальной сетки (визуально можно даунсемплить дальше)
-    bin_hz: int = 1_000_000  # 1 МГц по умолчанию для панорамы
-    lna_db: int = 24
-    vga_db: int = 20
-    amp_on: bool = False
+    bin_hz: int = 0  # Будет установлен из GUI
+    lna_db: int = 0  # Будет установлен из GUI
+    vga_db: int = 0  # Будет установлен из GUI
+    amp_on: bool = False  # Будет установлен из GUI
     serial: Optional[str] = None  # Серийник устройства обязателен для HackRF QSA
     extra: Optional[list[str]] = None
     
