@@ -101,10 +101,10 @@ class ComponentsManager:
                 apply_settings_to_watchlist_manager(det_settings, self.trilateration_coordinator.peak_manager)
                 if self.orchestrator:
                     self.orchestrator.set_global_parameters(
-                        span_hz=det_settings.watchlist_span_mhz * 1e6,
+                        span_hz=det_settings.rms_halfspan_mhz * 2e6,  # Полная ширина = 2 × halfspan
                         dwell_ms=int(det_settings.watchlist_dwell_ms)
                     )
-                self.trilateration_coordinator.set_user_span(float(det_settings.watchlist_span_mhz))
+                self.trilateration_coordinator.set_user_span(float(det_settings.rms_halfspan_mhz))
         except Exception as e:
             self.log.warning(f"Failed to load detector settings: {e}")
     

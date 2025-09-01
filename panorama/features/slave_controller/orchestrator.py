@@ -8,7 +8,7 @@ from __future__ import annotations
 import time
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from collections import deque, defaultdict
 
 from PyQt5.QtCore import QObject, pyqtSignal, QMutex, QTimer
@@ -436,13 +436,27 @@ class Orchestrator(QObject):
                 for entry in pm.watchlist.values():
                     # entry: WatchlistEntry
                     rssi_vals = entry.rssi_measurements if entry.rssi_measurements else {}
+                    # Рассчитываем halfspan и количество бинов
+                    halfspan = entry.span_hz / 2.0 / 1e6  # halfspan в МГц
+                    # Примерно оцениваем количество бинов (зависит от разрешения спектра)
+                    # Предполагаем разрешение ~10 кГц на бин
+                    total_bins = max(1, int(entry.span_hz / 10e3))
+                    
                     wl_ui.append({
                         'id': entry.peak_id,
                         'freq': entry.center_freq_hz / 1e6,
                         'span': (entry.freq_stop_hz - entry.freq_start_hz) / 1e6,
-                        'rssi_1': rssi_vals.get('slave0'),
-                        'rssi_2': rssi_vals.get('slave1'),
-                        'rssi_3': rssi_vals.get('slave2'),
+                        'halfspan': halfspan,
+                        'rms_1': rssi_vals.get('slave0'),
+                        'rms_2': rssi_vals.get('slave1'), 
+                        'rms_3': rssi_vals.get('slave2'),
+                        'total_bins': total_bins,
+                        'bins_used_1': total_bins if rssi_vals.get('slave0') is not None else 0,
+                        'bins_used_2': total_bins if rssi_vals.get('slave1') is not None else 0,
+                        'bins_used_3': total_bins if rssi_vals.get('slave2') is not None else 0,
+                        'timestamp_1': time.strftime('%H:%M:%S', time.localtime(entry.last_update)),
+                        'timestamp_2': time.strftime('%H:%M:%S', time.localtime(entry.last_update)),
+                        'timestamp_3': time.strftime('%H:%M:%S', time.localtime(entry.last_update)),
                         'updated': time.strftime('%H:%M:%S', time.localtime(entry.last_update))
                     })
             snapshot['watchlist'] = wl_ui

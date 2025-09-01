@@ -658,7 +658,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
                 # Применяем некоторые глобальные параметры к оркестратору
                 try:
                     if self.orchestrator:
-                        self.orchestrator.set_global_parameters(span_hz=s.watchlist_span_mhz * 1e6,
+                        self.orchestrator.set_global_parameters(span_hz=s.rms_halfspan_mhz * 2e6,  # Полная ширина = 2 × halfspan
                                                                 dwell_ms=int(s.watchlist_dwell_ms))
                 except Exception:
                     pass

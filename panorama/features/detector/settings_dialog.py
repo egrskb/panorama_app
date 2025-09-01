@@ -29,10 +29,12 @@ class DetectorSettings:
     min_peak_width_bins: int = 3  # Минимальная ширина пика
     min_peak_distance_bins: int = 5  # Минимальное расстояние между пиками
     
-    # Параметры для Slave watchlist
-    watchlist_span_mhz: float = 5.0  # Ширина полосы для измерения RSSI (увеличено до 5 МГц)
+    # Параметры для Slave watchlist и RMS трилатерации
     watchlist_dwell_ms: int = 150  # Время измерения
     max_watchlist_size: int = 20  # Максимальный размер списка
+    
+    # RMS параметры для трилатерации (единый параметр)
+    rms_halfspan_mhz: float = 2.5  # Полуширина полосы для RMS расчета
     
     # Временные параметры
     peak_timeout_sec: float = 5.0  # Таймаут для удаления неактивных пиков
@@ -59,9 +61,9 @@ class DetectorSettings:
             'min_snr_db': self.min_snr_db,
             'min_peak_width_bins': self.min_peak_width_bins,
             'min_peak_distance_bins': self.min_peak_distance_bins,
-            'watchlist_span_mhz': self.watchlist_span_mhz,
             'watchlist_dwell_ms': self.watchlist_dwell_ms,
             'max_watchlist_size': self.max_watchlist_size,
+            'rms_halfspan_mhz': self.rms_halfspan_mhz,
             'peak_timeout_sec': self.peak_timeout_sec,
             'measurement_interval_sec': self.measurement_interval_sec,
             'min_confirmation_sweeps': self.min_confirmation_sweeps,
@@ -302,15 +304,17 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         watchlist_group = QtWidgets.QGroupBox("Параметры Watchlist")
         watchlist_layout = QtWidgets.QFormLayout(watchlist_group)
         
-        self.spin_watchlist_span = QtWidgets.QDoubleSpinBox()
-        self.spin_watchlist_span.setRange(0.1, 20.0)
-        self.spin_watchlist_span.setValue(self.settings.watchlist_span_mhz)
-        self.spin_watchlist_span.setSuffix(" МГц")
-        self.spin_watchlist_span.setToolTip("Ширина полосы для измерения RSSI на Slave (рекомендуется 2-5 МГц)")
-        watchlist_layout.addRow("Span для RSSI:", self.spin_watchlist_span)
-        lbl_span = QtWidgets.QLabel("<i>Полная ширина диапазона вокруг пика, где Slaves измеряют среднеквадратичный RSSI.</i>")
-        lbl_span.setWordWrap(True)
-        watchlist_layout.addRow("", lbl_span)
+        # RMS Halfspan parameter (единый параметр для всех измерений)
+        self.spin_rms_halfspan = QtWidgets.QDoubleSpinBox()
+        self.spin_rms_halfspan.setRange(1.0, 10.0)
+        self.spin_rms_halfspan.setSingleStep(0.1)
+        self.spin_rms_halfspan.setValue(getattr(self.settings, 'rms_halfspan_mhz', 2.5))
+        self.spin_rms_halfspan.setSuffix(" МГц")
+        self.spin_rms_halfspan.setToolTip("Полуширина полосы для расчета RMS в трилатерации (от F_max ± halfspan)")
+        watchlist_layout.addRow("RMS полуширина:", self.spin_rms_halfspan)
+        lbl_rms = QtWidgets.QLabel("<i>Полуширина полосы для RMS измерений Slaves. Полная ширина = 2×halfspan. Slaves измеряют среднеквадратичный RSSI в диапазоне F_max ± halfspan для трилатерации.</i>")
+        lbl_rms.setWordWrap(True)
+        watchlist_layout.addRow("", lbl_rms)
         
         self.spin_watchlist_dwell = QtWidgets.QSpinBox()
         self.spin_watchlist_dwell.setRange(10, 1000)
@@ -434,8 +438,8 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         self.radio_fixed.toggled.connect(self._update_threshold_widgets)
         
         # Обновление примера при изменении параметров
-        self.spin_watchlist_span.valueChanged.connect(self._update_example_plot)
         self.spin_watchlist_dwell.valueChanged.connect(self._update_example_plot)
+        self.spin_rms_halfspan.valueChanged.connect(self._update_example_plot)
     
     def _update_threshold_widgets(self):
         """Обновляет доступность виджетов порогов."""
@@ -445,18 +449,22 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
     
     def _update_example_plot(self):
         """Обновляет пример визуализации."""
-        span = self.spin_watchlist_span.value()
         dwell = self.spin_watchlist_dwell.value()
-        left = 2450 - span / 2
-        right = 2450 + span / 2
+        rms_halfspan = self.spin_rms_halfspan.value() if hasattr(self, 'spin_rms_halfspan') else 2.5
+        
+        # Полная ширина = 2 × halfspan
+        full_span = 2 * rms_halfspan
+        left = 2450 - rms_halfspan
+        right = 2450 + rms_halfspan
+        
         text = (
             "<div style='color: #ffffff; padding: 20px;'>"
-            "<h3>Пример измерения RSSI</h3>"
-            f"<p>Центральная частота пика: 2450.0 МГц</p>"
-            f"<p>Ширина окна: ±{span/2:.1f} МГц</p>"
-            f"<p>Диапазон измерения: {left:.1f} - {right:.1f} МГц</p>"
+            "<h3>Пример RMS измерения</h3>"
+            f"<p>Центральная частота пика (F_max): 2450.0 МГц</p>"
+            f"<p><b>RMS полоса: ±{rms_halfspan:.1f} МГц ({left:.1f} - {right:.1f} МГц)</b></p>"
+            f"<p>Полная ширина измерения: {full_span:.1f} МГц</p>"
             f"<p>Время накопления: {dwell} мс</p>"
-            "<p><b>Slave измеряют среднеквадратичный RSSI в этом диапазоне</b></p>"
+            "<p><b>Все Slaves измеряют RMS RSSI в едином диапазоне ±halfspan вокруг F_max</b></p>"
             "</div>"
         )
         self.example_plot.setText(text)
@@ -549,7 +557,7 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
             self.settings.min_snr_db = 5.0
             self.settings.min_peak_width_bins = 2
             self.settings.min_peak_distance_bins = 3
-            self.settings.watchlist_span_mhz = 2.0
+            self.settings.rms_halfspan_mhz = 1.0  # Более чувствительный режим
             self.settings.watchlist_dwell_ms = 100
             self.settings.peak_timeout_sec = 3.0
             self.settings.measurement_interval_sec = 0.5
@@ -561,7 +569,7 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
             self.settings.min_snr_db = 10.0
             self.settings.min_peak_width_bins = 3
             self.settings.min_peak_distance_bins = 5
-            self.settings.watchlist_span_mhz = 5.0
+            self.settings.rms_halfspan_mhz = 2.5  # Стандартный режим
             self.settings.watchlist_dwell_ms = 150
             self.settings.peak_timeout_sec = 5.0
             self.settings.measurement_interval_sec = 1.0
@@ -573,7 +581,7 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
             self.settings.min_snr_db = 15.0
             self.settings.min_peak_width_bins = 5
             self.settings.min_peak_distance_bins = 8
-            self.settings.watchlist_span_mhz = 10.0
+            self.settings.rms_halfspan_mhz = 5.0  # Широкая полоса для надежности
             self.settings.watchlist_dwell_ms = 200
             self.settings.peak_timeout_sec = 10.0
             self.settings.measurement_interval_sec = 2.0
@@ -600,9 +608,9 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         self.spin_min_distance.setValue(self.settings.min_peak_distance_bins)
         
         # Watchlist
-        self.spin_watchlist_span.setValue(self.settings.watchlist_span_mhz)
         self.spin_watchlist_dwell.setValue(self.settings.watchlist_dwell_ms)
         self.spin_max_watchlist.setValue(self.settings.max_watchlist_size)
+        self.spin_rms_halfspan.setValue(self.settings.rms_halfspan_mhz)
         
         # Временные параметры (таймаут/интервал убраны из UI — сохраняем только подтверждение)
         self.spin_confirmation_sweeps.setValue(self.settings.min_confirmation_sweeps)
@@ -634,9 +642,9 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
             min_snr_db=self.spin_min_snr.value(),
             min_peak_width_bins=int(self.spin_min_width.value()),
             min_peak_distance_bins=int(self.spin_min_distance.value()),
-            watchlist_span_mhz=self.spin_watchlist_span.value(),
             watchlist_dwell_ms=int(self.spin_watchlist_dwell.value()),
             max_watchlist_size=int(self.spin_max_watchlist.value()),
+            rms_halfspan_mhz=self.spin_rms_halfspan.value(),
             # Таймаут и интервал остаются прежними (не редактируются в UI)
             peak_timeout_sec=self.settings.peak_timeout_sec,
             measurement_interval_sec=self.settings.measurement_interval_sec,
@@ -705,8 +713,12 @@ def apply_settings_to_watchlist_manager(settings: DetectorSettings, manager):
     manager.min_peak_width_bins = settings.min_peak_width_bins
     manager.min_peak_distance_bins = settings.min_peak_distance_bins
     
-    # Параметры watchlist
-    manager.watchlist_span_hz = settings.watchlist_span_mhz * 1e6
+    # Параметры watchlist (используем RMS halfspan для определения полосы)
+    manager.rms_halfspan_hz = settings.rms_halfspan_mhz * 1e6
+    # Для совместимости со старым кодом - устанавливаем watchlist_span как полную ширину
+    if hasattr(manager, 'watchlist_span_hz'):
+        manager.watchlist_span_hz = settings.rms_halfspan_mhz * 2e6  # Полная ширина = 2 × halfspan
+    
     manager.max_watchlist_size = settings.max_watchlist_size
     manager.peak_timeout_sec = settings.peak_timeout_sec
     manager.min_confirmation_sweeps = settings.min_confirmation_sweeps
@@ -714,5 +726,5 @@ def apply_settings_to_watchlist_manager(settings: DetectorSettings, manager):
     print(f"[DetectorSettings] Applied settings to watchlist manager: "
           f"mode={manager.threshold_mode}, "
           f"offset={manager.baseline_offset_db} dB, "
-          f"span={manager.watchlist_span_hz/1e6} MHz, "
+          f"rms_halfspan={manager.rms_halfspan_hz/1e6} MHz, "
           f"confirmations={manager.min_confirmation_sweeps}")

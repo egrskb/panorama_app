@@ -184,10 +184,10 @@ class ImprovedSlavesView(QWidget):
         
         # Таблица watchlist
         self.watchlist_table = QTableWidget()
-        self.watchlist_table.setColumnCount(8)
+        self.watchlist_table.setColumnCount(10)
         self.watchlist_table.setHorizontalHeaderLabels([
-            "ID", "Частота (МГц)", "Ширина (МГц)", 
-            "RSSI_1", "RSSI_2", "RSSI_3", "Обновлено", "Действия"
+            "ID", "Частота (МГц)", "Ширина (МГц)", "Halfspan (МГц)",
+            "RMS_1 (дБм)", "RMS_2 (дБм)", "RMS_3 (дБм)", "Бинов", "Обновлено", "Действия"
         ])
         self.watchlist_table.setAlternatingRowColors(True)
         layout.addWidget(self.watchlist_table)
@@ -435,26 +435,40 @@ class ImprovedSlavesView(QWidget):
             self.watchlist_table.setItem(row, 2, 
                 QTableWidgetItem(f"{span:.1f}"))
             
-            # RSSI для каждого slave
+            # Halfspan для RMS
+            halfspan = float(data.get('halfspan', 2.5))
+            self.watchlist_table.setItem(row, 3, 
+                QTableWidgetItem(f"{halfspan:.1f}"))
+            
+            # RMS для каждого slave
             for i in range(3):
-                rssi_key = f'rssi_{i+1}'
-                val = data.get(rssi_key)
+                rms_key = f'rms_{i+1}'
+                val = data.get(rms_key)
                 if val is not None:
                     item = QTableWidgetItem(f"{float(val):.1f}")
                     item.setBackground(QBrush(self._get_rssi_color(float(val))))
+                    # Добавляем tooltip с информацией
+                    bins_used = data.get(f'bins_used_{i+1}', 'N/A')
+                    timestamp = data.get(f'timestamp_{i+1}', '')
+                    item.setToolTip(f"Бинов использовано: {bins_used}\nПоследнее обновление: {timestamp}")
                 else:
                     item = QTableWidgetItem("—")
                 item.setTextAlignment(Qt.AlignCenter)
-                self.watchlist_table.setItem(row, 3 + i, item)
+                self.watchlist_table.setItem(row, 4 + i, item)
             
-            # Время
-            self.watchlist_table.setItem(row, 6, 
+            # Общее количество бинов
+            total_bins = data.get('total_bins', 0)
+            self.watchlist_table.setItem(row, 7, 
+                QTableWidgetItem(str(total_bins)))
+            
+            # Время обновления
+            self.watchlist_table.setItem(row, 8, 
                 QTableWidgetItem(data.get('updated', '')))
             
             # Кнопка
             btn = QPushButton("📍 На карту")
             btn.clicked.connect(lambda _, d=data: self._send_to_map(d))
-            self.watchlist_table.setCellWidget(row, 7, btn)
+            self.watchlist_table.setCellWidget(row, 9, btn)
         
         self.lbl_watchlist_count.setText(f"Записей: {len(watchlist_data)}")
 

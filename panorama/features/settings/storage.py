@@ -70,6 +70,10 @@ def load_detector_settings() -> Dict[str, Any]:
         "smoothing_window": 7,
         "ema_enabled": True,         # Включено по умолчанию
         "ema_alpha": 0.3,
+        # RMS параметры для трилатерации
+        "rms_halfspan_hz": 2500000,  # 2.5 МГц по умолчанию
+        "rms_halfspan_limits_hz": [2000000, 6000000],  # Пределы 2-6 МГц
+        "recentering_trigger_fraction": 0.3,
     }
 
 

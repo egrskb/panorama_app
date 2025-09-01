@@ -206,11 +206,15 @@ class TrilaterationCoordinator(QObject):
         print(f"[Coordinator] Updated {len(self.slave_positions)} slave positions")
         self.status_message.emit(f"Обновлено позиций slave: {len(self.slave_positions)}")
     
-    def set_user_span(self, span_mhz: float):
-        """Устанавливает пользовательский span для watchlist."""
-        self.user_span_mhz = span_mhz
-        self.peak_manager.watchlist_span_hz = span_mhz * 1e6
-        print(f"[Coordinator] User span set to {span_mhz} MHz")
+    def set_user_span(self, halfspan_mhz: float):
+        """Устанавливает пользовательский halfspan для RMS измерений."""
+        self.user_span_mhz = halfspan_mhz * 2  # Сохраняем как полную ширину для совместимости
+        # Устанавливаем полную ширину для watchlist_span_hz (2 × halfspan)
+        self.peak_manager.watchlist_span_hz = halfspan_mhz * 2e6
+        # Устанавливаем halfspan для RMS расчетов
+        if hasattr(self.peak_manager, 'rms_halfspan_hz'):
+            self.peak_manager.rms_halfspan_hz = halfspan_mhz * 1e6
+        print(f"[Coordinator] RMS halfspan set to {halfspan_mhz} MHz (full span: {halfspan_mhz * 2} MHz)")
     
     def set_path_loss_exponent(self, n: float):
         """Устанавливает коэффициент затухания."""

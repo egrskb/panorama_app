@@ -12,6 +12,8 @@ from scipy.optimize import minimize
 from PyQt5.QtCore import QObject, pyqtSignal
 import time
 
+from panorama.shared.rms_utils import RMSMeasurement
+
 
 @dataclass
 class SDRStation:
@@ -264,6 +266,52 @@ class RSSITrilaterationEngine(QObject):
         center = np.mean(sdr_coords, axis=0)
         return center
     
+    def calculate_position_from_rms_measurements(self, rms_measurements: List[RMSMeasurement]) -> Optional[TrilaterationResult]:
+        """
+        Calculates position from RMS measurements with automatic grouping and frequency extraction.
+        
+        Args:
+            rms_measurements: List of RMSMeasurement objects
+            
+        Returns:
+            TrilaterationResult or None if failed
+        """
+        if not rms_measurements:
+            self.trilateration_error.emit("No RMS measurements provided")
+            return None
+        
+        # Group measurements by target_id
+        targets: Dict[str, List[RMSMeasurement]] = {}
+        for measurement in rms_measurements:
+            target_id = measurement.target_id
+            if target_id not in targets:
+                targets[target_id] = []
+            targets[target_id].append(measurement)
+        
+        # Process the target with the most measurements
+        if not targets:
+            return None
+            
+        best_target_id = max(targets.keys(), key=lambda tid: len(targets[tid]))
+        target_measurements = targets[best_target_id]
+        
+        if len(target_measurements) < 3:
+            self.trilateration_error.emit(f"Insufficient RMS measurements for target {best_target_id}: {len(target_measurements)}, need at least 3")
+            return None
+        
+        # Convert to RSSI dictionary format
+        rssi_dict = {}
+        freq_mhz = 0.0
+        
+        for measurement in target_measurements:
+            rssi_dict[measurement.sdr_id] = measurement.rssi_rms_dbm
+            # Extract frequency from center_hz (use first measurement's frequency)
+            if freq_mhz == 0.0:
+                freq_mhz = measurement.center_hz / 1e6
+        
+        # Use existing calculate_position method
+        return self.calculate_position(rssi_dict, best_target_id, freq_mhz)
+
     def calculate_position_with_tracking(self, rssi_measurements: Dict[str, float],
                                         peak_id: str, freq_mhz: float,
                                         alpha: float = 0.7) -> Optional[TrilaterationResult]:

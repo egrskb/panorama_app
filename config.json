@@ -1,0 +1,43 @@
+{
+  "detector": {
+    "bin_hz": 5000,
+    "window_master": "hann",
+    "ema_alpha": 0.6,
+    "dwell_ms": 500,
+    "threshold": {
+      "k_sigma_overview": 4.5,
+      "k_sigma_confirm": 3.5,
+      "prominence_db": 6.0,
+      "abs_floor_dbm": -75.0,
+      "edge_guard_hz": 500000
+    },
+    "cluster": {
+      "min_bw_hz": 1500000,
+      "max_bw_hz": 12000000,
+      "merge_if_gap_hz": 2000000
+    },
+    "confirm": {
+      "overview_hits": 2,
+      "narrow_hits": 1,
+      "narrow_span_hz": 20000000
+    },
+    "rms_halfspan_hz": 2500000,
+    "rms_halfspan_limits_hz": [2000000, 6000000],
+    "recentering_trigger_fraction": 0.3
+  },
+  "slaves": {
+    "dwell_ms": 400,
+    "guard_hz": 1000000
+  },
+  "trilateration": {
+    "power_metric": "band_rssi_dbm",
+    "ema_alpha_time": 0.7,
+    "target_timeout_sec": 5,
+    "path_loss_n": 2.2
+  },
+  "debug": {
+    "band_rms_csv_dump": false,
+    "band_rms_csv_path": "output/band_rms.csv",
+    "log_level": "INFO"
+  }
+}

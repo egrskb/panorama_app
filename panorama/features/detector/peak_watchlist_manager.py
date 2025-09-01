@@ -16,7 +16,7 @@ from PyQt5.QtCore import QObject, pyqtSignal, QTimer
 @dataclass
 class VideoSignalPeak:
     """Обнаруженный пик видеосигнала."""
-    center_freq_hz: float  # Центральная частота пика
+    center_freq_hz: float  # Центральная частота пика (F_max - частота максимума)
     peak_power_dbm: float  # Пиковая мощность
     bandwidth_hz: float    # Ширина сигнала на уровне -3dB
     snr_db: float         # Отношение сигнал/шум
@@ -24,6 +24,11 @@ class VideoSignalPeak:
     consecutive_detections: int = 1  # Количество последовательных обнаружений
     last_seen: float = 0.0
     id: str = ""
+    # Новые метрики кластера
+    centroid_freq_hz: float = 0.0  # Центроид (взвешенный по мощности)
+    bandwidth_3db_hz: float = 0.0  # Ширина по уровню -3dB от пика
+    cluster_start_hz: float = 0.0  # Начало кластера
+    cluster_end_hz: float = 0.0    # Конец кластера
     
     def __post_init__(self):
         if not self.id:
@@ -74,6 +79,7 @@ class PeakWatchlistManager(QObject):
         self.min_snr_db = 5.0                # Минимальный SNR
         self.min_peak_width_bins = 5         # Минимальная ширина в бинах
         self.min_peak_distance_bins = 10     # Минимальное расстояние между пиками
+        self.merge_if_gap_hz = 2e6           # Объединять кластеры при разрыве < 2 МГц
         
         # Параметры watchlist
         self.watchlist_span_hz = 10e6        # Окно ±5 МГц вокруг пика по умолчанию
@@ -164,6 +170,15 @@ class PeakWatchlistManager(QObject):
                         existing_peak.consecutive_detections += 1
                         existing_peak.peak_power_dbm = max(existing_peak.peak_power_dbm,
                                                           peak.peak_power_dbm)
+                        # Обновляем новые метрики кластера
+                        if peak.centroid_freq_hz > 0.0:
+                            existing_peak.centroid_freq_hz = peak.centroid_freq_hz
+                        if peak.bandwidth_3db_hz > 0.0:
+                            existing_peak.bandwidth_3db_hz = peak.bandwidth_3db_hz
+                        if peak.cluster_start_hz > 0.0:
+                            existing_peak.cluster_start_hz = peak.cluster_start_hz
+                        if peak.cluster_end_hz > 0.0:
+                            existing_peak.cluster_end_hz = peak.cluster_end_hz
                         try:
                             print(f"[DEBUG] Peak {peak_id} detections: {existing_peak.consecutive_detections}")
                         except Exception:
@@ -213,7 +228,9 @@ class PeakWatchlistManager(QObject):
     def _find_video_peaks(self, freqs_hz: np.ndarray, power_dbm: np.ndarray, 
                          threshold: float, baseline: float) -> List[VideoSignalPeak]:
         """
-        Ищет широкополосные пики характерные для видеосигналов.
+        Ищет широкополосные пики характерные для видеосигналов с улучшенной кластеризацией.
+        Кластеризация: contiguous бины над порогом + объединение при разрыве < merge_if_gap_hz
+        Метрики: ширина по −3 дБ, центроид (взвешенный по мощности), пик (F_max)
         """
         peaks = []
         
@@ -222,19 +239,26 @@ class PeakWatchlistManager(QObject):
         if not np.any(above_threshold):
             return peaks
         
-        # Находим связные области
+        # 1. Находим связные области
         regions = self._find_connected_regions(above_threshold)
         
-        for start_idx, end_idx in regions:
+        # 2. Объединяем близко расположенные регионы
+        merged_regions = self._merge_nearby_regions(regions, freqs_hz)
+        
+        for start_idx, end_idx in merged_regions:
             region_freqs = freqs_hz[start_idx:end_idx+1]
             region_power = power_dbm[start_idx:end_idx+1]
             
             if len(region_freqs) < self.min_peak_width_bins:
                 continue
             
-            # Ширина региона в МГц
-            bandwidth_hz = region_freqs[-1] - region_freqs[0]
-            bandwidth_mhz = bandwidth_hz / 1e6
+            # 3. Рассчитываем метрики кластера
+            peak_freq, peak_power, centroid_freq, bandwidth_3db, cluster_start, cluster_end = \
+                self._calculate_cluster_metrics(freqs_hz, power_dbm, start_idx, end_idx)
+            
+            # Полная ширина кластера
+            cluster_bandwidth_hz = cluster_end - cluster_start
+            cluster_bandwidth_mhz = cluster_bandwidth_hz / 1e6
             
             # Проверяем, подходит ли под видеосигнал
             # Для 5.8 ГГц диапазона разрешаем более узкие сигналы
@@ -242,31 +266,29 @@ class PeakWatchlistManager(QObject):
                 min_width_mhz = 0.5
             else:
                 min_width_mhz = self.video_bandwidth_min_mhz
-            if bandwidth_mhz < min_width_mhz:
-                continue  # Слишком узкий
-            if bandwidth_mhz > self.video_bandwidth_max_mhz:
-                continue  # Слишком широкий
             
-            # Находим пик в регионе
-            peak_idx = np.argmax(region_power)
-            peak_freq = region_freqs[peak_idx]
-            peak_power = region_power[peak_idx]
+            if cluster_bandwidth_mhz < min_width_mhz:
+                continue  # Слишком узкий
+            if cluster_bandwidth_mhz > self.video_bandwidth_max_mhz:
+                continue  # Слишком широкий
             
             # Вычисляем SNR
             snr = peak_power - baseline
             if snr < self.min_snr_db:
                 continue
             
-            # Центральная частота: выбираем частоту максимума мощности
-            center_freq = float(peak_freq)
-            
-            # Создаем объект пика
+            # 4. Создаем объект пика с новыми метриками
             peak = VideoSignalPeak(
-                center_freq_hz=float(center_freq),
-                peak_power_dbm=float(peak_power),
-                bandwidth_hz=float(bandwidth_hz),
-                snr_db=float(snr),
-                timestamp=time.time()
+                center_freq_hz=peak_freq,                    # F_max - частота максимума
+                peak_power_dbm=peak_power,                   # Мощность в максимуме
+                bandwidth_hz=cluster_bandwidth_hz,           # Полная ширина кластера (для совместимости)
+                snr_db=snr,
+                timestamp=time.time(),
+                # Новые метрики кластера
+                centroid_freq_hz=centroid_freq,              # Центроид (взвешенный по мощности)
+                bandwidth_3db_hz=bandwidth_3db,              # Ширина по уровню -3 дБ
+                cluster_start_hz=cluster_start,              # Начало кластера
+                cluster_end_hz=cluster_end                   # Конец кластера
             )
             peaks.append(peak)
         
@@ -292,6 +314,98 @@ class PeakWatchlistManager(QObject):
             regions.append((start, len(mask)-1))
         
         return regions
+    
+    def _merge_nearby_regions(self, regions: List[Tuple[int, int]], freqs_hz: np.ndarray) -> List[Tuple[int, int]]:
+        """
+        Объединяет близко расположенные регионы если разрыв меньше merge_if_gap_hz.
+        """
+        if len(regions) <= 1:
+            return regions
+        
+        merged = []
+        current_start, current_end = regions[0]
+        
+        for start, end in regions[1:]:
+            # Проверяем разрыв между регионами
+            gap_hz = freqs_hz[start] - freqs_hz[current_end]
+            if gap_hz <= self.merge_if_gap_hz:
+                # Объединяем регионы
+                current_end = end
+            else:
+                # Добавляем текущий регион и начинаем новый
+                merged.append((current_start, current_end))
+                current_start, current_end = start, end
+        
+        # Добавляем последний регион
+        merged.append((current_start, current_end))
+        return merged
+    
+    def _calculate_cluster_metrics(self, freqs_hz: np.ndarray, power_dbm: np.ndarray, 
+                                 start_idx: int, end_idx: int) -> Tuple[float, float, float, float, float, float]:
+        """
+        Рассчитывает метрики кластера:
+        - peak_freq: частота максимума (F_max)
+        - peak_power: мощность в максимуме
+        - centroid_freq: центроид (взвешенный по мощности)
+        - bandwidth_3db: ширина по уровню -3 дБ от пика
+        - cluster_start: начальная частота кластера
+        - cluster_end: конечная частота кластера
+        """
+        try:
+            # Защитные проверки
+            if start_idx < 0 or end_idx >= len(freqs_hz) or start_idx > end_idx:
+                # Fallback значения
+                center_freq = float(freqs_hz[min(max(start_idx, 0), len(freqs_hz)-1)])
+                return center_freq, -80.0, center_freq, 1e6, center_freq, center_freq
+                
+            region_freqs = freqs_hz[start_idx:end_idx+1]
+            region_power = power_dbm[start_idx:end_idx+1]
+            
+            if len(region_freqs) == 0:
+                center_freq = float(freqs_hz[start_idx] if start_idx < len(freqs_hz) else freqs_hz[0])
+                return center_freq, -80.0, center_freq, 1e6, center_freq, center_freq
+            
+            # 1. Частота и мощность максимума (F_max)
+            peak_idx = np.argmax(region_power)
+            peak_freq = float(region_freqs[peak_idx])
+            peak_power = float(region_power[peak_idx])
+            
+            # 2. Центроид (взвешенный по мощности)
+            # Переводим мощности в линейные единицы для взвешивания
+            power_linear = np.power(10.0, region_power / 10.0)
+            power_sum = np.sum(power_linear)
+            if power_sum > 0:
+                centroid_freq = float(np.sum(region_freqs * power_linear) / power_sum)
+            else:
+                centroid_freq = peak_freq
+            
+            # 3. Ширина по уровню -3 дБ от пика
+            threshold_3db = peak_power - 3.0
+            above_3db = region_power >= threshold_3db
+            
+            if np.any(above_3db):
+                indices_above_3db = np.where(above_3db)[0]
+                start_3db_idx = indices_above_3db[0]
+                end_3db_idx = indices_above_3db[-1]
+                bandwidth_3db = float(region_freqs[end_3db_idx] - region_freqs[start_3db_idx])
+            else:
+                # Если нет точек выше -3 дБ, используем весь регион
+                bandwidth_3db = float(region_freqs[-1] - region_freqs[0])
+            
+            # 4. Границы кластера
+            cluster_start = float(region_freqs[0])
+            cluster_end = float(region_freqs[-1])
+            
+            return peak_freq, peak_power, centroid_freq, bandwidth_3db, cluster_start, cluster_end
+            
+        except Exception as e:
+            # В случае ошибки возвращаем безопасные значения
+            try:
+                center_freq = float(freqs_hz[min(max(start_idx, 0), len(freqs_hz)-1)])
+                print(f"[ERROR] _calculate_cluster_metrics failed: {e}, using fallback")
+                return center_freq, -80.0, center_freq, 1e6, center_freq, center_freq
+            except:
+                return 5640e6, -80.0, 5640e6, 1e6, 5640e6, 5640e6
     
     def _add_to_watchlist(self, peak: VideoSignalPeak, span_hz: float):
         """
@@ -331,9 +445,18 @@ class PeakWatchlistManager(QObject):
         }
         self.watchlist_task_ready.emit(task)
         
-        print(f"[Watchlist] Added: {peak.center_freq_hz/1e6:.1f} MHz, "
-              f"span={span_hz/1e6:.1f} MHz, "
-              f"window=[{entry.freq_start_hz/1e6:.1f}-{entry.freq_stop_hz/1e6:.1f}] MHz")
+        # Безопасные логи с проверкой наличия новых метрик
+        if peak.centroid_freq_hz > 0.0 and peak.bandwidth_3db_hz > 0.0:
+            print(f"[Watchlist] Added: Peak={peak.center_freq_hz/1e6:.1f} MHz, "
+                  f"Centroid={peak.centroid_freq_hz/1e6:.1f} MHz, "
+                  f"BW-3dB={peak.bandwidth_3db_hz/1e6:.1f} MHz, "
+                  f"Cluster=[{peak.cluster_start_hz/1e6:.1f}-{peak.cluster_end_hz/1e6:.1f}] MHz, "
+                  f"span={span_hz/1e6:.1f} MHz")
+        else:
+            # Fallback для старых пиков без новых метрик
+            print(f"[Watchlist] Added: {peak.center_freq_hz/1e6:.1f} MHz, "
+                  f"span={span_hz/1e6:.1f} MHz, "
+                  f"window=[{entry.freq_start_hz/1e6:.1f}-{entry.freq_stop_hz/1e6:.1f}] MHz")
     
     def update_rssi_measurement(self, peak_id: str, slave_id: str, rssi_dbm: float):
         """
@@ -397,7 +520,8 @@ class PeakWatchlistManager(QObject):
     def set_detection_parameters(self, threshold_offset_db: float = None,
                                 min_snr_db: float = None,
                                 min_peak_width_bins: int = None,
-                                watchlist_span_hz: float = None):
+                                watchlist_span_hz: float = None,
+                                merge_if_gap_hz: float = None):
         """Обновляет параметры детектора."""
         if threshold_offset_db is not None:
             self.baseline_offset_db = threshold_offset_db
@@ -407,3 +531,5 @@ class PeakWatchlistManager(QObject):
             self.min_peak_width_bins = min_peak_width_bins
         if watchlist_span_hz is not None:
             self.watchlist_span_hz = watchlist_span_hz
+        if merge_if_gap_hz is not None:
+            self.merge_if_gap_hz = merge_if_gap_hz
