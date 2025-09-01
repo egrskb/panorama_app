@@ -11,11 +11,6 @@
       "abs_floor_dbm": -75.0,
       "edge_guard_hz": 500000
     },
-    "cluster": {
-      "min_bw_hz": 1500000,
-      "max_bw_hz": 12000000,
-      "merge_if_gap_hz": 2000000
-    },
     "confirm": {
       "overview_hits": 2,
       "narrow_hits": 1,
