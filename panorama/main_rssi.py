@@ -279,7 +279,15 @@ class RSSIPanoramaMainWindow(QMainWindow):
                 self.ui_manager.update_stations_from_config(self.sdr_settings)
             except Exception:
                 pass
+        def _on_slaves_available(slaves_data: list):
+            # Обновляем координаты слейвов во вкладке
+            if hasattr(self, 'slaves_view') and self.slaves_view:
+                if hasattr(self.slaves_view, 'update_available_devices'):
+                    self.slaves_view.update_available_devices(slaves_data)
+                    self.log.info(f"Обновлены доступные устройства для слейвов: {len(slaves_data)} устройств")
+        
         dlg.devicesConfigured.connect(_on_conf)
+        dlg.slavesAvailable.connect(_on_slaves_available)
         dlg.exec_()
     
     def _load_calibration(self):
@@ -668,19 +676,53 @@ class RSSIPanoramaMainWindow(QMainWindow):
             self.log.error(f"Detector settings dialog error: {e}")
     
     def _on_slave_target_to_map(self, target_data: dict):
-        """Обрабатывает сигнал отправки цели на карту от slaves_view."""
+        """Обрабатывает сигнал отправки данных на карту от slaves_view."""
         try:
             if hasattr(self, 'map_view') and self.map_view:
-                # Отправляем цель на карту
-                if hasattr(self.map_view, 'add_target_from_detector'):
-                    self.map_view.add_target_from_detector(target_data)
-                    self.log.info(f"Цель от слейва отправлена на карту: {target_data.get('id', 'Unknown')}")
+                data_type = target_data.get('type', 'target')
+                
+                if data_type == 'update_slaves_coordinates':
+                    # Обновляем координаты слейвов на карте
+                    slaves_data = target_data.get('slaves', [])
+                    
+                    # Преобразуем в формат для карты
+                    config_slaves = []
+                    for slave in slaves_data:
+                        config_slaves.append({
+                            'nickname': slave['id'],
+                            'pos': [slave['x'], slave['y'], 0.0],
+                            'is_reference': slave.get('is_reference', False)
+                        })
+                    
+                    # Обновляем карту
+                    if hasattr(self.map_view, 'update_stations_from_config'):
+                        self.map_view.update_stations_from_config({'slaves': config_slaves})
+                        self.log.info(f"Координаты слейвов обновлены на карте: {len(config_slaves)} устройств")
+                    
+                elif data_type == 'slaves_layout':
+                    # Показываем расположение слейвов на карте
+                    slaves_data = target_data.get('slaves', [])
+                    for slave in slaves_data:
+                        if hasattr(self.map_view, 'add_station_marker'):
+                            self.map_view.add_station_marker(
+                                slave['id'], 
+                                slave['x'], 
+                                slave['y'], 
+                                slave['id'] == 'slave0'  # is_reference
+                            )
+                    self.log.info(f"Показано расположение {len(slaves_data)} слейвов на карте")
+                
                 else:
-                    self.log.warning("Метод add_target_from_detector не доступен в map_view")
+                    # Обычная цель/передатчик
+                    if hasattr(self.map_view, 'add_target_from_detector'):
+                        self.map_view.add_target_from_detector(target_data)
+                        self.log.info(f"Цель от слейва отправлена на карту: {target_data.get('id', 'Unknown')}")
+                    else:
+                        self.log.warning("Метод add_target_from_detector не доступен в map_view")
             else:
                 self.log.warning("Map view не доступен")
         except Exception as e:
-            self.log.error(f"Ошибка отправки цели на карту: {e}")
+            self.log.error(f"Ошибка отправки данных на карту: {e}")
     
     def _on_slave_task_selected(self, task_id: str):
         """Обрабатывает сигнал выбора задачи от slaves_view."""

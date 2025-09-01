@@ -349,6 +349,7 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
     """Улучшенный диалог управления устройствами."""
     
     devicesConfigured = pyqtSignal(dict)  # Конфигурация устройств
+    slavesAvailable = pyqtSignal(list)    # Доступные устройства для слейвов
 
     def __init__(self, parent=None, current_config: Dict[str, Any] = None):
         super().__init__(parent)
@@ -422,40 +423,37 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
         center_widget = QtWidgets.QWidget()
         center_layout = QtWidgets.QVBoxLayout(center_widget)
         
-        available_group = QtWidgets.QGroupBox("Доступные устройства для Slave")
+        available_group = QtWidgets.QGroupBox("Доступные SDR устройства")
         available_layout = QtWidgets.QVBoxLayout(available_group)
+        
+        # Информация о управлении Slave
+        info_label = QtWidgets.QLabel(
+            "ℹ️ Управление Slave устройствами и их координатами осуществляется во вкладке 'Слейвы'"
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("""
+            QLabel {
+                background-color: rgba(33, 150, 243, 30);
+                padding: 8px;
+                border-radius: 4px;
+                margin-bottom: 5px;
+            }
+        """)
+        available_layout.addWidget(info_label)
         
         self.available_table = QtWidgets.QTableWidget()
         self.available_table.setColumnCount(5)
-        self.available_table.setHorizontalHeaderLabels(["Тип", "Серийный", "Название", "Статус", "Действие"])
+        self.available_table.setHorizontalHeaderLabels(["Тип", "Серийный", "Название", "Статус", "Действия"])
         self.available_table.horizontalHeader().setStretchLastSection(False)
         self.available_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         available_layout.addWidget(self.available_table)
         
         center_layout.addWidget(available_group)
         
-        # === Правая панель: Настроенные Slave устройства ===
-        right_widget = QtWidgets.QWidget()
-        right_layout = QtWidgets.QVBoxLayout(right_widget)
-        
-        slaves_group = QtWidgets.QGroupBox("Slave устройства (для трилатерации)")
-        slaves_layout = QtWidgets.QVBoxLayout(slaves_group)
-        
-        self.slaves_table = QtWidgets.QTableWidget()
-        self.slaves_table.setColumnCount(7)
-        self.slaves_table.setHorizontalHeaderLabels(["Никнейм", "X (м)", "Y (м)", "Z (м)", "URI", "Статус", "Удалить"])
-        self.slaves_table.horizontalHeader().setStretchLastSection(False)
-        slaves_layout.addWidget(self.slaves_table)
-        
-        # Убираем предустановленные формы (треугольник/квадрат/линия) — трилатерация на 3 SDR
-        
-        right_layout.addWidget(slaves_group)
-        
-        # Добавляем панели в сплиттер
+        # Добавляем панели в сплиттер (только Master и доступные устройства)
         splitter.addWidget(left_widget)
         splitter.addWidget(center_widget)
-        splitter.addWidget(right_widget)
-        splitter.setSizes([300, 400, 500])
+        splitter.setSizes([400, 600])
         
         layout.addWidget(splitter)
 
@@ -553,7 +551,6 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
         # Обновляем UI
         self._update_master_list()
         self._update_available_table()
-        self._update_slaves_table()
     
     def _update_master_list(self):
         """Обновляет список HackRF для Master."""
@@ -595,10 +592,6 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
                 print(f"DEBUG: Skipping selected Master from Slave list: {d.serial}")
                 continue
             
-            # HackRF устройства могут быть Slave!
-            # if d.driver.lower() == "hackrf":
-            #     continue
-            
             available.append(d)
             print(f"DEBUG: Added device to Slave list: {d.driver} ({d.serial})")
         
@@ -624,45 +617,66 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
                 status_item.setForeground(QtGui.QBrush(QtGui.QColor(150, 0, 0)))
             self.available_table.setItem(row, 3, status_item)
             
-            # Кнопка действия
-            if device not in self.slave_devices:
-                btn = QtWidgets.QPushButton("➕ Добавить")
-                btn.clicked.connect(lambda checked, d=device: self._add_slave(d))
-                self.available_table.setCellWidget(row, 4, btn)
+            # Создаем контейнер для кнопок
+            button_widget = QtWidgets.QWidget()
+            button_layout = QtWidgets.QHBoxLayout(button_widget)
+            button_layout.setContentsMargins(4, 2, 4, 2)
+            button_layout.setSpacing(4)
+            
+            if not device.is_available:
+                # Устройство недоступно
+                status_label = QtWidgets.QLabel("❌ Недоступен")
+                status_label.setAlignment(QtCore.Qt.AlignCenter)
+                status_label.setStyleSheet("color: #666; font-style: italic;")
+                button_layout.addWidget(status_label)
+                
+            elif device in self.slave_devices:
+                # Устройство уже добавлено как Slave - показываем кнопку удаления
+                remove_btn = QtWidgets.QPushButton("🗑️ Удалить")
+                remove_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #F44336;
+                        color: white;
+                        border: none;
+                        padding: 4px 8px;
+                        border-radius: 3px;
+                        font-size: 11px;
+                    }
+                    QPushButton:hover {
+                        background-color: #D32F2F;
+                    }
+                """)
+                remove_btn.clicked.connect(lambda checked, dev=device: self._remove_slave_device(dev))
+                button_layout.addWidget(remove_btn)
+                
+                # Статус
+                status_label = QtWidgets.QLabel("✅ Добавлен")
+                status_label.setStyleSheet("color: #4CAF50; font-size: 11px;")
+                button_layout.addWidget(status_label)
+                
             else:
-                label = QtWidgets.QLabel("Уже добавлен")
-                label.setAlignment(QtCore.Qt.AlignCenter)
-                self.available_table.setCellWidget(row, 4, label)
-    
-    def _update_slaves_table(self):
-        """Обновляет таблицу Slave устройств."""
-        self.slaves_table.setRowCount(len(self.slave_devices))
+                # Устройство доступно для добавления
+                add_btn = QtWidgets.QPushButton("➕ Добавить")
+                add_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #2196F3;
+                        color: white;
+                        border: none;
+                        padding: 4px 8px;
+                        border-radius: 3px;
+                        font-size: 11px;
+                    }
+                    QPushButton:hover {
+                        background-color: #1976D2;
+                    }
+                """)
+                add_btn.clicked.connect(lambda checked, dev=device: self._add_slave_device(dev))
+                button_layout.addWidget(add_btn)
+            
+            self.available_table.setCellWidget(row, 4, button_widget)
         
-        for row, device in enumerate(self.slave_devices):
-            # Никнейм (редактируемый)
-            nickname_item = QtWidgets.QTableWidgetItem(device.nickname)
-            self.slaves_table.setItem(row, 0, nickname_item)
-            
-            # Позиция X, Y, Z (редактируемые)
-            for col, value in enumerate(device.position, start=1):
-                pos_item = QtWidgets.QTableWidgetItem(str(value))
-                self.slaves_table.setItem(row, col, pos_item)
-            
-            # URI (только чтение)
-            uri_item = QtWidgets.QTableWidgetItem(device.uri)
-            uri_item.setFlags(uri_item.flags() & ~QtCore.Qt.ItemIsEditable)
-            self.slaves_table.setItem(row, 4, uri_item)
-            
-            # Статус
-            status = "✅" if device.is_available else "❌"
-            status_item = QtWidgets.QTableWidgetItem(status)
-            status_item.setTextAlignment(QtCore.Qt.AlignCenter)
-            self.slaves_table.setItem(row, 5, status_item)
-            
-            # Кнопка удаления
-            btn_remove = QtWidgets.QPushButton("❌ Удалить")
-            btn_remove.clicked.connect(lambda checked, d=device: self._remove_slave(d))
-            self.slaves_table.setCellWidget(row, 6, btn_remove)
+        # Эмитируем сигнал с доступными устройствами для синхронизации со слейвами
+        self.slavesAvailable.emit(available)
     
     def _on_master_selected(self):
         """Обрабатывает выбор Master устройства."""
@@ -726,7 +740,50 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
             device.role = DeviceRole.SLAVE
             self.slave_devices.append(device)
             self._update_available_table()
-            self._update_slaves_table()
+    
+    def _add_slave_device(self, device: SDRDeviceInfo):
+        """Добавляет устройство как Slave через кнопку."""
+        if device not in self.slave_devices and device.is_available:
+            # Устанавливаем роль и никнейм по умолчанию
+            device.role = DeviceRole.SLAVE
+            
+            # Генерируем уникальный никнейм для Slave
+            slave_number = len(self.slave_devices) + 1
+            device.nickname = f"Slave{slave_number}"
+            
+            # Устанавливаем позицию по умолчанию
+            default_positions = [
+                (10.0, 0.0, 0.0),   # Slave1
+                (0.0, 10.0, 0.0),   # Slave2  
+                (-10.0, 0.0, 0.0),  # Slave3
+                (0.0, -10.0, 0.0),  # Slave4
+                (5.0, 5.0, 0.0),    # Slave5
+                (-5.0, -5.0, 0.0)   # Slave6
+            ]
+            
+            if slave_number <= len(default_positions):
+                device.position = default_positions[slave_number - 1]
+            else:
+                # Для дополнительных устройств случайная позиция
+                import random
+                angle = random.uniform(0, 2 * 3.14159)
+                radius = 10.0
+                import math
+                device.position = (radius * math.cos(angle), radius * math.sin(angle), 0.0)
+            
+            self.slave_devices.append(device)
+            self._update_available_table()
+            
+            # Автоматически сохраняем конфигурацию
+            self._auto_save_config()
+            
+            # Показываем сообщение
+            QtWidgets.QMessageBox.information(self, "Успех", 
+                f"Устройство {device.nickname} добавлено как Slave\n"
+                f"Позиция: ({device.position[0]:.1f}, {device.position[1]:.1f}, {device.position[2]:.1f})")
+        else:
+            QtWidgets.QMessageBox.warning(self, "Предупреждение", 
+                "Устройство недоступно или уже добавлено")
     
     def _remove_slave(self, device: SDRDeviceInfo):
         """Удаляет устройство из Slave."""
@@ -734,7 +791,26 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
             device.role = DeviceRole.NONE
             self.slave_devices.remove(device)
             self._update_available_table()
-            self._update_slaves_table()
+    
+    def _remove_slave_device(self, device: SDRDeviceInfo):
+        """Удаляет устройство из Slave через кнопку."""
+        if device in self.slave_devices:
+            # Подтверждение удаления
+            reply = QtWidgets.QMessageBox.question(self, "Подтверждение", 
+                f"Удалить устройство {device.nickname} из списка Slave?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+            
+            if reply == QtWidgets.QMessageBox.Yes:
+                device.role = DeviceRole.NONE
+                self.slave_devices.remove(device)
+                self._update_available_table()
+                
+                # Автоматически сохраняем конфигурацию
+                self._auto_save_config()
+                
+                # Показываем сообщение
+                QtWidgets.QMessageBox.information(self, "Успех", 
+                    f"Устройство {device.nickname} удалено из списка Slave")
     
     def _remove_master_from_slaves(self, master_serial: str):
         """Удаляет Master из списка Slave устройств."""
@@ -748,63 +824,7 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
         ]
         
         print(f"DEBUG: After removal: {len(self.slave_devices)} slaves")
-        
-        # Обновляем таблицу Slaves
-        self._update_slaves_table()
     
-    def _preset_triangle(self):
-        """Устанавливает позиции Slave в виде треугольника."""
-        if len(self.slave_devices) < 3:
-            QtWidgets.QMessageBox.warning(self, "Предупреждение", 
-                                         "Нужно минимум 3 Slave устройства для треугольника")
-            return
-        
-        # Равносторонний треугольник с Master в центре
-        # Master в (0, 0), Slaves на вершинах
-        positions = [
-            (0.0, 10.0, 0.0),      # Верх
-            (-8.66, -5.0, 0.0),    # Левый нижний
-            (8.66, -5.0, 0.0),     # Правый нижний
-        ]
-        
-        for i, device in enumerate(self.slave_devices[:3]):
-            device.position = positions[i]
-        
-        self._update_slaves_table()
-    
-    def _preset_square(self):
-        """Устанавливает позиции Slave в виде квадрата."""
-        if len(self.slave_devices) < 4:
-            QtWidgets.QMessageBox.warning(self, "Предупреждение", 
-                                         "Нужно минимум 4 Slave устройства для квадрата")
-            return
-        
-        # Квадрат с Master в центре
-        positions = [
-            (-5.0, 5.0, 0.0),    # Левый верхний
-            (5.0, 5.0, 0.0),     # Правый верхний
-            (5.0, -5.0, 0.0),    # Правый нижний
-            (-5.0, -5.0, 0.0),   # Левый нижний
-        ]
-        
-        for i, device in enumerate(self.slave_devices[:4]):
-            device.position = positions[i]
-        
-        self._update_slaves_table()
-    
-    def _preset_line(self):
-        """Устанавливает позиции Slave в линию."""
-        if len(self.slave_devices) < 2:
-            QtWidgets.QMessageBox.warning(self, "Предупреждение", 
-                                         "Нужно минимум 2 Slave устройства для линии")
-            return
-        
-        # Линия вдоль оси X
-        spacing = 10.0
-        for i, device in enumerate(self.slave_devices):
-            device.position = ((i + 1) * spacing, 0.0, 0.0)
-        
-        self._update_slaves_table()
     
     def _apply_saved_config(self):
         """Применяет сохраненную конфигурацию."""
@@ -837,21 +857,9 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
     
     def _gather_table_data(self):
         """Собирает данные из таблиц."""
-        # Обновляем никнеймы и позиции Slave из таблицы
-        for row, device in enumerate(self.slave_devices):
-            # Никнейм
-            nickname_item = self.slaves_table.item(row, 0)
-            if nickname_item:
-                device.nickname = nickname_item.text()
-            
-            # Позиции
-            try:
-                x = float(self.slaves_table.item(row, 1).text())
-                y = float(self.slaves_table.item(row, 2).text())
-                z = float(self.slaves_table.item(row, 3).text())
-                device.position = (x, y, z)
-            except (AttributeError, ValueError):
-                pass
+        # Данные Slave теперь управляются во вкладке "Слейвы"
+        # Здесь только сохраняем Master конфигурацию
+        pass
     
     def _auto_save_config(self):
         """Автоматически сохраняет конфигурацию при изменениях."""
@@ -915,10 +923,14 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
                                          "Выберите Master устройство (HackRF)")
             return
         
-        if len(self.slave_devices) < 2:
+        # Считаем общее количество устройств: 1 Master + количество Slave
+        total_devices = 1 + len(self.slave_devices)  # 1 Master + N Slaves
+        
+        if total_devices < 3:  # Нужно минимум 3 устройства (1 Master + 2 Slave)
             reply = QtWidgets.QMessageBox.question(self, "Подтверждение",
-                "Для трилатерации рекомендуется минимум 3 устройства (1 Master + 2 Slave).\n"
-                "Сейчас настроено меньше. Продолжить?",
+                f"Для трилатерации рекомендуется минимум 3 устройства (1 Master + 2 Slave).\n"
+                f"Сейчас настроено: 1 Master + {len(self.slave_devices)} Slave = {total_devices} устройств.\n"
+                f"Продолжить?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
             
             if reply != QtWidgets.QMessageBox.Yes:
