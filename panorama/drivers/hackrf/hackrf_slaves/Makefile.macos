@@ -1,0 +1,79 @@
+# Makefile для сборки hackrf_slave библиотеки на macOS
+
+CC = clang
+CFLAGS = -Wall -Wextra -O2 -fPIC -std=c99
+INCLUDES = -I/usr/include -I/usr/local/include -I/opt/homebrew/include
+
+# Пробуем pkg-config сначала для более точных флагов
+HACKRF_CFLAGS := $(shell pkg-config --cflags libhackrf 2>/dev/null || echo "")
+HACKRF_LIBS := $(shell pkg-config --libs libhackrf 2>/dev/null || echo "-lhackrf")
+FFTW_CFLAGS := $(shell pkg-config --cflags fftw3f 2>/dev/null || echo "")  
+FFTW_LIBS := $(shell pkg-config --libs fftw3f 2>/dev/null || echo "-lfftw3f")
+
+# Добавляем библиотеки из Homebrew
+HOMEBREW_LIB_PATHS = -L/opt/homebrew/lib -L/usr/local/lib
+
+INCLUDES += $(HACKRF_CFLAGS) $(FFTW_CFLAGS)
+LIBS = $(HOMEBREW_LIB_PATHS) $(HACKRF_LIBS) $(FFTW_LIBS) -lm -lpthread
+LDFLAGS = -shared -undefined dynamic_lookup
+
+# Директории
+SRC_DIR = .
+BUILD_DIR = build
+TARGET_DIR = .
+
+# Файлы
+SOURCES = hackrf_slave.c
+OBJECTS = $(SOURCES:%.c=$(BUILD_DIR)/%.o)
+TARGET = libhackrf_slave.dylib
+
+# macOS также может использовать .so расширение
+ALT_TARGET = libhackrf_slave.so
+
+# Основная цель
+all: $(TARGET_DIR)/$(TARGET) $(TARGET_DIR)/$(ALT_TARGET)
+
+# Создание директории для сборки
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+# Сборка объектных файлов
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Сборка разделяемой библиотеки (.dylib)
+$(TARGET_DIR)/$(TARGET): $(OBJECTS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+
+# Создаем также .so версию для совместимости
+$(TARGET_DIR)/$(ALT_TARGET): $(TARGET_DIR)/$(TARGET)
+	cp $(TARGET_DIR)/$(TARGET) $(TARGET_DIR)/$(ALT_TARGET)
+
+# Очистка
+clean:
+	rm -rf $(BUILD_DIR)
+	rm -f $(TARGET_DIR)/$(TARGET) $(TARGET_DIR)/$(ALT_TARGET)
+
+# Установка зависимостей (для разработчика)
+install-deps:
+	@echo "Установка зависимостей для macOS..."
+	@echo "Используя Homebrew:"
+	@echo "  brew install hackrf fftw swig cmake pkg-config libusb"
+	@echo ""
+	@echo "Если Homebrew не установлен:"
+	@echo "  /bin/bash -c \"\$$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+
+# Тест сборки
+test-build: all
+	@echo "Библиотека $(TARGET) успешно собрана на macOS"
+	@otool -L $(TARGET_DIR)/$(TARGET)
+
+# Копирование в lib директорию
+install: all
+	@LIB_DIR="../../../lib"; \
+	mkdir -p "$$LIB_DIR"; \
+	cp $(TARGET_DIR)/$(TARGET) "$$LIB_DIR/"; \
+	cp $(TARGET_DIR)/$(ALT_TARGET) "$$LIB_DIR/"; \
+	echo "✓ Библиотеки установлены в $$LIB_DIR/"
+
+.PHONY: all clean install-deps test-build install

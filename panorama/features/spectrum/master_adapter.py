@@ -13,7 +13,7 @@ import numpy as np
 from PyQt5 import QtCore
 
 # наш backend
-from panorama.drivers.hrf_backend import HackRFQSABackend, SweepConfig
+from panorama.drivers.hackrf.hrf_backend import HackRFQSABackend, SweepConfig
 
 
 class MasterSourceAdapter(QtCore.QObject):

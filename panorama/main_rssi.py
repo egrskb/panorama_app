@@ -769,13 +769,124 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def _on_slave_watchlist_updated(self, watchlist_data: list):
         """Обрабатывает сигнал обновления watchlist от slaves_view."""
         try:
-            # Логируем только при реальных изменениях, а не каждые 2 секунды
-            if not hasattr(self, '_last_watchlist_count') or self._last_watchlist_count != len(watchlist_data):
-                self.log.info(f"Watchlist обновлен от слейва: {len(watchlist_data)} элементов")
-                self._last_watchlist_count = len(watchlist_data)
-            # TODO: Реализовать логику обновления watchlist
+            watchlist_count = len(watchlist_data)
+            prev_count = getattr(self, '_last_watchlist_count', 0)
+            
+            # Логируем только при реальных изменениях
+            if prev_count != watchlist_count:
+                self.log.info(f"Watchlist обновлен: {watchlist_count} элементов (было: {prev_count})")
+                self._last_watchlist_count = watchlist_count
+                
+                # Автоматическое управление оркестратором и slaves
+                self._auto_manage_orchestrator(watchlist_count, prev_count)
+                
         except Exception as e:
             self.log.error(f"Ошибка обработки обновления watchlist: {e}")
+    
+    def _auto_manage_orchestrator(self, current_count: int, prev_count: int):
+        """Автоматически управляет оркестратором в зависимости от состояния watchlist."""
+        try:
+            # Проверяем что компоненты доступны
+            if not hasattr(self, 'components_manager') or not self.components_manager:
+                return
+                
+            orchestrator = self.components_manager.orchestrator
+            slave_manager = self.components_manager.slave_manager
+            
+            if not orchestrator or not slave_manager:
+                return
+            
+            # Проверяем доступность slaves
+            available_slaves = sum(1 for slave in slave_manager.slaves.values() if slave.is_initialized) if slave_manager else 0
+            
+            # Логика управления:
+            # Первый пик в watchlist (0 -> 1+) = запуск slaves и оркестратора
+            if prev_count == 0 and current_count > 0:
+                if available_slaves > 0:
+                    self.log.info(f"🚀 Первый пик обнаружен - запускаем оркестратор с {available_slaves} slaves")
+                    
+                    # Запускаем оркестратор если он не запущен
+                    if not orchestrator.is_running:
+                        orchestrator.start()
+                        self.log.info("Orchestrator started")
+                    
+                    # Уведомляем о начале активной фазы
+                    if available_slaves == 1:
+                        self.log.info(f"📡 Начинаем мониторинг {current_count} целей (shared device mode - timeouts expected)")
+                    else:
+                        self.log.info(f"📡 Начинаем мониторинг {current_count} целей с {available_slaves} slaves")
+                else:
+                    self.log.warning(f"🚀 Первый пик обнаружен, но нет доступных slaves для измерений")
+                    self.log.info(f"📊 Обнаружено {current_count} целей - работаем только в режиме обнаружения (без RSSI)")
+                
+            # Watchlist стал пустым (1+ -> 0) = остановка slaves и оркестратора  
+            elif prev_count > 0 and current_count == 0:
+                self.log.info("⏹️  Все пики исчезли - останавливаем оркестратор")
+                
+                # Останавливаем оркестратор
+                if orchestrator.is_running:
+                    orchestrator.stop()
+                    self.log.info("Orchestrator stopped")
+                
+                # Уведомляем об окончании активной фазы
+                self.log.info("📡 Мониторинг завершен - система в режиме ожидания")
+                
+            # Изменение количества целей в активной фазе
+            elif prev_count > 0 and current_count > 0:
+                if available_slaves > 0:
+                    self.log.info(f"📊 Обновление watchlist: {current_count} активных целей, {available_slaves} slaves")
+                else:
+                    self.log.info(f"📊 Обновление watchlist: {current_count} активных целей (только обнаружение)")
+                
+        except Exception as e:
+            self.log.error(f"Ошибка автоуправления оркестратором: {e}")
+    
+    def _on_watchlist_updated_from_peak_manager(self, watchlist_entries: list):
+        """Обрабатывает обновления watchlist от PeakWatchlistManager для автоуправления."""
+        try:
+            # Конвертируем WatchlistEntry в простой формат для совместимости
+            watchlist_data = []
+            for entry in watchlist_entries:
+                watchlist_data.append({
+                    'id': entry.peak_id,
+                    'freq': entry.center_freq_hz / 1e6,  # МГц
+                    'span': entry.span_hz / 1e6,         # МГц
+                    'rssi': entry.rssi_measurements or {},
+                    'updated': entry.last_update
+                })
+            
+            # Вызываем основную логику автоуправления
+            self._on_slave_watchlist_updated(watchlist_data)
+            
+        except Exception as e:
+            self.log.error(f"Ошибка обработки watchlist от peak_manager: {e}")
+    
+    @safe_method("Master spectrum for slaves", default_return=None)
+    def _on_master_spectrum_for_slaves(self, freqs, dbm):
+        """Передает спектральные данные от Master всем slaves для Virtual Slave режима."""
+        try:
+            if not hasattr(self, 'components_manager') or not self.components_manager:
+                return
+            
+            slave_manager = self.components_manager.slave_manager
+            if not slave_manager or not slave_manager.slaves:
+                return
+                
+            # Конвертируем в numpy arrays если нужно
+            if not isinstance(freqs, np.ndarray):
+                freqs = np.array(freqs, dtype=np.float64)
+            if not isinstance(dbm, np.ndarray):
+                dbm = np.array(dbm, dtype=np.float32)
+            
+            # Передаем данные всем slaves
+            for slave in slave_manager.slaves.values():
+                try:
+                    slave.update_spectrum_from_master(freqs, dbm)
+                except Exception as e:
+                    self.log.debug(f"Error updating spectrum for slave {slave.slave_id}: {e}")
+                    
+        except Exception as e:
+            self.log.error(f"Error processing master spectrum for slaves: {e}")
     
     def _refresh_slaves_data(self):
         """Обновляет данные слейвов."""
@@ -834,19 +945,26 @@ class RSSIPanoramaMainWindow(QMainWindow):
         self.spectrum_view.newRowReady.connect(
             self.trilateration_coordinator.process_master_spectrum
         )
+        
+        # Virtual-slave режим отключён: не подключаем спектр Master к слейвам
         # Пересылка задач watchlist в оркестратор для измерений слейвами
         try:
             self.trilateration_coordinator.peak_manager.watchlist_task_ready.connect(
                 self.orchestrator.enqueue_watchlist_task
             )
+            
+            # Подключаем автоматическое управление оркестратором при изменении watchlist
+            self.trilateration_coordinator.peak_manager.watchlist_updated.connect(
+                self._on_watchlist_updated_from_peak_manager
+            )
         except Exception as e:
             self.log.error(f"Failed to connect watchlist tasks: {e}")
         
-        # Обновления позиций slave из настроек
+        # Позиции трёх слейвов (slave0 — опорный)
         self.trilateration_coordinator.set_slave_positions({
+            'slave0': (0.0, 0.0, 0.0),
             'slave1': (10.0, 0.0, 0.0),
-            'slave2': (0.0, 10.0, 0.0),
-            'slave3': (-10.0, 0.0, 0.0)
+            'slave2': (0.0, 10.0, 0.0)
         })
         
         # Подключаем к карте

@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 # Ensure new backend module is importable
-spec = importlib.util.find_spec("panorama.drivers.hrf_backend")
+spec = importlib.util.find_spec("panorama.drivers.hackrf.hrf_backend")
 if spec is None:
     pytest.skip("hrf_backend not importable", allow_module_level=True)
 

@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Slave SDR controller: измерение RMS RSSI в заданном окне частот.
+Использует нативную C библиотеку hackrf_slave вместо SoapySDR.
 """
 
 from __future__ import annotations
 import os
-os.environ.setdefault("SOAPY_SDR_DISABLE_AVAHI", "1")  # без Avahi
 import time
 import logging
 import threading
@@ -17,13 +17,22 @@ from PyQt5.QtCore import QObject, pyqtSignal, QMutex, QMutexLocker
 
 from panorama.shared.rms_utils import compute_band_rssi_dbm, RMSCalculator, RMSMeasurement
 
+# Импорт нашей нативной C библиотеки
 try:
-    import SoapySDR
-    from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CF32
-    SOAPY_AVAILABLE = True
-except Exception:
-    SOAPY_AVAILABLE = False
-    SoapySDR = None
+    from panorama.drivers.hackrf.hackrf_slaves.hackrf_slave_wrapper import (
+        HackRFSlaveDevice, 
+        HackRFSlaveError,
+        HackRFSlaveDeviceError,
+        HackRFSlaveConfigError,
+        HackRFSlaveCaptureError,
+        HackRFSlaveProcessingError,
+        HackRFSlaveTimeoutError,
+        list_devices
+    )
+    HACKRF_SLAVE_AVAILABLE = True
+except Exception as e:
+    HACKRF_SLAVE_AVAILABLE = False
+    logging.getLogger(__name__).error(f"Failed to import hackrf_slave library: {e}")
 
 
 @dataclass
@@ -55,19 +64,20 @@ class SlaveSDR(QObject):
     def __init__(self, slave_id: str, uri: str, logger: logging.Logger):
         super().__init__()
         self.slave_id = slave_id
-        self.uri = uri
+        self.uri = uri  # Для HackRF это может быть серийный номер
         self.log = logger
 
-        self.sdr = None
-        self.rx_stream = None
+        self.device = None
         self.is_initialized = False
 
-        self.sample_rate = 8e6
-        self.gain = 20.0
-        self.frequency = 2.4e9
-        self.bandwidth = 2.5e6
-
-        self.k_cal_db = 0.0
+        # Конфигурация устройства
+        self.sample_rate = 8000000  # 8 МГц
+        self.lna_gain = 16          # LNA усиление
+        self.vga_gain = 20          # VGA усиление
+        self.amp_enable = False     # RF усилитель
+        self.bandwidth = 2500000    # 2.5 МГц
+        self.frequency = 2.4e9      # Текущая частота
+        self.k_cal_db = 0.0         # Калибровочная поправка
 
         self.is_measuring = False
         self.current_window: Optional[MeasurementWindow] = None
@@ -84,7 +94,8 @@ class SlaveSDR(QObject):
         self.success_count = 0  # Счетчик успехов для восстановления
 
         self._mutex = QMutex()
-        self._init_sdr()
+        
+        self._init_device()
 
     # --- Error management ---
     def _record_error(self):
@@ -142,36 +153,116 @@ class SlaveSDR(QObject):
             'last_error_time': self.last_error_time
         }
 
-    # --- SDR init/close ---
-    def _init_sdr(self):
-        if not SOAPY_AVAILABLE:
-            self.log.error("SoapySDR not available")
+    # --- Device init/close ---
+    def _init_device(self):
+        if not HACKRF_SLAVE_AVAILABLE:
+            self.log.error("HackRF slave library not available")
             return
+        
         try:
-            self.sdr = SoapySDR.Device(self.uri)
-            self.sdr.setSampleRate(SOAPY_SDR_RX, 0, self.sample_rate)
-            self.sdr.setBandwidth(SOAPY_SDR_RX, 0, self.bandwidth)
-            self.sdr.setGain(SOAPY_SDR_RX, 0, self.gain)
-            self.sdr.setFrequency(SOAPY_SDR_RX, 0, self.frequency)
-            self.rx_stream = self.sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
-            self.sdr.activateStream(self.rx_stream)
+            # Парсинг URI для извлечения серийного номера
+            serial = self._parse_serial_from_uri(self.uri)
+            
+            # Создаем и открываем устройство
+            self.device = HackRFSlaveDevice(serial=serial, logger=self.log)
+            
+            if not self.device.open():
+                raise HackRFSlaveDeviceError(f"Failed to open device with serial: {serial}")
+            
+            # Импортируем SlaveConfig из нового wrapper
+            from panorama.drivers.hackrf.hackrf_slaves.hackrf_slave_wrapper import SlaveConfig
+            
+            # Создаем конфигурацию
+            config = SlaveConfig(
+                center_freq_hz=int(self.frequency),
+                sample_rate_hz=self.sample_rate,
+                lna_gain=self.lna_gain,
+                vga_gain=self.vga_gain,
+                amp_enable=self.amp_enable,
+                window_type=1,  # HAMMING
+                dc_offset_correction=True,
+                iq_balance_correction=True,
+                freq_offset_hz=0.0
+            )
+            
+            # Конфигурируем устройство
+            if not self.device.configure(config):
+                raise HackRFSlaveConfigError(f"Failed to configure device")
+            
             self.is_initialized = True
             self.status_changed.emit("READY")
-            self.log.info(f"Slave {self.slave_id} initialized: {self.uri}")
+            self.log.info(f"Slave {self.slave_id} initialized: {self.uri} (serial: {serial})")
+            
         except Exception as e:
-            self.log.error(f"Failed to initialize slave {self.slave_id}: {e}")
+            error_msg = str(e)
+            if "not found" in error_msg.lower() or "unavailable" in error_msg.lower():
+                self.log.warning(f"Slave {self.slave_id} device not available (may be in use as master): {e}")
+            else:
+                self.log.error(f"Failed to initialize slave {self.slave_id}: {e}")
             self.status_changed.emit("ERROR")
+            if hasattr(self, 'device') and self.device:
+                try:
+                    self.device.close()
+                except:
+                    pass
+                self.device = None
+    
+    def _parse_serial_from_uri(self, uri: str) -> str:
+        """Извлекает серийный номер из URI."""
+        if not uri:
+            return ""
+            
+        # Парсинг различных форматов URI
+        if 'serial=' in uri:
+            # driver=hackrf,serial=XXXX или просто serial=XXXX
+            for part in uri.split(','):
+                if part.startswith('serial='):
+                    return part[7:]  # Убираем 'serial='
+        
+        # Если это просто серийный номер (32 символа hex)
+        if len(uri) == 32 and all(c in '0123456789abcdefABCDEF' for c in uri):
+            return uri
+            
+        return ""
 
     def close(self):
         try:
-            if self.rx_stream:
-                self.sdr.deactivateStream(self.rx_stream)
-                self.sdr.closeStream(self.rx_stream)
-            self.sdr = None
+            if self.device:
+                self.device.close()
+                self.device = None
             self.is_initialized = False
             self.log.info(f"Slave {self.slave_id} closed")
         except Exception as e:
             self.log.error(f"Error closing slave {self.slave_id}: {e}")
+
+    def _reconfigure_device(self, new_bandwidth: Optional[int] = None) -> bool:
+        """Переконфигурация устройства при необходимости."""
+        try:
+            if not self.device or not self.is_initialized:
+                return False
+            
+            # При необходимости обновляем конфигурацию
+            if new_bandwidth and new_bandwidth != self.bandwidth:
+                self.bandwidth = new_bandwidth
+                from panorama.drivers.hackrf.hackrf_slaves.hackrf_slave_wrapper import SlaveConfig
+                config = SlaveConfig(
+                    center_freq_hz=int(self.frequency),  # Используем текущую частоту
+                    sample_rate_hz=self.sample_rate,
+                    lna_gain=self.lna_gain,
+                    vga_gain=self.vga_gain,
+                    amp_enable=self.amp_enable,
+                    window_type=1,  # HAMMING
+                    dc_offset_correction=True,
+                    iq_balance_correction=True,
+                    freq_offset_hz=0.0
+                )
+                self.device.configure(config)
+                self.log.debug(f"{self.slave_id}: reconfigured with bandwidth {new_bandwidth}")
+            
+            return True
+        except Exception as e:
+            self.log.error(f"{self.slave_id}: reconfiguration failed: {e}")
+            return False
 
     # --- band measurement ---
     def measure_band_rssi(self, center_hz: float, span_hz: float, dwell_ms: int,
@@ -182,7 +273,7 @@ class SlaveSDR(QObject):
             remaining = self.disabled_until - current_time
             raise RuntimeError(f"Slave {self.slave_id} temporarily disabled. Retry in {remaining:.0f} seconds")
             
-        if not self.is_initialized:
+        if not self.is_initialized or not self.device:
             raise RuntimeError(f"Slave {self.slave_id} not initialized")
         if self.is_measuring:
             raise RuntimeError(f"Slave {self.slave_id} busy")
@@ -196,119 +287,49 @@ class SlaveSDR(QObject):
             self.current_window = MeasurementWindow(center=center_hz, span=span_hz,
                                                     dwell_ms=dwell_ms, epoch=time.time())
 
-            # Настройка тюнера
-            self.sdr.setFrequency(SOAPY_SDR_RX, 0, center_hz)
-            # чтобы захватить всю полосу, выставим bandwidth ≈ span
-            bw = max(200e3, min(span_hz, self.sample_rate * 0.8))
-            self.sdr.setBandwidth(SOAPY_SDR_RX, 0, bw)
-            # Небольшая задержка на установление ГКЧ/фильтров
-            time.sleep(0.01)
-
-            # Сбор выборки с улучшенной обработкой ошибок
-            n_samp = int(max(1, round(self.sample_rate * (dwell_ms / 1000.0))))
+            # Подготовка к измерению
+            # Обновляем калибровку если передана
+            calibration_db = k_cal_db if k_cal_db is not None else self.k_cal_db
+            if calibration_db != self.k_cal_db:
+                self.k_cal_db = calibration_db
+                # Переконфигурируем устройство с новой калибровкой
+                from panorama.drivers.hackrf.hackrf_slaves.hackrf_slave_wrapper import SlaveConfig
+                config = SlaveConfig(
+                    center_freq_hz=int(center_hz),
+                    sample_rate_hz=self.sample_rate,
+                    lna_gain=self.lna_gain,
+                    vga_gain=self.vga_gain,
+                    amp_enable=self.amp_enable,
+                    window_type=1,  # HAMMING
+                    dc_offset_correction=True,
+                    iq_balance_correction=True,
+                    freq_offset_hz=0.0
+                )
+                self.device.configure(config)
             
-            # Повторяем попытку сбора данных несколько раз
-            max_collection_attempts = 3
-            for collection_attempt in range(max_collection_attempts):
-                out = np.empty(n_samp, dtype=np.complex64)
-                offset = 0
-                max_read_attempts = 15  # Увеличили количество попыток
-                read_attempts = 0
-                # 20мс чанки или меньше, чтобы быстрее получать данные
-                chunk = max(1024, min(int(self.sample_rate * 0.02), n_samp))
-                
-                while offset < n_samp and read_attempts < max_read_attempts:
-                    try:
-                        tmp = np.empty(chunk, dtype=np.complex64)
-                        rc = self.sdr.readStream(self.rx_stream, [tmp], len(tmp))
-                        
-                        # Обработка возвращаемого значения
-                        if isinstance(rc, tuple):
-                            got = int(rc[0])
-                        else:
-                            try:
-                                got = int(getattr(rc, 'ret', rc))
-                            except Exception:
-                                got = -1
-                        
-                        if got and got > 0:
-                            take = min(got, n_samp - offset)
-                            out[offset:offset+take] = tmp[:take]
-                            offset += take
-                            read_attempts = 0  # Сброс счетчика при успехе
-                        else:
-                            read_attempts += 1
-                            time.sleep(0.01)  # Увеличили задержку между попытками
-                            
-                    except Exception as e:
-                        read_attempts += 1
-                        self.log.debug(f"readStream exception in {self.slave_id}: {e}")
-                        time.sleep(0.02)
-                
-                # Если получили данные, выходим из цикла повторений
-                if offset > 0:
-                    break
-                    
-                # Логируем неудачную попытку
-                self.log.warning(f"Collection attempt {collection_attempt + 1}/{max_collection_attempts} failed for {self.slave_id}, offset={offset}")
-                
-                # Между попытками делаем более длительную паузу вместо перезапуска потока
-                if collection_attempt < max_collection_attempts - 1:
-                    time.sleep(0.2)  # Увеличенная пауза между попытками
-            
-            if offset == 0:
-                raise RuntimeError(f"readStream returned no data after {max_collection_attempts} attempts")
+            # Автоматическая настройка полосы пропускания
+            bw = max(200000, min(int(span_hz), int(self.sample_rate * 0.8)))
+            self._reconfigure_device(bw)
 
-            sig = out[:offset]
-
-            # спектр
-            # окно Хэмминга для RMS оценки
-            win = np.hamming(len(sig)).astype(np.float32)
-            sig_w = sig * win
-            # FFT для комплексного потока CF32
-            sp = np.fft.fft(sig_w)
-            sp = np.fft.fftshift(sp)
-            psd = (np.abs(sp) ** 2) / np.sum(win ** 2)
-            psd_dbm = 10.0 * np.log10(psd + 1e-20) - 174.0 + 10.0 * np.log10(self.sample_rate / len(sig_w))
-
-            # частотная ось этого рида (центрированная вокруг 0), затем к абсолютной частоте
-            freqs = np.fft.fftfreq(len(sig_w), d=1.0 / self.sample_rate)
-            freqs = np.fft.fftshift(freqs)
-            freqs = freqs + 0.0  # базовая полоса вокруг 0 Гц
-            freqs_hz = freqs + center_hz
-
-            # Используем централизованную функцию для RMS расчета
-            band_rssi_dbm = compute_band_rssi_dbm(freqs_hz, psd_dbm, center_hz, span_hz/2)
-            
-            if band_rssi_dbm is None:
-                raise RuntimeError("Failed to compute band RSSI - insufficient frequency bins")
-            
-            # Для расчета шумового пола извлекаем нужную полосу
-            freq_mask = (freqs_hz >= center_hz - span_hz/2) & (freqs_hz <= center_hz + span_hz/2)
-            band_powers = psd_dbm[freq_mask]
-            
-            # шумовой пол — медиана нижних 30%
-            sorted_vals = np.sort(band_powers)
-            k = max(1, int(len(sorted_vals) * 0.3))
-            noise_dbm = float(np.median(sorted_vals[:k]))
-
-            # калибровка
-            k_corr = float(self.k_cal_db if k_cal_db is None else k_cal_db)
-            band_rssi_dbm += k_corr
-            noise_dbm += k_corr
-
-            snr_db = float(band_rssi_dbm - noise_dbm)
-
+            # Прямой доступ к устройству (только реальный SDR)
+            duration_sec = dwell_ms / 1000.0
+            result = self.device.measure_rssi(
+                center_hz=center_hz,
+                span_hz=span_hz,
+                duration_sec=duration_sec
+            )
+            if result is None:
+                raise RuntimeError("RSSI measurement returned None")
             measurement = RSSIMeasurement(
                 slave_id=self.slave_id,
                 center_hz=float(center_hz),
                 span_hz=float(span_hz),
-                band_rssi_dbm=band_rssi_dbm,
-                band_noise_dbm=noise_dbm,
-                snr_db=snr_db,
-                n_samples=int(got),
-                ts=time.time(),
-                flags={"valid": True},
+                band_rssi_dbm=result.rssi_dbm,
+                band_noise_dbm=result.noise_floor_dbm,
+                snr_db=result.snr_db,
+                n_samples=result.sample_count,
+                ts=result.timestamp,
+                flags={"direct_device": True},
             )
             
             # Записываем успех
@@ -316,8 +337,13 @@ class SlaveSDR(QObject):
             return measurement
             
         except Exception as e:
-            # Записываем ошибку
-            self._record_error()
+            error_msg = str(e)
+            if "timeout" in error_msg.lower() or "busy" in error_msg.lower():
+                # Timeout - временная проблема, не увеличиваем счетчик критических ошибок
+                self.log.debug(f"Slave {self.slave_id}: temporary timeout (device busy with master)")
+            else:
+                # Записываем ошибку только для серьезных проблем
+                self._record_error()
             raise e
         finally:
             self.is_measuring = False
@@ -333,7 +359,7 @@ class SlaveSDR(QObject):
         Returns:
             RMSMeasurement or None if failed
         """
-        if not self.is_initialized:
+        if not self.is_initialized or not self.device:
             self.log.error(f"Slave {self.slave_id} not initialized")
             return None
             
@@ -347,84 +373,47 @@ class SlaveSDR(QObject):
             center_hz = float(target.get('center_hz', 0))
             halfspan_hz = float(target.get('halfspan_hz', 2.5e6))
             guard_hz = float(target.get('guard_hz', 1e6))
+            target_id = str(target.get('id', 'unknown'))
             
-            # Calculate working span: 2 * (halfspan + guard)
-            working_span = 2 * (halfspan_hz + guard_hz)
+            # Используем новый CFFI wrapper для RSSI измерения
+            span_hz = halfspan_hz * 2.0  # Полный span = 2 * halfspan
+            duration_sec = dwell_ms / 1000.0  # Конвертируем в секунды
             
-            # Tune to center frequency
-            self.sdr.setFrequency(SOAPY_SDR_RX, 0, center_hz)
+            result = self.device.measure_rssi(
+                center_hz=center_hz,
+                span_hz=span_hz,
+                duration_sec=duration_sec
+            )
             
-            # Set bandwidth to cover working span
-            bw = max(200e3, min(working_span, self.sample_rate * 0.8))
-            self.sdr.setBandwidth(SOAPY_SDR_RX, 0, bw)
+            if result is None:
+                raise RuntimeError("RSSI measurement returned None")
             
-            # Brief settling time
-            time.sleep(0.01)
-            
-            # Collect samples
-            n_samp = int(max(1, round(self.sample_rate * (dwell_ms / 1000.0))))
-            out = np.empty(n_samp, dtype=np.complex64)
-            offset = 0
-            max_attempts = 10
-            attempts = 0
-            chunk = max(1024, min(int(self.sample_rate * 0.02), n_samp))
-            
-            while offset < n_samp and attempts < max_attempts:
-                tmp = np.empty(chunk, dtype=np.complex64)
-                rc = self.sdr.readStream(self.rx_stream, [tmp], len(tmp))
-                if isinstance(rc, tuple):
-                    got = int(rc[0])
-                else:
-                    try:
-                        got = int(getattr(rc, 'ret', rc))
-                    except Exception:
-                        got = -1
-                        
-                if got and got > 0:
-                    take = min(got, n_samp - offset)
-                    out[offset:offset+take] = tmp[:take]
-                    offset += take
-                    attempts = 0
-                else:
-                    attempts += 1
-                    time.sleep(0.005)
-                    
-            if offset == 0:
-                self.log.error(f"Slave {self.slave_id}: no data received")
-                return None
-
-            sig = out[:offset]
-            
-            # Compute spectrum
-            win = np.hamming(len(sig)).astype(np.float32)
-            sig_w = sig * win
-            sp = np.fft.fft(sig_w)
-            sp = np.fft.fftshift(sp)
-            psd = (np.abs(sp) ** 2) / np.sum(win ** 2)
-            
-            # Convert to dBm
-            psd_dbm = 10.0 * np.log10(psd + 1e-20) - 174.0 + 10.0 * np.log10(self.sample_rate / len(sig_w))
-            
-            # Frequency axis
-            freqs = np.fft.fftfreq(len(sig_w), d=1.0 / self.sample_rate)
-            freqs = np.fft.fftshift(freqs)
-            freqs_hz = freqs + center_hz
-            
-            # Apply calibration
-            psd_dbm += self.k_cal_db
-            
-            # Use RMS calculator to get measurement
-            measurement = self.rms_calculator.measure_target_rms(
-                freqs_hz, psd_dbm, target, self.slave_id
+            # Преобразуем в наш формат RMSMeasurement
+            from panorama.shared.rms_utils import RMSMeasurement
+            measurement = RMSMeasurement(
+                slave_id=self.slave_id,
+                target_id=target_id,
+                center_hz=center_hz,
+                halfspan_hz=halfspan_hz,
+                guard_hz=guard_hz,
+                rssi_rms_dbm=result.rssi_dbm,
+                noise_floor_dbm=result.noise_floor_dbm,
+                snr_db=result.snr_db,
+                n_samples=result.sample_count,
+                timestamp=result.timestamp
             )
             
             if measurement:
-                self.log.debug(f"Slave {self.slave_id}: RMS measurement for target {target.get('id')} = {measurement.rssi_rms_dbm:.1f} dBm")
+                self.log.debug(f"Slave {self.slave_id}: RMS measurement for target {target_id} = {measurement.rssi_rms_dbm:.1f} dBm")
             
             return measurement
             
         except Exception as e:
-            self.log.error(f"Slave {self.slave_id}: target RMS measurement failed: {e}")
+            error_msg = str(e)
+            if "timeout" in error_msg.lower() or "busy" in error_msg.lower():
+                self.log.debug(f"Slave {self.slave_id}: RMS measurement timeout (device busy with master)")
+            else:
+                self.log.error(f"Slave {self.slave_id}: target RMS measurement failed: {e}")
             return None
         finally:
             self.is_measuring = False
@@ -432,6 +421,14 @@ class SlaveSDR(QObject):
     # --- manager glue helpers ---
     def set_k_cal(self, k_db: float):
         self.k_cal_db = float(k_db)
+    
+    def update_spectrum_from_master(self, freqs: np.ndarray, dbm: np.ndarray):
+        # Virtual-slave режим отключён. Никаких данных от Master для слейвов.
+        return
+    
+    def _measure_rssi_from_spectrum(self, center_hz: float, span_hz: float) -> Optional[RSSIMeasurement]:
+        # Virtual-slave режим отключён
+        return None
 
 
 class SlaveManager(QObject):

@@ -21,7 +21,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 # Импорт C библиотеки для HackRF
 try:
-    from panorama.drivers.hrf_backend import HackRFQSABackend
+    from panorama.drivers.hackrf.hrf_backend import HackRFQSABackend
     HACKRF_AVAILABLE = True
 except ImportError:
     HackRFQSABackend = None

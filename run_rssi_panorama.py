@@ -106,7 +106,7 @@ def check_dependencies():
     
     # Проверяем CFFI-библиотеку HackRF Master
     try:
-        from panorama.drivers.hrf_backend import HackRFQSABackend
+        from panorama.drivers.hackrf.hrf_backend import HackRFQSABackend
         print("✓ HackRF Master (CFFI) доступен")
     except Exception as e:
         print(f"✗ HackRF Master (CFFI) не найден: {e}")

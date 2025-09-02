@@ -51,7 +51,8 @@ install_emoji_fonts() {
 build_hackrf_master() {
     echo "🔧 Сборка библиотеки hackrf_master..."
     
-    cd panorama/drivers/hackrf_master
+    local original_dir=$(pwd)
+    cd panorama/drivers/hackrf/hackrf_master
     
     # Используем macOS Makefile
     if [ -f "Makefile.macos" ]; then
@@ -61,10 +62,60 @@ build_hackrf_master() {
         echo "✓ Библиотека hackrf_master собрана и установлена"
     else
         echo "❌ Makefile.macos не найден"
+        cd "$original_dir"
         exit 1
     fi
     
-    cd ../..
+    cd "$original_dir"
+    echo
+}
+
+# Функция для сборки библиотеки hackrf_slave
+build_hackrf_slave() {
+    echo "🔧 Сборка библиотеки hackrf_slave..."
+    
+    local original_dir=$(pwd)
+    cd panorama/drivers/hackrf/hackrf_slaves
+    
+    # Используем macOS Makefile
+    if [ -f "Makefile.macos" ]; then
+        make -f Makefile.macos clean
+        make -f Makefile.macos all
+        echo "✓ Библиотека hackrf_slave собрана"
+    elif [ -f "Makefile" ]; then
+        make clean
+        make all
+        echo "✓ Библиотека hackrf_slave собрана"
+    else
+        echo "❌ Makefile для hackrf_slave не найден"
+        cd "$original_dir"
+        exit 1
+    fi
+    
+    # Проверяем результат
+    if [ -f "libhackrf_slave.dylib" ] || [ -f "libhackrf_slave.so" ]; then
+        LIBFILE=$(ls libhackrf_slave.* | head -1)
+        echo "✓ $LIBFILE создана успешно"
+        
+        # Показываем зависимости
+        echo "Library dependencies:"
+        otool -L "$LIBFILE" || ldd "$LIBFILE" 2>/dev/null || true
+        
+        # Копируем в общую папку библиотек если нужно
+        LIB_DIR="../../../../lib"
+        if [ ! -d "$LIB_DIR" ]; then
+            mkdir -p "$LIB_DIR"
+        fi
+        cp "$LIBFILE" "$LIB_DIR/"
+        echo "✓ Библиотека скопирована в $LIB_DIR/"
+        
+    else
+        echo "❌ libhackrf_slave не найдена после сборки"
+        cd "$original_dir"
+        exit 1
+    fi
+    
+    cd "$original_dir"
     echo
 }
 
@@ -117,7 +168,7 @@ main() {
         echo "  --help, -h     Показать эту справку"
         echo "  --install      Установить зависимости и собрать библиотеку"
         echo "  --fonts        Только установить emoji шрифты"
-        echo "  --build        Только собрать библиотеку hackrf_master"
+        echo "  --build        Только собрать библиотеки hackrf_master и hackrf_slave"
         echo "  --run          Только запустить приложение"
         echo "  (без опций)    Полная установка и запуск"
         echo
@@ -136,6 +187,7 @@ main() {
             install_homebrew_deps
             install_emoji_fonts
             build_hackrf_master
+            build_hackrf_slave
             check_conda_env
             echo "✅ Установка завершена!"
             ;;
@@ -144,6 +196,7 @@ main() {
             ;;
         "--build")
             build_hackrf_master
+            build_hackrf_slave
             ;;
         "--run")
             check_conda_env
@@ -154,6 +207,7 @@ main() {
             install_homebrew_deps
             install_emoji_fonts
             build_hackrf_master
+            build_hackrf_slave
             check_conda_env
             run_panorama
             ;;

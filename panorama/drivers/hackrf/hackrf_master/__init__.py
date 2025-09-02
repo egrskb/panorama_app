@@ -1,0 +1,3 @@
+"""
+HackRF Master implementation
+"""

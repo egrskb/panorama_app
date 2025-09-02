@@ -8,13 +8,8 @@ set -e  # Остановка при ошибке
 echo "=== Panorama App для Linux ==="
 echo
 
-# Определяем путь к conda
-CONDA_PATH="$HOME/radioconda"
-if [ ! -d "$CONDA_PATH" ]; then
-    echo "❌ Conda не найдена в $CONDA_PATH"
-    echo "Установите conda или укажите правильный путь"
-    exit 1
-fi
+# Путь к venv
+VENV_DIR="$(pwd)/mvenv"
 
 # Функция для определения дистрибутива Linux
 detect_distro() {
@@ -83,7 +78,8 @@ install_emoji_fonts() {
 build_hackrf_master() {
     echo "🔧 Сборка библиотеки hackrf_master..."
     
-    cd panorama/drivers/hackrf_master
+    local original_dir=$(pwd)
+    cd panorama/drivers/hackrf/hackrf_master
     
     # Используем Linux Makefile
     if [ -f "Makefile.linux" ]; then
@@ -93,34 +89,91 @@ build_hackrf_master() {
         echo "✓ Библиотека hackrf_master собрана и установлена"
     else
         echo "❌ Makefile.linux не найден"
+        cd "$original_dir"
         exit 1
     fi
     
-    cd ../..
+    cd "$original_dir"
+    echo
+}
+
+# Функция для сборки библиотеки hackrf_slave
+build_hackrf_slave() {
+    echo "🔧 Сборка библиотеки hackrf_slave..."
+    
+    local original_dir=$(pwd)
+    cd panorama/drivers/hackrf/hackrf_slaves
+    
+    # Используем Linux Makefile
+    if [ -f "Makefile.linux" ]; then
+        make -f Makefile.linux clean
+        make -f Makefile.linux all
+        echo "✓ Библиотека hackrf_slave собрана"
+    elif [ -f "Makefile" ]; then
+        make clean
+        make all
+        echo "✓ Библиотека hackrf_slave собрана"
+    else
+        echo "❌ Makefile для hackrf_slave не найден"
+        cd "$original_dir"
+        exit 1
+    fi
+    
+    # Проверяем результат
+    if [ -f "libhackrf_slave.so" ]; then
+        echo "✓ libhackrf_slave.so создана успешно"
+        
+        # Показываем зависимости
+        echo "Library dependencies:"
+        ldd libhackrf_slave.so
+        
+        # Копируем в общую папку библиотек если нужно
+        LIB_DIR="../../../../lib"
+        if [ ! -d "$LIB_DIR" ]; then
+            mkdir -p "$LIB_DIR"
+        fi
+        cp libhackrf_slave.so "$LIB_DIR/"
+        echo "✓ Библиотека скопирована в $LIB_DIR/"
+        
+    else
+        echo "❌ libhackrf_slave.so не найдена после сборки"
+        cd "$original_dir"
+        exit 1
+    fi
+    
+    cd "$original_dir"
     echo
 }
 
 # Функция для проверки conda окружения
-check_conda_env() {
-    echo "🐍 Проверка conda окружения..."
+check_venv() {
+    echo "🐍 Проверка python venv..."
     
-    # Активируем conda
-    source "$CONDA_PATH/bin/activate" panorama_env
-    
-    # Проверяем Python
-    if ! python --version > /dev/null 2>&1; then
-        echo "❌ Python не найден в conda окружении"
-        exit 1
+    if [ ! -d "$VENV_DIR" ]; then
+        echo "Создаю виртуальное окружение в $VENV_DIR"
+        python3 -m venv "$VENV_DIR"
     fi
     
-    # Проверяем SoapySDR
-    if ! python -c "import SoapySDR" > /dev/null 2>&1; then
-        echo "❌ SoapySDR не установлен"
-        echo "Выполните: conda activate panorama_env && conda install -c conda-forge soapysdr=0.8.1"
-        exit 1
+    # Активируем venv
+    # shellcheck disable=SC1090
+    source "$VENV_DIR/bin/activate"
+    
+    python -m pip install --upgrade pip wheel setuptools >/dev/null
+    
+    # Установка зависимостей из requirements.txt
+    if [ -f requirements.txt ]; then
+        echo "📦 Установка python-зависимостей (requirements.txt)"
+        pip install -r requirements.txt
     fi
     
-    echo "✓ Conda окружение готово"
+    # Проверяем SoapySDR (важно для работы SDR)
+    python - <<'PY'
+try:
+    import SoapySDR  # noqa: F401
+    print('✓ SoapySDR установлен')
+except Exception as e:
+    print('⚠️  SoapySDR не установлен или недоступен:', e)
+PY
     echo
 }
 
@@ -144,15 +197,24 @@ setup_usb_permissions() {
 run_panorama() {
     echo "🚀 Запуск Panorama App..."
     
-    # Активируем conda окружение
-    source "$CONDA_PATH/bin/activate" panorama_env
+    # Активируем venv
+    # shellcheck disable=SC1090
+    source "$VENV_DIR/bin/activate"
     
-    # Очищаем переменные окружения
-    unset LD_LIBRARY_PATH
-    unset SOAPY_SDR_PLUGIN_PATH
+    # Очищаем переменные окружения, чтобы не мешали системные плагины
+    unset LD_LIBRARY_PATH || true
+    unset SOAPY_SDR_PLUGIN_PATH || true
     
     # Запускаем приложение
-    python run_rssi_panorama.py
+    # Определяем путь к лаунчеру
+    if [ -f "run_rssi_panorama.py" ]; then
+        python run_rssi_panorama.py
+    elif [ -f "panorama/run_rssi_panorama.py" ]; then
+        python panorama/run_rssi_panorama.py
+    else
+        echo "❌ Не найден файл запуска run_rssi_panorama.py"
+        exit 1
+    fi
 }
 
 # Основная логика
@@ -165,7 +227,7 @@ main() {
         echo "  --help, -h     Показать эту справку"
         echo "  --install      Установить зависимости и собрать библиотеку"
         echo "  --fonts        Только установить emoji шрифты"
-        echo "  --build        Только собрать библиотеку hackrf_master"
+        echo "  --build        Только собрать библиотеки hackrf_master и hackrf_slave"
         echo "  --usb          Только настроить права доступа к USB"
         echo "  --run          Только запустить приложение"
         echo "  (без опций)    Полная установка и запуск"
@@ -185,8 +247,9 @@ main() {
             install_system_deps
             install_emoji_fonts
             build_hackrf_master
+            build_hackrf_slave
             setup_usb_permissions
-            check_conda_env
+            check_venv
             echo "✅ Установка завершена!"
             ;;
         "--fonts")
@@ -194,12 +257,13 @@ main() {
             ;;
         "--build")
             build_hackrf_master
+            build_hackrf_slave
             ;;
         "--usb")
             setup_usb_permissions
             ;;
         "--run")
-            check_conda_env
+            check_venv
             run_panorama
             ;;
         "")
@@ -207,8 +271,9 @@ main() {
             install_system_deps
             install_emoji_fonts
             build_hackrf_master
+            build_hackrf_slave
             setup_usb_permissions
-            check_conda_env
+            check_venv
             run_panorama
             ;;
         *)

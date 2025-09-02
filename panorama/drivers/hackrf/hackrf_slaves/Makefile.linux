@@ -1,0 +1,69 @@
+# Makefile для сборки hackrf_slave библиотеки на Linux
+
+CC = gcc
+CFLAGS = -Wall -Wextra -O2 -fPIC -std=c99 -D_GNU_SOURCE
+INCLUDES = -I/usr/include -I/usr/local/include
+
+# Пробуем pkg-config сначала для более точных флагов
+HACKRF_CFLAGS := $(shell pkg-config --cflags libhackrf 2>/dev/null || echo "")
+HACKRF_LIBS := $(shell pkg-config --libs libhackrf 2>/dev/null || echo "-lhackrf")
+FFTW_CFLAGS := $(shell pkg-config --cflags fftw3f 2>/dev/null || echo "")  
+FFTW_LIBS := $(shell pkg-config --libs fftw3f 2>/dev/null || echo "-lfftw3f")
+
+INCLUDES += $(HACKRF_CFLAGS) $(FFTW_CFLAGS)
+LIBS = $(HACKRF_LIBS) $(FFTW_LIBS) -lm -lpthread
+LDFLAGS = -shared
+
+# Директории
+SRC_DIR = .
+BUILD_DIR = build
+TARGET_DIR = .
+
+# Файлы
+SOURCES = hackrf_slave.c
+OBJECTS = $(SOURCES:%.c=$(BUILD_DIR)/%.o)
+TARGET = libhackrf_slave.so
+
+# Основная цель
+all: $(TARGET_DIR)/$(TARGET)
+
+# Создание директории для сборки
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+# Сборка объектных файлов
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
+# Сборка разделяемой библиотеки
+$(TARGET_DIR)/$(TARGET): $(OBJECTS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+
+# Очистка
+clean:
+	rm -rf $(BUILD_DIR)
+	rm -f $(TARGET_DIR)/$(TARGET)
+
+# Установка зависимостей (для разработчика)
+install-deps:
+	@echo "Установка зависимостей для Linux..."
+	@echo "Ubuntu/Debian:"
+	@echo "  sudo apt-get install libhackrf-dev libfftw3-dev build-essential pkg-config"
+	@echo "Fedora/RHEL/CentOS:"
+	@echo "  sudo dnf install hackrf-devel fftw3-devel gcc make pkgconfig"
+	@echo "Arch Linux:"
+	@echo "  sudo pacman -S hackrf fftw gcc make pkg-config"
+
+# Тест сборки
+test-build: all
+	@echo "Библиотека $(TARGET) успешно собрана на Linux"
+	@ldd $(TARGET_DIR)/$(TARGET)
+
+# Копирование в lib директорию
+install: all
+	@LIB_DIR="../../../lib"; \
+	mkdir -p "$$LIB_DIR"; \
+	cp $(TARGET_DIR)/$(TARGET) "$$LIB_DIR/"; \
+	echo "✓ Библиотека установлена в $$LIB_DIR/"
+
+.PHONY: all clean install-deps test-build install

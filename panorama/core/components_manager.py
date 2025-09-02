@@ -71,10 +71,11 @@ class ComponentsManager:
         for sid in list(self.slave_manager.slaves.keys()):
             self.slave_manager.remove_slave(sid)
         
-        # Добавляем слейвы из конфига
-        slaves_config = self.config_manager.get_slaves_config()
-        for idx, slave_config in enumerate(slaves_config, start=1):
-            slave_id = self.config_manager.generate_slave_id(slave_config, idx)
+        # Добавляем слейвы из конфига (не более трёх)
+        slaves_config = self.config_manager.get_slaves_config()[:3]
+        for idx, slave_config in enumerate(slaves_config):
+            # Жестко нормализуем ID слейвов к 'slave0', 'slave1', 'slave2'
+            slave_id = f"slave{idx}"
             uri = self.config_manager.get_slave_uri(slave_config)
             
             if uri:
