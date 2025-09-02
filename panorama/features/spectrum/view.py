@@ -74,6 +74,7 @@ class SpectrumView(QtWidgets.QWidget):
         self._wf_ds_factor = 1
         self._wf_cols_ds = 0
         self._wf_x_ds: Optional[np.ndarray] = None
+        self._water_idx_cache: Optional[np.ndarray] = None
         
         # Статистика
         self._sweep_count = 0
@@ -168,6 +169,9 @@ class SpectrumView(QtWidgets.QWidget):
         self._last_power_dbm: Optional[np.ndarray] = None
         # Счётчик текущих точек на экране (для плашки)
         self._last_plotted_points: int = 0
+        # Троттлинг перерисовки UI
+        self._ui_min_interval_s: float = 0.15
+        self._last_plot_ts: float = 0.0
 
         # Целевая ширина водопада (точек по X) для ресемплинга
         self._wf_target_cols: int = 2048
@@ -637,22 +641,25 @@ class SpectrumView(QtWidgets.QWidget):
             if freqs_hz.size == 0:
                 return
 
-        # Инициализируем сетку/водопад при первом приходе данных
+        # Инициализируем сетку/водопад при первом приходе данных (с пониженным разрешением для воды)
         if self._model.freqs_hz.size == 0 or self._model.water is None:
-            # В прототипе set_grid создаёт матрицу water и last_row
-            # Берём желаемые границы из _current_cfg, а не из пришедших данных
             if self._current_cfg is not None:
                 f0 = float(self._current_cfg.freq_start_hz)
                 f1 = float(self._current_cfg.freq_end_hz)
             else:
                 f0 = float(freqs_hz[0])
                 f1 = float(freqs_hz[-1])
-            # Оценим bin как медианное расстояние
-            if freqs_hz.size > 1:
-                bw = float(np.median(np.diff(freqs_hz)))
+            # Для водопада используем ограниченное число колонок, независимое от bin входных данных
+            target_cols = int(max(512, min(4096, self._wf_target_cols)))
+            water_bin_hz = max(1.0, (f1 - f0) / max(1, target_cols - 1))
+            self._model.set_grid(f0, f1, water_bin_hz)
+
+            # Предрасчёт индексов для даунсэмпла строки воды
+            n_src = int(freqs_hz.size)
+            if n_src > target_cols:
+                self._water_idx_cache = (np.linspace(0, n_src - 1, num=target_cols).astype(np.int64))
             else:
-                bw = float(self.bin_khz.value() * 1e3)
-            self._model.set_grid(f0, f1, bw)
+                self._water_idx_cache = None  # прямое копирование
 
             # Выставляем оси строго по пользовательским границам
             cfg0 = float(self._current_cfg.freq_start_hz) * 1e-6 if self._current_cfg else float(f0) * 1e-6
@@ -669,7 +676,6 @@ class SpectrumView(QtWidgets.QWidget):
             self.water_plot.setYRange(0, self._model.rows, padding=0)
             if self._model.water is not None:
                 self.water_img.setImage(self._model.water, autoLevels=False, levels=self._wf_levels, lut=self._lut)
-                # Прямоугольник водопада по пользовательской сетке
                 x_mhz = self._model.freqs_hz.astype(np.float64) / 1e6
                 self.water_img.setRect(QtCore.QRectF(float(x_mhz[0]), 0.0, float(x_mhz[-1] - x_mhz[0]), float(self._model.rows)))
 
@@ -679,12 +685,23 @@ class SpectrumView(QtWidgets.QWidget):
         except Exception:
             self.full_spectrum = (freqs_hz * 1e-6, power_dbm)
 
-        # Обновление модели и водопада (матрица со сдвигом)
-        self._model.append_row(power_dbm)
+        # Обновление модели и водопада: кладём даунсэмпленную строку для воды
+        try:
+            if self._water_idx_cache is not None and self._model.freqs_hz.size > 0:
+                row_ds = power_dbm[self._water_idx_cache]
+            else:
+                row_ds = power_dbm
+            self._model.append_row(row_ds)
+        except Exception:
+            self._model.append_row(power_dbm)
 
-        # Статистика и перерисовка
-        self._update_statistics()
-        self._refresh_spectrum()
+        # Троттлинг UI: ограничиваем частоту тяжёлой перерисовки
+        now_ts = time.time()
+        do_plot = (self._last_plot_ts == 0.0) or ((now_ts - self._last_plot_ts) >= self._ui_min_interval_s)
+        if do_plot:
+            self._update_statistics()
+            self._refresh_spectrum()
+            self._last_plot_ts = now_ts
         # Передаём ПОЛНЫЙ спектр в координатор детектора, если подключен
         try:
             if self._orchestrator and self.full_spectrum is not None:

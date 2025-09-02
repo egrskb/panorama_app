@@ -1,0 +1,961 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ПАНОРАМА RSSI - Трилатерация дронов</title>
+    
+    <!-- OpenLayers 10.6.0 -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@10.6.0/ol.css">
+    <script src="https://cdn.jsdelivr.net/npm/ol@10.6.0/dist/ol.js"></script>
+    
+    <!-- Qt WebChannel -->
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+    
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #0f172a;
+            color: #f8fafc;
+            overflow: hidden;
+        }
+        
+        #map {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+        
+        /* Панель управления RSSI */
+        .rssi-controls {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(15, 23, 42, 0.95);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(59, 130, 246, 0.3);
+            border-radius: 20px;
+            padding: 24px;
+            z-index: 1000;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.3);
+            min-width: 280px;
+        }
+        
+        .control-title {
+            font-size: 16px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: #3b82f6;
+            margin-bottom: 20px;
+            text-align: center;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+        
+        .info-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin: 12px 0;
+            font-size: 13px;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .info-item:last-child {
+            border-bottom: none;
+        }
+        
+        .info-label {
+            color: #94a3b8;
+            font-weight: 500;
+        }
+        
+        .info-value {
+            color: #f8fafc;
+            font-weight: 600;
+            font-size: 12px;
+        }
+        
+        /* Легенда для дронов и трилатерации */
+        .trilateration-legend {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(15, 23, 42, 0.95);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(245, 158, 11, 0.3);
+            border-radius: 20px;
+            padding: 24px;
+            z-index: 1000;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.3);
+            min-width: 260px;
+        }
+        
+        .legend-title {
+            font-size: 16px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: #f59e0b;
+            margin-bottom: 20px;
+            text-align: center;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin: 12px 0;
+            font-size: 14px;
+            padding: 10px 12px;
+            border-radius: 10px;
+            background: rgba(255, 255, 255, 0.05);
+            transition: background 0.3s ease;
+        }
+        
+        .legend-item:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+        
+        .legend-icon {
+            width: 24px;
+            height: 24px;
+            margin-right: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            font-weight: bold;
+            font-size: 12px;
+        }
+        
+        .legend-text {
+            color: #e2e8f0;
+            font-weight: 500;
+        }
+        
+        /* Координатная информация */
+        .coordinate-info {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(15, 23, 42, 0.95);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(34, 197, 94, 0.3);
+            border-radius: 20px;
+            padding: 24px;
+            z-index: 1000;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.3);
+            min-width: 320px;
+        }
+        
+        .coord-title {
+            font-size: 14px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            color: #22c55e;
+            margin-bottom: 16px;
+            text-align: center;
+        }
+        
+        .coord-item {
+            display: flex;
+            justify-content: space-between;
+            margin: 10px 0;
+            font-size: 14px;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .coord-item:last-child {
+            border-bottom: none;
+        }
+        
+        .coord-label {
+            color: #94a3b8;
+            font-weight: 500;
+        }
+        
+        .coord-value {
+            color: #f8fafc;
+            font-weight: 600;
+            font-family: 'JetBrains Mono', 'Courier New', monospace;
+            background: rgba(34, 197, 94, 0.2);
+            padding: 4px 8px;
+            border-radius: 6px;
+        }
+        
+        /* Статус трилатерации */
+        .trilateration-status {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(15, 23, 42, 0.95);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            border-radius: 20px;
+            padding: 24px;
+            z-index: 1000;
+            min-width: 300px;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.3);
+        }
+        
+        .status-title {
+            font-size: 16px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: #ef4444;
+            margin-bottom: 20px;
+            text-align: center;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+        
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin: 14px 0;
+            font-size: 14px;
+            padding: 10px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .status-item:last-child {
+            border-bottom: none;
+        }
+        
+        .status-label {
+            color: #94a3b8;
+            font-weight: 500;
+        }
+        
+        .status-value {
+            color: #f8fafc;
+            font-weight: 700;
+            padding: 6px 12px;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            min-width: 60px;
+            text-align: center;
+        }
+        
+        .status-value.active {
+            color: #065f46;
+            background: linear-gradient(135deg, #22c55e, #16a34a);
+        }
+        
+        .status-value.warning {
+            color: #92400e;
+            background: linear-gradient(135deg, #f59e0b, #d97706);
+        }
+        
+        .status-value.danger {
+            color: #991b1b;
+            background: linear-gradient(135deg, #ef4444, #dc2626);
+        }
+        
+        /* Анимации */
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        
+        @keyframes droneDetected {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.5); opacity: 0.8; }
+            100% { transform: scale(2); opacity: 0; }
+        }
+        
+        .drone-pulse {
+            animation: droneDetected 3s infinite;
+        }
+        
+        .rssi-zone-pulse {
+            animation: pulse 2s infinite;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    
+    <!-- Информационная панель -->
+    <div class="rssi-controls">
+        <div class="control-title">📡 RSSI Трилатерация</div>
+        
+        <div class="info-item">
+            <span class="info-label">Режим работы:</span>
+            <span class="info-value">Детекция дронов</span>
+        </div>
+        
+        <div class="info-item">
+            <span class="info-label">Координаты:</span>
+            <span class="info-value">Метрическая система</span>
+        </div>
+        
+        <div class="info-item">
+            <span class="info-label">Сетка:</span>
+            <span class="info-value">100м интервал</span>
+        </div>
+    </div>
+    
+    <!-- Легенда трилатерации -->
+    <div class="trilateration-legend">
+        <div class="legend-title">🔍 Объекты</div>
+        
+        <div class="legend-item">
+            <div class="legend-icon" style="background: linear-gradient(135deg, #f59e0b, #d97706);">🎯</div>
+            <span class="legend-text">SDR Станции</span>
+        </div>
+        
+        <div class="legend-item">
+            <div class="legend-icon" style="background: linear-gradient(135deg, #ef4444, #dc2626);">🛸</div>
+            <span class="legend-text">Дроны / Цели</span>
+        </div>
+        
+        <div class="legend-item">
+            <div class="legend-icon" style="background: linear-gradient(135deg, #3b82f6, #2563eb);">📍</div>
+            <span class="legend-text">Траектории</span>
+        </div>
+        
+        <div class="legend-item">
+            <div class="legend-icon" style="background: linear-gradient(135deg, #22c55e, #16a34a);">📊</div>
+            <span class="legend-text">RSSI Зоны</span>
+        </div>
+    </div>
+    
+    <!-- Координатная информация -->
+    <div class="coordinate-info">
+        <div class="coord-title">🧭 Навигация</div>
+        <div class="coord-item">
+            <span class="coord-label">Опорная станция:</span>
+            <span class="coord-value" id="reference-coords">X: 0.0, Y: 0.0</span>
+        </div>
+        <div class="coord-item">
+            <span class="coord-label">Масштаб:</span>
+            <span class="coord-value" id="scale-value">1:1000</span>
+        </div>
+        <div class="coord-item">
+            <span class="coord-label">Сетка:</span>
+            <span class="coord-value" id="grid-size">100м</span>
+        </div>
+        <div class="coord-item">
+            <span class="coord-label">Курсор:</span>
+            <span class="coord-value" id="cursor-position">X: 0, Y: 0</span>
+        </div>
+    </div>
+    
+    <!-- Статус трилатерации -->
+    <div class="trilateration-status">
+        <div class="status-title">📍 Трилатерация</div>
+        
+        <div class="status-item">
+            <span class="status-label">Обнаружено дронов:</span>
+            <span class="status-value danger" id="active-drones">0</span>
+        </div>
+        
+        <div class="status-item">
+            <span class="status-label">SDR станций активно:</span>
+            <span class="status-value active" id="sdr-stations">0</span>
+        </div>
+        
+        <div class="status-item">
+            <span class="status-label">Точность:</span>
+            <span class="status-value warning" id="trilateration-accuracy">—</span>
+        </div>
+        
+        <div class="status-item">
+            <span class="status-label">Обновление данных:</span>
+            <span class="status-value" id="update-rate">20 Гц</span>
+        </div>
+    </div>
+    
+    <script>
+        // ==================== Инициализация карты для трилатерации ====================
+        
+        // Создаем локальную проекцию в метрах с центром в (0,0) для опорной станции
+        const projection = new ol.proj.Projection({
+            code: 'local-meters',
+            units: 'meters',
+            extent: [-2000, -2000, 2000, 2000] // 4км x 4км область
+        });
+        
+        // Режим карты - только RSSI трилатерация
+        let currentMapMode = 'rssi-trilateration';
+        
+        // Улучшенные стили для трилатерации
+        const mapStyles = {
+            // Стиль для SDR станций (улучшенный для трилатерации)
+            sdrStation: function(feature) {
+                const id = feature.get('id') || '';
+                const isReference = id === 'slave0' || feature.get('is_reference');
+                const isActive = feature.get('is_active') !== false;
+                
+                return new ol.style.Style({
+                    image: new ol.style.Circle({
+                        radius: isReference ? 20 : 16,
+                        fill: new ol.style.Fill({ 
+                            color: isReference ? 'rgba(251, 191, 36, 0.9)' : 
+                                  isActive ? 'rgba(34, 197, 94, 0.8)' : 'rgba(156, 163, 175, 0.6)'
+                        }),
+                        stroke: new ol.style.Stroke({ 
+                            color: isReference ? 'rgba(245, 158, 11, 1)' : 
+                                  isActive ? 'rgba(22, 163, 74, 1)' : 'rgba(107, 114, 128, 1)',
+                            width: isReference ? 4 : 3
+                        })
+                    }),
+                    text: new ol.style.Text({
+                        text: isReference ? '🎯 ' + id.toUpperCase() : '📡 ' + id.toUpperCase(),
+                        font: 'bold 14px sans-serif',
+                        fill: new ol.style.Fill({ color: '#ffffff' }),
+                        stroke: new ol.style.Stroke({ color: '#000000', width: 3 }),
+                        offsetY: -32
+                    })
+                });
+            },
+            
+            // Стиль для дронов (адаптированный для трилатерации)
+            drone: function(feature) {
+                const confidence = feature.get('confidence') || 0.5;
+                const rssi = feature.get('rssi') || -100;
+                const isTracked = feature.get('is_tracked') || false;
+                
+                // Цвет на основе уверенности и RSSI
+                let color;
+                if (confidence > 0.8) {
+                    color = '#ef4444'; // Высокая уверенность
+                } else if (confidence > 0.5) {
+                    color = '#f59e0b'; // Средняя
+                } else {
+                    color = '#6b7280'; // Низкая
+                }
+                
+                return new ol.style.Style({
+                    image: new ol.style.RegularShape({
+                        points: isTracked ? 6 : 4, // Шестиугольник для отслеживаемых
+                        radius: 14,
+                        radius2: isTracked ? 10 : 8,
+                        rotation: isTracked ? 0 : Math.PI / 4,
+                        fill: new ol.style.Fill({ color: color }),
+                        stroke: new ol.style.Stroke({ 
+                            color: '#ffffff', 
+                            width: isTracked ? 3 : 2
+                        })
+                    }),
+                    text: new ol.style.Text({
+                        text: `🛸 ${(confidence * 100).toFixed(0)}%\n${rssi.toFixed(0)}dBm`,
+                        font: 'bold 11px monospace',
+                        fill: new ol.style.Fill({ color: '#ffffff' }),
+                        stroke: new ol.style.Stroke({ color: '#000000', width: 2 }),
+                        offsetY: 30
+                    })
+                });
+            },
+            
+            // Координатная сетка (еле видная прозрачная)
+            gridStyle: new ol.style.Style({
+                stroke: new ol.style.Stroke({
+                    color: 'rgba(59, 130, 246, 0.15)',
+                    width: 1,
+                    lineDash: [1, 4]
+                })
+            }),
+            
+            // Стиль для подписей координат
+            gridLabelStyle: function(text, x, y) {
+                return new ol.style.Style({
+                    text: new ol.style.Text({
+                        text: text,
+                        font: '11px monospace',
+                        fill: new ol.style.Fill({ color: 'rgba(156, 163, 175, 0.7)' }),
+                        stroke: new ol.style.Stroke({ color: 'rgba(15, 23, 42, 0.8)', width: 2 }),
+                        offsetX: x > 0 ? 15 : (x < 0 ? -15 : 0),
+                        offsetY: y > 0 ? -15 : (y < 0 ? 15 : -5),
+                        textAlign: x > 0 ? 'left' : (x < 0 ? 'right' : 'center'),
+                        textBaseline: 'middle'
+                    })
+                });
+            },
+            
+            // Оси координат (опорная точка)
+            axisStyle: new ol.style.Style({
+                stroke: new ol.style.Stroke({
+                    color: 'rgba(251, 191, 36, 0.6)',
+                    width: 2
+                })
+            }),
+            
+            // Стиль для RSSI зон (упрощенный)
+            rssiZone: function(rssi) {
+                const normalizedRssi = Math.max(0, Math.min(1, (rssi + 120) / 90));
+                const alpha = Math.max(0.1, normalizedRssi * 0.5);
+                let color;
+                
+                if (normalizedRssi > 0.7) {
+                    color = `rgba(34, 197, 94, ${alpha})`; // Зеленый для сильного сигнала
+                } else if (normalizedRssi > 0.4) {
+                    color = `rgba(245, 158, 11, ${alpha})`; // Желтый для среднего
+                } else {
+                    color = `rgba(239, 68, 68, ${alpha})`; // Красный для слабого
+                }
+                
+                return new ol.style.Style({
+                    fill: new ol.style.Fill({ color }),
+                    stroke: new ol.style.Stroke({
+                        color: color.replace(/[\\d\\.]+\\)$/, '0.7)'),
+                        width: 1,
+                        lineDash: [3, 3]
+                    })
+                });
+            }
+        };
+        
+        // Источники данных
+        const sources = {
+            stations: new ol.source.Vector(),
+            drones: new ol.source.Vector(),
+            trajectories: new ol.source.Vector(),
+            coverage: new ol.source.Vector(),
+            grid: new ol.source.Vector()
+        };
+        
+        // Создаем координатную сетку с подписями
+        function createCoordinateGrid() {
+            const gridFeatures = [];
+            const gridStep = 100; // 100 метров
+            const extent = [-2000, -2000, 2000, 2000];
+            
+            // Вертикальные линии
+            for (let x = extent[0]; x <= extent[2]; x += gridStep) {
+                const line = new ol.geom.LineString([[x, extent[1]], [x, extent[3]]]);
+                const feature = new ol.Feature({ 
+                    geometry: line,
+                    type: 'grid-line'
+                });
+                feature.setStyle(x === 0 ? mapStyles.axisStyle : mapStyles.gridStyle);
+                gridFeatures.push(feature);
+                
+                // Добавляем подписи для основных делений (каждые 100м)
+                if (x !== 0 && x % 100 === 0) {
+                    const labelFeature = new ol.Feature({
+                        geometry: new ol.geom.Point([x, 0]),
+                        type: 'grid-label'
+                    });
+                    labelFeature.setStyle(mapStyles.gridLabelStyle(`${Math.abs(x)}м`, x, 0));
+                    gridFeatures.push(labelFeature);
+                }
+            }
+            
+            // Горизонтальные линии
+            for (let y = extent[1]; y <= extent[3]; y += gridStep) {
+                const line = new ol.geom.LineString([[extent[0], y], [extent[2], y]]);
+                const feature = new ol.Feature({ 
+                    geometry: line,
+                    type: 'grid-line'
+                });
+                feature.setStyle(y === 0 ? mapStyles.axisStyle : mapStyles.gridStyle);
+                gridFeatures.push(feature);
+                
+                // Добавляем подписи для основных делений (каждые 100м)
+                if (y !== 0 && y % 100 === 0) {
+                    const labelFeature = new ol.Feature({
+                        geometry: new ol.geom.Point([0, y]),
+                        type: 'grid-label'
+                    });
+                    labelFeature.setStyle(mapStyles.gridLabelStyle(`${Math.abs(y)}м`, 0, y));
+                    gridFeatures.push(labelFeature);
+                }
+            }
+            
+            // Добавляем подпись центра координат
+            const originLabel = new ol.Feature({
+                geometry: new ol.geom.Point([0, 0]),
+                type: 'origin-label'
+            });
+            originLabel.setStyle(new ol.style.Style({
+                text: new ol.style.Text({
+                    text: '0,0',
+                    font: 'bold 12px monospace',
+                    fill: new ol.style.Fill({ color: 'rgba(251, 191, 36, 1)' }),
+                    stroke: new ol.style.Stroke({ color: 'rgba(15, 23, 42, 0.9)', width: 2 }),
+                    offsetX: -20,
+                    offsetY: 20,
+                    textAlign: 'center',
+                    textBaseline: 'middle'
+                })
+            }));
+            gridFeatures.push(originLabel);
+            
+            sources.grid.addFeatures(gridFeatures);
+        }
+        
+        // Слои карты (оптимизированные для трилатерации)
+        const layers = {
+            // Координатная сетка (всегда внизу)
+            grid: new ol.layer.Vector({
+                source: sources.grid,
+                zIndex: 1
+            }),
+            
+            // RSSI визуализация (основной режим)
+            rssiVisualization: new ol.layer.Vector({
+                source: sources.coverage,
+                style: function(feature) {
+                    const rssi = feature.get('rssi') || -100;
+                    return mapStyles.rssiZone(rssi);
+                },
+                zIndex: 40
+            }),
+            
+            // Траектории
+            trajectories: new ol.layer.Vector({
+                source: sources.trajectories,
+                style: new ol.style.Style({
+                    stroke: new ol.style.Stroke({
+                        color: 'rgba(59, 130, 246, 0.8)',
+                        width: 3,
+                        lineDash: [10, 5]
+                    })
+                }),
+                zIndex: 60
+            }),
+            
+            // SDR станции
+            stations: new ol.layer.Vector({
+                source: sources.stations,
+                style: mapStyles.sdrStation,
+                zIndex: 100
+            }),
+            
+            // Дроны
+            drones: new ol.layer.Vector({
+                source: sources.drones,
+                style: mapStyles.drone,
+                zIndex: 90
+            })
+        };
+        
+        // Создание карты (оптимизированной для трилатерации)
+        const map = new ol.Map({
+            target: 'map',
+            layers: [
+                layers.grid,
+                layers.rssiVisualization,
+                layers.trajectories,
+                layers.stations,
+                layers.drones
+            ],
+            view: new ol.View({
+                projection: projection,
+                center: [0, 0], // Опорная станция в центре
+                zoom: 15,
+                maxZoom: 20,
+                minZoom: 12,
+                rotation: 0,
+                enableRotation: false
+            }),
+            controls: ol.control.defaults.defaults({
+                attribution: false,
+                rotate: false
+            }).extend([
+                new ol.control.ScaleLine({
+                    units: 'metric',
+                    bar: true,
+                    steps: 4,
+                    text: true,
+                    minWidth: 140
+                })
+            ])
+        });
+        
+        // Инициализация
+        createCoordinateGrid();
+        initializeStations();
+        initializeRSSIControls();
+        
+        // ==================== Инициализация станций ====================
+        
+        function initializeStations() {
+            // Не создаём станций по умолчанию. Ждём данные от Python.
+            sources.stations.clear();
+            sources.coverage.clear();
+        }
+        
+        // ==================== Инициализация ====================
+        
+        function initializeRSSIControls() {
+            // Базовая инициализация без элементов управления
+            console.log('RSSI visualization initialized (detector-controlled)');
+        }
+        
+        // ==================== WebChannel для связи с Python ====================
+        
+        let bridge = null;
+        
+        if (typeof QWebChannel !== 'undefined' && typeof qt !== 'undefined') {
+            new QWebChannel(qt.webChannelTransport, function(channel) {
+                bridge = channel.objects.bridge;
+                console.log('WebChannel connected');
+                
+                if (bridge && bridge.dataUpdated) {
+                    bridge.dataUpdated.connect(function(data) {
+                        handleDataUpdate(JSON.parse(data));
+                    });
+                }
+            });
+        }
+        
+        // ==================== Обработчики данных ====================
+        
+        function handleDataUpdate(data) {
+            if (data.drones) updateDrones(data.drones);
+            if (data.stations) updateStations(data.stations);
+            if (data.trajectories) updateTrajectories(data.trajectories);
+            if (data.rssiLevels) updateRSSIDisplay(data.rssiLevels);
+            updateStats();
+        }
+        
+        function updateDrones(drones) {
+            sources.drones.clear();
+            
+            drones.forEach(drone => {
+                const feature = new ol.Feature({
+                    geometry: new ol.geom.Point([drone.x, drone.y]),
+                    id: drone.id,
+                    freq: drone.freq,
+                    confidence: drone.confidence,
+                    rssi: drone.rssi,
+                    is_tracked: drone.is_tracked || false
+                });
+                
+                sources.drones.addFeature(feature);
+            });
+            
+            // Обновляем RSSI визуализацию автоматически
+            updateRSSIVisualization();
+            
+            document.getElementById('active-drones').textContent = drones.length;
+            document.getElementById('active-drones').className = 
+                drones.length > 0 ? 'status-value danger' : 'status-value';
+        }
+        
+        function updateStations(stations) {
+            // Пере-синхронизация списка станций: добавляем/обновляем те, что пришли,
+            // удаляем отсутствующие
+            const incomingIds = new Set(stations.map(s => s.id));
+            // Удаляем отсутствующие
+            sources.stations.getFeatures().forEach(f => {
+                if (!incomingIds.has(f.get('id'))) {
+                    sources.stations.removeFeature(f);
+                }
+            });
+            // Добавляем/обновляем
+            stations.forEach(station => {
+                let feature = sources.stations.getFeatureById(station.id);
+                if (!feature) {
+                    feature = new ol.Feature({
+                        geometry: new ol.geom.Point([station.x, station.y]),
+                        id: station.id,
+                        name: station.id,
+                        type: 'sdr_station',
+                        is_reference: station.id === 'slave0' || station.is_reference,
+                        is_active: station.is_active !== false
+                    });
+                    sources.stations.addFeature(feature);
+                } else {
+                    feature.getGeometry().setCoordinates([station.x, station.y]);
+                    feature.set('is_active', station.is_active !== false);
+                }
+            });
+            
+            // Обновляем счетчик активных станций
+            const activeStations = stations.filter(s => s.is_active !== false).length;
+            document.getElementById('sdr-stations').textContent = activeStations;
+        }
+        
+        function updateTrajectories(trajectories) {
+            sources.trajectories.clear();
+            
+            trajectories.forEach(traj => {
+                const coords = traj.points.map(p => [p.x, p.y]);
+                const feature = new ol.Feature({
+                    geometry: new ol.geom.LineString(coords),
+                    id: traj.id
+                });
+                sources.trajectories.addFeature(feature);
+            });
+        }
+        
+        function updateRSSIDisplay(rssiLevels) {
+            // Обновляем отображение RSSI зон (управляется детектором)
+            sources.coverage.clear();
+            
+            let visibleZones = 0;
+            
+            rssiLevels.forEach(level => {
+                const feature = new ol.Feature({
+                    geometry: new ol.geom.Circle([level.x, level.y], level.radius || 50),
+                    rssi: level.rssi,
+                    radius: level.radius || 50
+                });
+                
+                sources.coverage.addFeature(feature);
+                visibleZones++;
+            });
+            
+            // Обновляем счётчики активных RSSI зон
+            updateRSSIStats(visibleZones);
+        }
+        
+        function updateRSSIStats(activeZones) {
+            const accuracyElement = document.getElementById('trilateration-accuracy');
+            if (activeZones >= 3) {
+                accuracyElement.textContent = 'Высокая';
+                accuracyElement.className = 'status-value active';
+            } else if (activeZones >= 2) {
+                accuracyElement.textContent = 'Средняя';
+                accuracyElement.className = 'status-value warning';
+            } else {
+                accuracyElement.textContent = 'Низкая';
+                accuracyElement.className = 'status-value danger';
+            }
+        }
+        
+        // ==================== Интерактивность ====================
+        
+        // Отслеживание курсора
+        map.on('pointermove', function(evt) {
+            const coords = evt.coordinate;
+            document.getElementById('cursor-position').textContent = 
+                `X: ${coords[0].toFixed(1)}, Y: ${coords[1].toFixed(1)}`;
+        });
+        
+        // Обновление масштаба
+        map.getView().on('change:resolution', function() {
+            const resolution = map.getView().getResolution();
+            const scale = Math.round(resolution * 1000);
+            document.getElementById('scale-value').textContent = `1:${scale}`;
+            
+            // Обновляем размер сетки
+            let gridSize = 100;
+            if (resolution > 10) gridSize = 500;
+            if (resolution > 50) gridSize = 1000;
+            document.getElementById('grid-size').textContent = `${gridSize}м`;
+        });
+        
+        // ==================== Обновление статистики ====================
+        
+        function updateStats() {
+            const dronesCount = sources.drones.getFeatures().length;
+            const stationsCount = sources.stations.getFeatures().length;
+            
+            document.getElementById('active-drones').textContent = dronesCount;
+            document.getElementById('sdr-stations').textContent = stationsCount;
+        }
+        
+        // FPS счетчик
+        let frameCount = 0;
+        let lastFpsUpdate = Date.now();
+        
+        function updateFPS() {
+            frameCount++;
+            const now = Date.now();
+            if (now - lastFpsUpdate >= 1000) {
+                document.getElementById('update-rate').textContent = `${frameCount} Гц`;
+                frameCount = 0;
+                lastFpsUpdate = now;
+            }
+            requestAnimationFrame(updateFPS);
+        }
+        updateFPS();
+        
+        // ==================== API для Python ====================
+        
+        window.mapAPI = {
+            updateDrones: updateDrones,
+            updateStations: updateStations,
+            updateTrajectories: updateTrajectories,
+            updateRSSIDisplay: updateRSSIDisplay,
+            // Методы управления убраны - настройки контролируются детектором
+            
+            addDrone: function(id, x, y, confidence, rssi) {
+                const feature = new ol.Feature({
+                    geometry: new ol.geom.Point([x, y]),
+                    id: id,
+                    confidence: confidence,
+                    rssi: rssi || -100
+                });
+                sources.drones.addFeature(feature);
+                updateStats();
+            },
+            
+            removeDrone: function(id) {
+                const feature = sources.drones.getFeatureById(id);
+                if (feature) {
+                    sources.drones.removeFeature(feature);
+                    updateStats();
+                }
+            },
+            
+            clearAll: function() {
+                sources.drones.clear();
+                sources.trajectories.clear();
+                sources.coverage.clear();
+                updateStats();
+            },
+            
+            centerOnStation: function(stationId) {
+                const view = map.getView();
+                const feature = sources.stations.getFeatureById(stationId);
+                if (feature) {
+                    const coords = feature.getGeometry().getCoordinates();
+                    view.animate({ center: coords, zoom: 16, duration: 500 });
+                } else {
+                    // Фолбэк: центрируемся на начале локальной системы координат
+                    view.setCenter([0, 0]);
+                }
+            },
+            
+            centerOnOrigin: function() {
+                const view = map.getView();
+                view.animate({ center: [0, 0], duration: 500 });
+            },
+            
+            getMapInfo: function() {
+                const view = map.getView();
+                return {
+                    center: view.getCenter(),
+                    zoom: view.getZoom(),
+                    resolution: view.getResolution(),
+                    extent: view.calculateExtent(map.getSize())
+                };
+            }
+        };
+        
+        // Инициализация завершена
+        console.log('RSSI Trilateration Map initialized');
+        
+        // Нотификация о готовности
+        if (bridge && bridge._on_map_ready) {
+            bridge._on_map_ready();
+        }
+    </script>
+</body>
+</html>

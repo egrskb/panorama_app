@@ -86,6 +86,9 @@ class RSSIPanoramaMainWindow(QMainWindow):
         self.status_manager.status_updated.connect(self._on_status_updated)
         self._setup_status_callbacks()
         
+        # Устанавливаем фиксированный заголовок окна
+        self.setWindowTitle("ПАНОРАМА RSSI")
+        
         self.log.info("ПАНОРАМА RSSI initialized")
     
     def _setup_logging(self):
@@ -127,9 +130,8 @@ class RSSIPanoramaMainWindow(QMainWindow):
     def _on_status_updated(self, status: dict):
         """Обрабатывает обновление статуса системы."""
         try:
-            # Обновляем заголовок окна
-            title = self.status_manager.format_status_title()
-            self.setWindowTitle(title)
+            # Заголовок окна остается фиксированным как "ПАНОРАМА RSSI"
+            pass
             
         except Exception as e:
             self.log.error(f"Error updating UI from status: {e}")

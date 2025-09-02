@@ -173,12 +173,19 @@ class OpenLayersMapWidget(QWidget):
         page = self._web_view.page()
         page.setWebChannel(self._web_channel)
         
-        # Загружаем HTML
-        html_path = Path(__file__).parent / 'openlayers_map_v10.html'
+        # Загружаем улучшенную HTML карту
+        html_path = Path(__file__).parent / 'openlayers_map_v10_improved.html'
         if html_path.exists():
             page.load(QUrl.fromLocalFile(str(html_path)))
+            logger.info(f"Loading improved trilateration map from {html_path}")
         else:
-            logger.warning(f"HTML file not found at {html_path}")
+            # Fallback к оригинальной версии
+            html_path_fallback = Path(__file__).parent / 'openlayers_map_v10.html'
+            if html_path_fallback.exists():
+                page.load(QUrl.fromLocalFile(str(html_path_fallback)))
+                logger.warning(f"Using fallback HTML file at {html_path_fallback}")
+            else:
+                logger.error(f"No HTML file found at {html_path}")
         
         page.loadFinished.connect(self._on_page_loaded)
         
@@ -188,8 +195,9 @@ class OpenLayersMapWidget(QWidget):
         """Обработчик загрузки страницы."""
         if success:
             self._page_loaded = True
-            logger.info("Drone detection map loaded successfully")
+            logger.info("RSSI Trilateration map loaded successfully")
             self._initialize_stations()
+            self._initialize_rssi_settings()
         else:
             logger.error("Failed to load map")
     
@@ -207,16 +215,20 @@ class OpenLayersMapWidget(QWidget):
         update = {'stations': stations_data}
         self._bridge.send_update(update)
     
-    def _on_mode_changed(self, mode_text: str):
-        """Изменение режима карты."""
-        mode_map = {"Тепловая карта": "heatmap", "RSSI уровни": "rssi"}
-        
-        mode = mode_map.get(mode_text, "heatmap")
-        self._current_mode = mode
-        
+    def _initialize_rssi_settings(self):
+        """Инициализирует настройки RSSI для трилатерации."""
         if self._page_loaded:
-            js_code = f"if (window.mapAPI) {{ window.mapAPI.setMapMode('{mode}'); }}"
+            # Базовая инициализация без элементов управления
+            # (пороги управляются детектором на master устройстве)
+            js_code = """
+                if (window.mapAPI) {
+                    console.log('RSSI visualization ready - detector controlled');
+                }
+            """
             self._web_view.page().runJavaScript(js_code)
+            logger.debug("RSSI visualization initialized (detector-controlled)")
+    
+    # Методы управления RSSI убраны - настройки контролируются детектором на master устройстве
     
     def _on_feature_clicked(self, properties_json: str):
         """Обработка клика по объекту."""
@@ -256,8 +268,8 @@ class OpenLayersMapWidget(QWidget):
     
     def add_drone(self, drone_id: str, x: float, y: float, 
                   freq_mhz: float = 0.0, rssi_dbm: float = -100.0,
-                  confidence: float = 0.5):
-        """Добавляет или обновляет дрон на карте."""
+                  confidence: float = 0.5, is_tracked: bool = False):
+        """Добавляет или обновляет дрон на карте с поддержкой трилатерации."""
         drone = DroneUpdate(
             id=drone_id,
             x=float(x),
@@ -274,7 +286,7 @@ class OpenLayersMapWidget(QWidget):
             self._trajectories[drone_id] = deque(maxlen=self._max_trajectory_length)
         self._trajectories[drone_id].append((x, y))
         
-        # Отправляем обновление
+        # Отправляем обновление с улучшенными данными для трилатерации
         update = {
             'drones': [{
                 'id': drone.id,
@@ -282,7 +294,9 @@ class OpenLayersMapWidget(QWidget):
                 'y': drone.y,
                 'freq': drone.freq,
                 'rssi': drone.rssi,
-                'confidence': drone.confidence
+                'confidence': drone.confidence,
+                'is_tracked': is_tracked,
+                'detection_time': drone.timestamp
             }]
         }
         
@@ -295,6 +309,8 @@ class OpenLayersMapWidget(QWidget):
             }]
         
         self._bridge.send_update(update)
+        
+        logger.debug(f"Drone {drone_id} updated: pos=({x:.1f},{y:.1f}), RSSI={rssi_dbm:.1f}dBm, confidence={confidence:.2f}")
     
     def add_target(self, target_id: str, x: float, y: float, 
                    freq_mhz: float = 0.0, rssi_dbm: float = -100.0,
@@ -325,21 +341,25 @@ class OpenLayersMapWidget(QWidget):
             logger.error(f"Error adding target from detector: {e}")
     
     def update_rssi_levels(self, measurements: List[Dict]):
-        """Обновляет отображение уровней RSSI."""
-        if self._current_mode != 'rssi':
-            return
-        
+        """Обновляет отображение уровней RSSI для трилатерации."""
         rssi_data = []
         for m in measurements:
-            rssi_data.append({
+            # Добавляем дополнительные данные для улучшенной визуализации
+            measurement_data = {
                 'x': float(m.get('x', 0)),
                 'y': float(m.get('y', 0)),
-                'radius': float(m.get('radius', 100)),
-                'rssi': float(m.get('rssi', -100))
-            })
+                'radius': float(m.get('radius', 50)),
+                'rssi': float(m.get('rssi', -100)),
+                'station_id': m.get('station_id', 'unknown'),
+                'frequency': float(m.get('frequency', 0)),
+                'timestamp': m.get('timestamp', time.time())
+            }
+            rssi_data.append(measurement_data)
         
         update = {'rssiLevels': rssi_data}
         self._bridge.send_update(update)
+        
+        logger.debug(f"Updated {len(rssi_data)} RSSI measurements for trilateration")
     
     def remove_drone(self, drone_id: str):
         """Удаляет дрон с карты."""
@@ -375,10 +395,61 @@ class OpenLayersMapWidget(QWidget):
             self._web_view.page().runJavaScript(js_code)
     
     def get_statistics(self) -> Dict[str, Any]:
-        """Возвращает статистику."""
+        """Возвращает статистику для трилатерации."""
+        # Подсчитываем активные станции
+        active_stations = 0
+        for station_id, (x, y, z) in self._stations.items():
+            # Считаем станцию активной, если она не в начале координат и не является опорной
+            if station_id != 'slave0' and (x != 0 or y != 0):
+                active_stations += 1
+        
+        # Подсчитываем дроны с хорошей уверенностью
+        high_confidence_drones = len([d for d in self._active_drones.values() if d.confidence > 0.7])
+        
         return {
             'active_drones': len(self._active_drones),
+            'high_confidence_drones': high_confidence_drones,
             'active_trajectories': len(self._trajectories),
-            'stations': len(self._stations),
-            'current_mode': self._current_mode
+            'total_stations': len(self._stations),
+            'active_stations': active_stations + 1,  # +1 для опорной станции
+            'trilateration_ready': active_stations >= 2,  # Нужно минимум 3 станции (включая опорную)
+            'current_mode': 'rssi-trilateration'
         }
+    
+    def sync_with_slaves_data(self, slaves_data: Dict[str, Any]):
+        """Синхронизирует карту с данными от вкладки слейвов."""
+        try:
+            # Обновляем позиции станций если они изменились
+            if 'stations' in slaves_data:
+                station_updates = []
+                for station_data in slaves_data['stations']:
+                    station_id = station_data.get('id', 'unknown')
+                    x = float(station_data.get('x', 0))
+                    y = float(station_data.get('y', 0))
+                    z = float(station_data.get('z', 0))
+                    is_active = station_data.get('is_active', True)
+                    
+                    station_updates.append({
+                        'id': station_id,
+                        'x': x,
+                        'y': y,
+                        'z': z,
+                        'is_active': is_active,
+                        'is_reference': station_id == 'slave0'
+                    })
+                    
+                    # Обновляем локальные данные
+                    self._stations[station_id] = (x, y, z)
+                
+                # Отправляем обновление на карту
+                update = {'stations': station_updates}
+                self._bridge.send_update(update)
+                
+                logger.info(f"Synchronized {len(station_updates)} stations with slaves data")
+            
+            # Обновляем RSSI измерения если есть
+            if 'rssi_measurements' in slaves_data:
+                self.update_rssi_levels(slaves_data['rssi_measurements'])
+                
+        except Exception as e:
+            logger.error(f"Error syncing with slaves data: {e}")

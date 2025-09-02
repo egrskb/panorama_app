@@ -32,48 +32,67 @@
             position: relative;
         }
         
-        /* Панель управления режимами карты */
-        .map-modes {
+        /* Панель управления RSSI */
+        .rssi-controls {
             position: absolute;
             top: 20px;
             left: 20px;
             background: rgba(30, 30, 30, 0.95);
             backdrop-filter: blur(10px);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 12px;
-            padding: 15px;
+            border: 1px solid rgba(102, 126, 234, 0.3);
+            border-radius: 16px;
+            padding: 20px;
             z-index: 1000;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
         }
         
-        .mode-title {
-            font-size: 12px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: #888;
-            margin-bottom: 10px;
-        }
-        
-        .mode-button {
-            display: block;
-            width: 100%;
-            padding: 10px 20px;
-            margin: 5px 0;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            border: none;
-            border-radius: 8px;
-            color: white;
+        .control-title {
             font-size: 14px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            color: #4ade80;
+            margin-bottom: 15px;
+            text-align: center;
+        }
+        
+        .control-group {
+            margin: 10px 0;
+        }
+        
+        .control-label {
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 5px;
+            display: block;
+        }
+        
+        .rssi-slider {
+            width: 100%;
+            -webkit-appearance: none;
+            height: 4px;
+            border-radius: 5px;
+            background: linear-gradient(90deg, #ef4444 0%, #f59e0b 50%, #22c55e 100%);
+            outline: none;
+        }
+        
+        .rssi-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #4ade80;
             cursor: pointer;
-            transition: all 0.3s ease;
+            box-shadow: 0 2px 8px rgba(74, 222, 128, 0.4);
         }
         
-        .mode-button:hover {
-            transform: translateX(5px);
-            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
-        }
-        
-        .mode-button.active {
-            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        .threshold-display {
+            text-align: center;
+            font-weight: 500;
+            color: #fff;
+            font-size: 14px;
+            margin-top: 5px;
         }
         
         /* Координатная сетка */
@@ -115,75 +134,120 @@
             font-family: 'Courier New', monospace;
         }
         
-        /* Легенда для дронов */
-        .drone-legend {
+        /* Легенда для дронов и трилатерации */
+        .trilateration-legend {
             position: absolute;
             top: 20px;
             right: 20px;
             background: rgba(30, 30, 30, 0.95);
             backdrop-filter: blur(10px);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 12px;
-            padding: 15px;
+            border: 1px solid rgba(251, 191, 36, 0.3);
+            border-radius: 16px;
+            padding: 20px;
             z-index: 1000;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+        
+        .legend-title {
+            font-size: 14px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            color: #fbbf24;
+            margin-bottom: 15px;
+            text-align: center;
         }
         
         .legend-item {
             display: flex;
             align-items: center;
-            margin: 8px 0;
-            font-size: 14px;
+            margin: 10px 0;
+            font-size: 13px;
+            padding: 8px;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.05);
         }
         
         .legend-icon {
-            width: 24px;
-            height: 24px;
-            margin-right: 10px;
+            width: 20px;
+            height: 20px;
+            margin-right: 12px;
             display: flex;
             align-items: center;
             justify-content: center;
+            border-radius: 50%;
         }
         
-        /* Статус детекции */
-        .detection-status {
+        .legend-text {
+            color: #e5e7eb;
+            font-weight: 500;
+        }
+        
+        /* Статус трилатерации */
+        .trilateration-status {
             position: absolute;
             bottom: 20px;
             right: 20px;
             background: rgba(30, 30, 30, 0.95);
             backdrop-filter: blur(10px);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 12px;
-            padding: 15px;
+            border: 1px solid rgba(248, 113, 113, 0.3);
+            border-radius: 16px;
+            padding: 20px;
             z-index: 1000;
-            min-width: 250px;
+            min-width: 280px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+        
+        .status-title {
+            font-size: 14px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            color: #f87171;
+            margin-bottom: 15px;
+            text-align: center;
         }
         
         .status-item {
             display: flex;
             justify-content: space-between;
-            margin: 8px 0;
+            align-items: center;
+            margin: 12px 0;
             font-size: 14px;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .status-item:last-child {
+            border-bottom: none;
         }
         
         .status-label {
-            color: #888;
+            color: #9ca3af;
+            font-weight: 500;
         }
         
         .status-value {
             color: #fff;
-            font-weight: 500;
+            font-weight: 600;
+            padding: 4px 8px;
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.1);
         }
         
         .status-value.active {
-            color: #4ade80;
+            color: #22c55e;
+            background: rgba(34, 197, 94, 0.2);
         }
         
         .status-value.warning {
-            color: #fbbf24;
+            color: #f59e0b;
+            background: rgba(245, 158, 11, 0.2);
         }
         
         .status-value.danger {
-            color: #f87171;
+            color: #ef4444;
+            background: rgba(239, 68, 68, 0.2);
         }
         
         /* Координаты курсора */
@@ -249,11 +313,23 @@
 <body>
     <div id="map"></div>
     
-    <!-- Панель режимов карты (упрощенная) -->
-    <div class="map-modes">
-        <div class="mode-title">Режимы карты</div>
-        <button class="mode-button active" onclick="setMapMode('heatmap')">🔥 Тепловая карта</button>
-        <button class="mode-button" onclick="setMapMode('rssi')">📊 RSSI уровни</button>
+    <!-- Панель управления RSSI -->
+    <div class="rssi-controls">
+        <div class="control-title">📡 RSSI Трилатерация</div>
+        
+        <div class="control-group">
+            <label class="control-label">Порог обнаружения</label>
+            <input type="range" class="rssi-slider" id="rssi-threshold" 
+                   min="-120" max="-30" value="-70" step="1">
+            <div class="threshold-display" id="threshold-value">-70 дБм</div>
+        </div>
+        
+        <div class="control-group">
+            <label class="control-label">Радиус визуализации</label>
+            <input type="range" class="rssi-slider" id="rssi-radius" 
+                   min="10" max="200" value="50" step="10">
+            <div class="threshold-display" id="radius-value">50 м</div>
+        </div>
     </div>
     
     <!-- Координатная информация -->
@@ -277,25 +353,52 @@
         </div>
     </div>
     
-    <!-- Легенда скрыта по требованию -->
+    <!-- Легенда трилатерации -->
+    <div class="trilateration-legend">
+        <div class="legend-title">🔍 Объекты</div>
+        
+        <div class="legend-item">
+            <div class="legend-icon" style="background: linear-gradient(135deg, #fbbf24, #f59e0b);">S</div>
+            <span class="legend-text">SDR Станции</span>
+        </div>
+        
+        <div class="legend-item">
+            <div class="legend-icon" style="background: linear-gradient(135deg, #ef4444, #dc2626);">D</div>
+            <span class="legend-text">Дроны / Цели</span>
+        </div>
+        
+        <div class="legend-item">
+            <div class="legend-icon" style="background: linear-gradient(135deg, #3b82f6, #2563eb);">T</div>
+            <span class="legend-text">Траектории</span>
+        </div>
+        
+        <div class="legend-item">
+            <div class="legend-icon" style="background: linear-gradient(135deg, #10b981, #059669);">R</div>
+            <span class="legend-text">RSSI Зоны</span>
+        </div>
+    </div>
     
-    <!-- Статус детекции -->
-    <div class="detection-status">
-        <div class="mode-title">Статус детекции</div>
+    <!-- Статус трилатерации -->
+    <div class="trilateration-status">
+        <div class="status-title">🔋 Трилатерация</div>
+        
         <div class="status-item">
-            <span class="status-label">Активных дронов:</span>
+            <span class="status-label">Обнаружено дронов:</span>
             <span class="status-value danger" id="active-drones">0</span>
         </div>
+        
         <div class="status-item">
-            <span class="status-label">SDR станций:</span>
-            <span class="status-value active" id="sdr-stations">3</span>
+            <span class="status-label">SDR станций активно:</span>
+            <span class="status-value active" id="sdr-stations">0</span>
         </div>
+        
         <div class="status-item">
-            <span class="status-label">Режим:</span>
-            <span class="status-value" id="current-mode">Детекция</span>
+            <span class="status-label">Точность трилатерации:</span>
+            <span class="status-value warning" id="trilateration-accuracy">—</span>
         </div>
+        
         <div class="status-item">
-            <span class="status-label">Обновление:</span>
+            <span class="status-label">Обновление данных:</span>
             <span class="status-value" id="update-rate">20 Гц</span>
         </div>
     </div>

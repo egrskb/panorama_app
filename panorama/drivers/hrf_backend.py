@@ -543,9 +543,12 @@ class _MasterWorker(QtCore.QThread):
                 )
                 
                 if n > 0:
-                    # Конвертируем в numpy массивы
-                    freqs_hz = np.array([freqs_buf[i] for i in range(n)], dtype=np.float64)
-                    power_dbm = np.array([power_buf[i] for i in range(n)], dtype=np.float32)
+                    # Получаем векторизованные представления C-буферов без Python-циклов
+                    freqs_view = self._backend._ffi.buffer(freqs_buf, n * self._backend._ffi.sizeof("double"))
+                    power_view = self._backend._ffi.buffer(power_buf, n * self._backend._ffi.sizeof("float"))
+                    # Создаём numpy-вью поверх буферов (копии, чтобы не зависеть от перезаписи C)
+                    freqs_hz = np.frombuffer(freqs_view, dtype=np.float64, count=n).copy()
+                    power_dbm = np.frombuffer(power_view, dtype=np.float32, count=n).copy()
                     
                     # Проверка и корректировка значений
                     # Убираем NaN/inf
