@@ -748,8 +748,7 @@
                 sources.drones.addFeature(feature);
             });
             
-            // Обновляем RSSI визуализацию автоматически
-            updateRSSIVisualization();
+            // Обновляем RSSI визуализацию автоматически (функция встроена в updateRSSIDisplay)
             
             document.getElementById('active-drones').textContent = drones.length;
             document.getElementById('active-drones').className = 

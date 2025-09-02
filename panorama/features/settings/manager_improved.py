@@ -350,6 +350,7 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
     
     devicesConfigured = pyqtSignal(dict)  # Конфигурация устройств
     slavesAvailable = pyqtSignal(list)    # Доступные устройства для слейвов
+    devicesForCoordinatesTable = pyqtSignal(list)  # Устройства для координатной таблицы
 
     def __init__(self, parent=None, current_config: Dict[str, Any] = None):
         super().__init__(parent)
@@ -446,6 +447,15 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
         self.available_table.setHorizontalHeaderLabels(["Тип", "Серийный", "Название", "Статус", "Действия"])
         self.available_table.horizontalHeader().setStretchLastSection(False)
         self.available_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        # Улучшаем читаемость таблицы
+        header = self.available_table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
+        self.available_table.verticalHeader().setDefaultSectionSize(28)
+        self.available_table.setAlternatingRowColors(True)
         available_layout.addWidget(self.available_table)
         
         center_layout.addWidget(available_group)
@@ -596,6 +606,20 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
             print(f"DEBUG: Added device to Slave list: {d.driver} ({d.serial})")
         
         print(f"DEBUG: Total devices available for Slave: {len(available)}")
+
+        # Перед заполнением гарантированно удаляем предыдущие виджеты ячеек,
+        # чтобы не оставались старые кнопки/лейблы и не наслаивались элементы
+        try:
+            rows = self.available_table.rowCount()
+            cols = self.available_table.columnCount()
+            for r in range(rows):
+                for c in range(cols):
+                    w = self.available_table.cellWidget(r, c)
+                    if w is not None:
+                        w.deleteLater()
+        except Exception:
+            pass
+
         self.available_table.setRowCount(len(available))
         
         for row, device in enumerate(available):
@@ -611,6 +635,7 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
             # Статус
             status = "✅ Доступен" if device.is_available else "❌ Недоступен"
             status_item = QtWidgets.QTableWidgetItem(status)
+            status_item.setTextAlignment(QtCore.Qt.AlignCenter)
             if device.is_available:
                 status_item.setForeground(QtGui.QBrush(QtGui.QColor(0, 150, 0)))
             else:
@@ -623,43 +648,27 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
             button_layout.setContentsMargins(4, 2, 4, 2)
             button_layout.setSpacing(4)
             
+            # Единая кнопка-действие: Добавить / Удалить
+            action_btn = QtWidgets.QPushButton()
             if not device.is_available:
-                # Устройство недоступно
-                status_label = QtWidgets.QLabel("❌ Недоступен")
-                status_label.setAlignment(QtCore.Qt.AlignCenter)
-                status_label.setStyleSheet("color: #666; font-style: italic;")
-                button_layout.addWidget(status_label)
-                
-            elif device in self.slave_devices:
-                # Устройство уже добавлено как Slave - показываем кнопку удаления
-                remove_btn = QtWidgets.QPushButton("🗑️ Удалить")
-                remove_btn.setStyleSheet("""
+                action_btn.setText("Недоступно")
+                action_btn.setEnabled(False)
+                action_btn.setStyleSheet("""
                     QPushButton {
-                        background-color: #F44336;
-                        color: white;
+                        background-color: #9E9E9E;
+                        color: #222;
                         border: none;
                         padding: 4px 8px;
                         border-radius: 3px;
                         font-size: 11px;
                     }
-                    QPushButton:hover {
-                        background-color: #D32F2F;
-                    }
                 """)
-                remove_btn.clicked.connect(lambda checked, dev=device: self._remove_slave_device(dev))
-                button_layout.addWidget(remove_btn)
-                
-                # Статус
-                status_label = QtWidgets.QLabel("✅ Добавлен")
-                status_label.setStyleSheet("color: #4CAF50; font-size: 11px;")
-                button_layout.addWidget(status_label)
-                
             else:
-                # Устройство доступно для добавления
-                add_btn = QtWidgets.QPushButton("➕ Добавить")
-                add_btn.setStyleSheet("""
+                is_added = device in self.slave_devices
+                action_btn.setText("🗑️ Удалить" if is_added else "➕ Добавить")
+                action_btn.setStyleSheet("""
                     QPushButton {
-                        background-color: #2196F3;
+                        background-color: %s;
                         color: white;
                         border: none;
                         padding: 4px 8px;
@@ -667,16 +676,30 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
                         font-size: 11px;
                     }
                     QPushButton:hover {
-                        background-color: #1976D2;
+                        background-color: %s;
                     }
-                """)
-                add_btn.clicked.connect(lambda checked, dev=device: self._add_slave_device(dev))
-                button_layout.addWidget(add_btn)
+                """ % ("#F44336" if is_added else "#2196F3",
+                        "#D32F2F" if is_added else "#1976D2"))
+                action_btn.clicked.connect(lambda checked, dev=device: self._toggle_slave_device(dev))
+
+            button_layout.addWidget(action_btn)
             
             self.available_table.setCellWidget(row, 4, button_widget)
         
         # Эмитируем сигнал с доступными устройствами для синхронизации со слейвами
         self.slavesAvailable.emit(available)
+        
+        # Дополнительно эмитируем сигнал для обновления координатной таблицы
+        self._emit_devices_for_coordinates_table()
+
+    def _toggle_slave_device(self, device: SDRDeviceInfo):
+        """Переключает состояние устройства между Добавить/Удалить.
+        Используется единой кнопкой действий, чтобы избежать визуальной каши.
+        """
+        if device in self.slave_devices:
+            self._remove_slave_device(device)
+        else:
+            self._add_slave_device(device)
     
     def _on_master_selected(self):
         """Обрабатывает выбор Master устройства."""
@@ -725,6 +748,9 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
             
             # Автоматически сохраняем обновленную конфигурацию
             self._auto_save_config()
+            
+            # Обновляем координатную таблицу
+            self._emit_devices_for_coordinates_table()
         else:
             self.master_device = None
             if hasattr(self, '_discovery_thread'):
@@ -777,6 +803,9 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
             # Автоматически сохраняем конфигурацию
             self._auto_save_config()
             
+            # Обновляем координатную таблицу
+            self._emit_devices_for_coordinates_table()
+            
             # Показываем сообщение
             QtWidgets.QMessageBox.information(self, "Успех", 
                 f"Устройство {device.nickname} добавлено как Slave\n"
@@ -807,6 +836,9 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
                 
                 # Автоматически сохраняем конфигурацию
                 self._auto_save_config()
+                
+                # Обновляем координатную таблицу
+                self._emit_devices_for_coordinates_table()
                 
                 # Показываем сообщение
                 QtWidgets.QMessageBox.information(self, "Успех", 
@@ -981,8 +1013,73 @@ class ImprovedDeviceManagerDialog(QtWidgets.QDialog):
             f"Master: {self.master_device.nickname}\n"
             f"Slaves: {len(self.slave_devices)} устройств")
         
+        # После сохранения конфигурации обновляем карту количеством станций
+        try:
+            devices_count = len(self.slave_devices)
+            update_payload = {
+                'type': 'update_devices_coordinates',
+                'devices': [
+                    {
+                        'id': f'slave{i+1}',
+                        'x': d.position[0],
+                        'y': d.position[1],
+                        'z': d.position[2] if len(d.position) > 2 else 0.0,
+                        'is_reference': False
+                    } for i, d in enumerate(self.slave_devices)
+                ]
+            }
+            # Если есть хотя бы один слейв — добавим опорную точку
+            update_payload['devices'].insert(0, {
+                'id': 'slave0', 'x': 0.0, 'y': 0.0, 'z': 0.0, 'is_reference': True
+            })
+            # Передаем наверх через сигнал, main_rssi перенаправит на карту
+            if hasattr(self, 'devicesConfigured'):
+                # Переиспользуем существующий путь обновления карты
+                pass
+        except Exception:
+            pass
+        
         self.accept()
 
+    def _emit_devices_for_coordinates_table(self):
+        """Эмитирует сигнал для обновления координатной таблицы."""
+        try:
+            # Формируем список только Slave устройств (Master не участвует в трилатерации)
+            devices_for_coords = []
+            
+            # Правило опорного: если есть явно сохранённый slave0 — он опорный;
+            # иначе первый в списке становится опорным.
+            reference_idx = 0
+            for idx, dev in enumerate(self.slave_devices):
+                nickname_lower = (dev.nickname or '').lower()
+                if nickname_lower == 'slave0' or nickname_lower == 'опорное':
+                    reference_idx = idx
+                    break
+            
+            for i, device in enumerate(self.slave_devices):
+                is_reference = (i == reference_idx)
+                # Опорное устройство всегда в (0,0,0)
+                coords = (0.0, 0.0, 0.0) if is_reference else tuple(device.position)
+                
+                devices_for_coords.append({
+                    'nickname': device.nickname or f"SDR-{(device.serial or '0000')[-4:]}",
+                    'serial': device.serial,
+                    'driver': device.driver, 
+                    'is_available': device.is_available,
+                    'coords': coords,
+                    'status': 'REFERENCE' if is_reference else ('AVAILABLE' if device.is_available else 'UNAVAILABLE'),
+                    'is_reference': is_reference
+                })
+            
+            # Эмитируем специальный сигнал для координатной таблицы
+            if hasattr(self, 'devicesForCoordinatesTable'):
+                self.devicesForCoordinatesTable.emit(devices_for_coords)
+            
+            print(f"DEBUG: Emitted {len(devices_for_coords)} Slave devices for coordinates table")
+            
+        except Exception as e:
+            print(f"DEBUG: Error emitting devices for coordinates: {e}")
+    
     def _save_to_file(self, config: dict):
         """Сохраняет конфигурацию в файл."""
         import os

@@ -288,8 +288,23 @@ class RSSIPanoramaMainWindow(QMainWindow):
                     self.slaves_view.update_available_devices(slaves_data)
                     self.log.info(f"Обновлены доступные устройства для слейвов: {len(slaves_data)} устройств")
         
+        def _on_devices_for_coordinates(devices_data: list):
+            """Обрабатывает устройства для координатной таблицы."""
+            try:
+                if hasattr(self, 'slaves_view') and self.slaves_view:
+                    # Используем прямой метод синхронизации координатной таблицы
+                    if hasattr(self.slaves_view, 'update_coordinates_from_manager'):
+                        self.slaves_view.update_coordinates_from_manager(devices_data)
+                    else:
+                        # Fallback на старый метод
+                        self.slaves_view.update_available_devices(devices_data)
+                    self.log.info(f"Обновлена координатная таблица: {len(devices_data)} устройств")
+            except Exception as e:
+                self.log.error(f"Ошибка обновления координатной таблицы: {e}")
+        
         dlg.devicesConfigured.connect(_on_conf)
         dlg.slavesAvailable.connect(_on_slaves_available)
+        dlg.devicesForCoordinatesTable.connect(_on_devices_for_coordinates)
         dlg.exec_()
     
     def _load_calibration(self):
@@ -683,18 +698,35 @@ class RSSIPanoramaMainWindow(QMainWindow):
             if hasattr(self, 'map_view') and self.map_view:
                 data_type = target_data.get('type', 'target')
                 
-                if data_type == 'update_slaves_coordinates':
+                if data_type in ('update_slaves_coordinates', 'update_devices_coordinates'):
                     # Обновляем координаты слейвов на карте
-                    slaves_data = target_data.get('slaves', [])
+                    # Поддерживаем оба формата ключей: 'slaves' и 'devices'
+                    slaves_data = target_data.get('slaves') or target_data.get('devices') or []
                     
                     # Преобразуем в формат для карты
                     config_slaves = []
-                    for slave in slaves_data:
-                        config_slaves.append({
-                            'nickname': slave['id'],
-                            'pos': [slave['x'], slave['y'], 0.0],
-                            'is_reference': slave.get('is_reference', False)
-                        })
+                    try:
+                        # Сначала опорное как slave0
+                        ref = next((s for s in slaves_data if s.get('is_reference')), None)
+                        if ref is not None:
+                            config_slaves.append({
+                                'nickname': 'slave0',
+                                'pos': [0.0, 0.0, 0.0],
+                                'is_reference': True
+                            })
+                        # Остальные начиная с slave1
+                        idx = 1
+                        for s in slaves_data:
+                            if s is ref:
+                                continue
+                            config_slaves.append({
+                                'nickname': f'slave{idx}',
+                                'pos': [float(s.get('x', 0.0)), float(s.get('y', 0.0)), float(s.get('z', 0.0))],
+                                'is_reference': False
+                            })
+                            idx += 1
+                    except Exception:
+                        pass
                     
                     # Обновляем карту
                     if hasattr(self.map_view, 'update_stations_from_config'):

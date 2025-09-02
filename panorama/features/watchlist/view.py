@@ -72,14 +72,6 @@ class ImprovedSlavesView(QWidget):
         
         layout.addStretch()
         
-        self.btn_refresh = QPushButton("🔄 Обновить")
-        self.btn_refresh.clicked.connect(self._refresh_data)
-        layout.addWidget(self.btn_refresh)
-        
-        self.btn_clear = QPushButton("🗑️ Очистить")
-        self.btn_clear.clicked.connect(self._clear_data)
-        layout.addWidget(self.btn_clear)
-        
         return widget
 
 
@@ -152,8 +144,8 @@ class ImprovedSlavesView(QWidget):
         
         controls.addStretch()
         
-        # Кнопки управления
-        self.btn_clear_combined = QPushButton("🗑️ Очистить")
+        # Кнопки управления: очищение измерений оставляем
+        self.btn_clear_combined = QPushButton("🗑️ Очистить измерения")
         self.btn_clear_combined.clicked.connect(self._clear_combined_data)
         controls.addWidget(self.btn_clear_combined)
         
@@ -254,6 +246,11 @@ class ImprovedSlavesView(QWidget):
             "Никнейм", "Роль", "X (метры)", "Y (метры)", "Z (метры)", "Статус"
         ])
         self.coordinates_table.setAlternatingRowColors(True)
+        # Цвета под qdarkstyle
+        self._color_reference = QColor(212, 175, 55, 160)  # muted gold
+        self._color_available = QColor(76, 175, 80, 140)   # muted green
+        self._color_unavailable = QColor(244, 67, 54, 140) # muted red
+        self._color_locked_bg = QColor(120, 120, 120, 120) # disabled gray
         
         # Настройка столбцов
         header = self.coordinates_table.horizontalHeader()
@@ -264,24 +261,15 @@ class ImprovedSlavesView(QWidget):
         # Инициализация координат
         self._initialize_coordinates_table()
         
-        # Кнопки управления
+        # Кнопки управления координатами
         buttons_layout = QHBoxLayout()
         
-        self.btn_save_coords = QPushButton("💾 Сохранить координаты")
-        self.btn_save_coords.clicked.connect(self._save_coordinates)
-        buttons_layout.addWidget(self.btn_save_coords)
-        
-        self.btn_reset_coords = QPushButton("🔄 Сброс по умолчанию")
-        self.btn_reset_coords.clicked.connect(self._reset_coordinates)
-        buttons_layout.addWidget(self.btn_reset_coords)
+        self.btn_sync_coords = QPushButton("🔄 Синхронизация")
+        # Сохраняем координаты и сразу отправляем на карту
+        self.btn_sync_coords.clicked.connect(lambda: (self._save_coordinates(), self._emit_current_coordinates_to_map()))
+        buttons_layout.addWidget(self.btn_sync_coords)
         
         buttons_layout.addStretch()
-        
-        # Визуализация расположения
-        self.btn_show_layout = QPushButton("👁️ Показать на карте")
-        self.btn_show_layout.clicked.connect(self._show_slaves_on_map)
-        buttons_layout.addWidget(self.btn_show_layout)
-        
         layout.addLayout(buttons_layout)
         
         return widget
@@ -400,10 +388,13 @@ class ImprovedSlavesView(QWidget):
                     updated_time = data.get('updated', time.strftime('%H:%M:%S'))
                     self.combined_table.setItem(row, 9, QTableWidgetItem(updated_time))
                     
-                    # Кнопка на карту
-                    btn = QPushButton("📍")
-                    btn.clicked.connect(lambda _, d=data: self._send_to_map(d))
-                    self.combined_table.setCellWidget(row, 10, btn)
+                    # Кнопка на карту: не даем повторно добавлять одно и то же измерение
+                    existing_btn = self.combined_table.cellWidget(row, 10)
+                    if not (existing_btn and existing_btn.property('sent_to_map')):
+                        btn = QPushButton("📍")
+                        btn.setProperty('sent_to_map', False)
+                        btn.clicked.connect(lambda _, r=row, d=data: self._on_add_measurement_to_map(r, d))
+                        self.combined_table.setCellWidget(row, 10, btn)
                     
                     # Статус - переводим на русский
                     has_measurements = any(data.get(f'rms_{i+1}') for i in range(3))
@@ -505,12 +496,14 @@ class ImprovedSlavesView(QWidget):
                 self.combined_table.setItem(row, 8, QTableWidgetItem(f"{confidence*100:.0f}%"))  # Доверие
                 self.combined_table.setItem(row, 9, QTableWidgetItem(time.strftime("%H:%M:%S")))  # Время
                 
-                # Кнопка на карту
-                btn = QPushButton("📍")
-                btn.clicked.connect(lambda: self.send_to_map.emit({
-                    'id': peak_id, 'freq': freq, 'x': x, 'y': y
-                }))
-                self.combined_table.setCellWidget(row, 10, btn)
+                # Кнопка на карту: не даем повторно добавлять одно и то же измерение
+                existing_btn = self.combined_table.cellWidget(row, 10)
+                if not (existing_btn and existing_btn.property('sent_to_map')):
+                    btn = QPushButton("📍")
+                    btn.setProperty('sent_to_map', False)
+                    payload = {'id': peak_id, 'freq': freq, 'x': x, 'y': y}
+                    btn.clicked.connect(lambda _, r=row, d=payload: self._on_add_measurement_to_map(r, d))
+                    self.combined_table.setCellWidget(row, 10, btn)
                 
                 # Статус
                 self.combined_table.setItem(row, 11, QTableWidgetItem("ОБНАРУЖЕН"))
@@ -545,6 +538,23 @@ class ImprovedSlavesView(QWidget):
     def _send_to_map(self, data):
         """Отправляет на карту."""
         self.send_to_map.emit(data)
+
+    def _on_add_measurement_to_map(self, row: int, payload: dict):
+        """Отправляет измерение на карту и блокирует кнопку для этой строки."""
+        try:
+            self.send_to_map.emit(payload)
+            btn = self.combined_table.cellWidget(row, 10)
+            if btn:
+                btn.setProperty('sent_to_map', True)
+                btn.setEnabled(False)
+                btn.setText("✅")
+                btn.setToolTip("Уже добавлено на карту")
+                btn.setStyleSheet(
+                    "QPushButton { background-color: #2E7D32; color: #ffffff;"
+                    " border: none; padding: 4px 8px; border-radius: 3px; }"
+                )
+        except Exception:
+            pass
 
     def _clear_watchlist(self):
         """Очищает watchlist (в объединенной таблице)."""
@@ -633,28 +643,200 @@ class ImprovedSlavesView(QWidget):
     # Методы для работы с координатами
     def _initialize_coordinates_table(self):
         """Инициализирует таблицу координат."""
-        # Если нет реальных SDR устройств, таблица остается пустой
+        # Сначала пытаемся загрузить сохраненные устройства
         self.coordinates_table.setRowCount(0)
         
-        # Добавляем информационное сообщение
-        if self.coordinates_table.rowCount() == 0:
-            # Создаем строку с информацией
-            self.coordinates_table.setRowCount(1)
-            info_item = QTableWidgetItem("Нет настроенных SDR устройств")
-            info_item.setTextAlignment(Qt.AlignCenter)
-            info_item.setFlags(Qt.NoItemFlags)  # Неселектируемый
-            info_item.setBackground(QBrush(QColor(240, 240, 240, 100)))
+        # Загружаем сохраненные устройства из JSON
+        saved_devices = self._load_saved_devices_from_json()
+        
+        if saved_devices:
+            self._populate_coordinates_table_from_saved_data(saved_devices)
+            print(f"[SlavesView] Loaded {len(saved_devices)} saved devices from JSON")
             
-            # Объединяем все колонки для сообщения
-            self.coordinates_table.setItem(0, 0, info_item)
-            for col in range(1, 6):
-                empty_item = QTableWidgetItem("")
-                empty_item.setFlags(Qt.NoItemFlags)
-                empty_item.setBackground(QBrush(QColor(240, 240, 240, 100)))
-                self.coordinates_table.setItem(0, col, empty_item)
+            # Автоматически отправляем загруженные устройства на карту
+            self._send_saved_devices_to_map(saved_devices)
+        else:
+            # Если нет сохраненных данных, показываем информационное сообщение
+            self._show_empty_coordinates_message()
+    
+    def _send_saved_devices_to_map(self, devices_data):
+        """Отправляет сохраненные устройства на карту."""
+        try:
+            stations_data = []
             
-            # Объединяем ячейки для информационного сообщения
-            self.coordinates_table.setSpan(0, 0, 1, 6)
+            for device in devices_data:
+                x, y, z = device.get('coords', (0.0, 0.0, 0.0))
+                stations_data.append({
+                    'id': device.get('nickname', 'Unknown'),
+                    'x': x,
+                    'y': y,
+                    'z': z,
+                    'is_reference': device.get('is_reference', False),
+                    'is_active': True
+                })
+            
+            # Эмитируем сигнал для отправки на карту
+            self.send_to_map.emit({
+                'type': 'stations_update',
+                'stations': stations_data
+            })
+            
+            print(f"[SlavesView] Sent {len(stations_data)} saved stations to map")
+            
+        except Exception as e:
+            print(f"[SlavesView] Error sending saved devices to map: {e}")
+    
+    def _show_empty_coordinates_message(self):
+        """Показывает сообщение о отсутствии SDR устройств."""
+        self.coordinates_table.setRowCount(1)
+        info_item = QTableWidgetItem("Нет настроенных SDR устройств")
+        info_item.setTextAlignment(Qt.AlignCenter)
+        info_item.setFlags(Qt.NoItemFlags)  # Неселектируемый
+        info_item.setBackground(QBrush(QColor(240, 240, 240, 100)))
+        
+        # Объединяем все колонки для сообщения
+        self.coordinates_table.setItem(0, 0, info_item)
+        for col in range(1, 6):
+            empty_item = QTableWidgetItem("")
+            empty_item.setFlags(Qt.NoItemFlags)
+            empty_item.setBackground(QBrush(QColor(240, 240, 240, 100)))
+            self.coordinates_table.setItem(0, col, empty_item)
+        
+        # Объединяем ячейки для информационного сообщения
+        self.coordinates_table.setSpan(0, 0, 1, 6)
+    
+    def _load_saved_devices_from_json(self):
+        """Загружает сохраненные устройства из JSON файла."""
+        try:
+            import json
+            from pathlib import Path
+            
+            config_file = Path.home() / ".panorama" / "device_config.json"
+            
+            if not config_file.exists():
+                return []
+            
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            
+            devices = []
+            
+            # Загружаем только Slave устройства (Master не участвует в трилатерации)
+            slaves = config.get('slaves', [])
+            reference_found = False
+            
+            for i, slave in enumerate(slaves):
+                pos = slave.get('pos', [0.0, 0.0, 0.0])
+                nickname = slave.get('nickname', f'Slave{i+1}')
+                
+                # Первый Slave становится опорным
+                is_reference = (i == 0) or (pos[0] == 0.0 and pos[1] == 0.0 and pos[2] == 0.0 and not reference_found)
+                
+                if is_reference:
+                    reference_found = True
+                    pos = [0.0, 0.0, 0.0]  # Опорное устройство всегда в (0,0,0)
+                
+                devices.append({
+                    'nickname': nickname,
+                    'role': 'Опорное' if is_reference else 'Измерительное',
+                    'coords': (float(pos[0]), float(pos[1]), float(pos[2])),
+                    'status': 'REFERENCE' if is_reference else 'AVAILABLE',
+                    'is_reference': is_reference
+                })
+            
+            # Если нет устройств или нет опорного, делаем первое опорным
+            if devices and not reference_found:
+                devices[0]['role'] = 'Опорное'
+                devices[0]['status'] = 'REFERENCE' 
+                devices[0]['is_reference'] = True
+                devices[0]['coords'] = (0.0, 0.0, 0.0)
+            
+            return devices
+            
+        except Exception as e:
+            print(f"[SlavesView] Error loading saved devices from JSON: {e}")
+            return []
+    
+    def _populate_coordinates_table_from_saved_data(self, devices_data):
+        """Заполняет таблицу координат сохраненными данными."""
+        try:
+            self.coordinates_table.clearSpans()
+            self.coordinates_table.setRowCount(len(devices_data))
+            
+            for row, device in enumerate(devices_data):
+                is_reference = device.get('is_reference', False)
+                
+                # Никнейм устройства
+                nickname = device.get('nickname', f'Device-{row}')
+                nickname_item = QTableWidgetItem(nickname)
+                # Никнейм централизованно редактируется только в диспетчере устройств
+                nickname_item.setFlags(nickname_item.flags() & ~Qt.ItemIsEditable)
+                nickname_item.setToolTip("Никнейм редактируется в Диспетчере устройств")
+                
+                if is_reference:
+                    nickname_item.setBackground(QBrush(QColor(255, 215, 0, 100)))  # Золотой
+                    nickname_item.setToolTip("Опорное устройство (0,0,0)")
+                
+                self.coordinates_table.setItem(row, 0, nickname_item)
+                
+                # Роль устройства
+                role_combo = QComboBox()
+                role_combo.addItems([
+                    "Опорное", "Измерительное", "Резервное", "Отключено"
+                ])
+                
+                saved_role = device.get('role', 'Измерительное')
+                role_combo.setCurrentText(saved_role)
+                
+                if is_reference:
+                    role_combo.setEnabled(False)
+                    role_combo.setToolTip("Первое устройство всегда опорное")
+                
+                role_combo.setProperty('device_data', device)
+                role_combo.currentTextChanged.connect(self._on_role_changed)
+                
+                self.coordinates_table.setCellWidget(row, 1, role_combo)
+                
+                # Координаты
+                x, y, z = device.get('coords', (0.0, 0.0, 0.0))
+                
+                x_item = QTableWidgetItem(f"{x:.1f}")
+                y_item = QTableWidgetItem(f"{y:.1f}")
+                z_item = QTableWidgetItem(f"{z:.1f}")
+                
+                # Опорное устройство не редактируется
+                if is_reference:
+                    for item in [x_item, y_item, z_item]:
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                        item.setBackground(QBrush(QColor(200, 200, 200, 100)))
+                        item.setToolTip("Опорное устройство имеет фиксированные координаты (0,0,0)")
+                
+                self.coordinates_table.setItem(row, 2, x_item)
+                self.coordinates_table.setItem(row, 3, y_item)
+                self.coordinates_table.setItem(row, 4, z_item)
+                
+                # Статус устройства
+                status = device.get('status', 'UNKNOWN')
+                if status == 'REFERENCE' or is_reference:
+                    status_text = 'ОПОРНОЕ'
+                    status_color = QColor(255, 215, 0, 100)  # Золотой
+                elif status == 'AVAILABLE' or status == 'ACTIVE':
+                    status_text = 'ДОСТУПНО'
+                    status_color = QColor(74, 222, 128, 100)  # Зеленый
+                else:
+                    status_text = 'НЕИЗВЕСТНО'
+                    status_color = QColor(200, 200, 200, 100)  # Серый
+                
+                status_item = QTableWidgetItem(status_text)
+                status_item.setBackground(QBrush(status_color))
+                self.coordinates_table.setItem(row, 5, status_item)
+                
+                print(f"[SlavesView] Loaded device {nickname} with coords ({x:.1f}, {y:.1f}, {z:.1f})")
+                
+        except Exception as e:
+            print(f"[SlavesView] Error populating coordinates table: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _save_coordinates(self):
         """Сохраняет координаты и роли SDR устройств."""
@@ -673,20 +855,22 @@ class ImprovedSlavesView(QWidget):
                 role_widget = self.coordinates_table.cellWidget(row, 1)
                 role = role_widget.currentText() if role_widget else "Измерительное"
                 
-                # Получаем координаты
-                x_item = self.coordinates_table.item(row, 2)
-                y_item = self.coordinates_table.item(row, 3)
-                z_item = self.coordinates_table.item(row, 4)
-                
-                if x_item and y_item and z_item:
+                # Получаем координаты (безопасная конвертация)
+                def safe_float_convert(item, default=0.0):
+                    if not item or not item.text().strip():
+                        return default
                     try:
-                        x = float(x_item.text())
-                        y = float(y_item.text())
-                        z = float(z_item.text())
-                    except ValueError:
-                        x, y, z = 0.0, 0.0, 0.0
-                else:
+                        return float(item.text().strip())
+                    except (ValueError, AttributeError):
+                        return default
+                
+                # Для опорного устройства координаты всегда (0,0,0)
+                if role == "Опорное":
                     x, y, z = 0.0, 0.0, 0.0
+                else:
+                    x = safe_float_convert(self.coordinates_table.item(row, 2), 0.0)
+                    y = safe_float_convert(self.coordinates_table.item(row, 3), 0.0)
+                    z = safe_float_convert(self.coordinates_table.item(row, 4), 0.0)
                 
                 device_config = {
                     "nickname": nickname,
@@ -746,56 +930,7 @@ class ImprovedSlavesView(QWidget):
         """Сбрасывает координаты по умолчанию."""
         self._initialize_coordinates_table()
     
-    def _show_slaves_on_map(self):
-        """Показывает расположение SDR устройств на карте."""
-        try:
-            devices_data = []
-            
-            for row in range(self.coordinates_table.rowCount()):
-                # Проверяем, что это не информационная строка
-                nickname_item = self.coordinates_table.item(row, 0)
-                if not nickname_item or nickname_item.flags() == Qt.NoItemFlags:
-                    continue
-                
-                nickname = nickname_item.text()
-                
-                # Получаем роль
-                role_widget = self.coordinates_table.cellWidget(row, 1)
-                role = role_widget.currentText() if role_widget else "Измерительное"
-                
-                # Получаем координаты
-                x_item = self.coordinates_table.item(row, 2)
-                y_item = self.coordinates_table.item(row, 3)
-                z_item = self.coordinates_table.item(row, 4)
-                
-                if x_item and y_item and z_item:
-                    try:
-                        x = float(x_item.text())
-                        y = float(y_item.text())
-                        z = float(z_item.text())
-                    except ValueError:
-                        x, y, z = 0.0, 0.0, 0.0
-                else:
-                    continue
-                
-                devices_data.append({
-                    'id': nickname,
-                    'x': x, 'y': y, 'z': z,
-                    'type': 'sdr_device',
-                    'role': role,
-                    'is_reference': role == "Опорное"
-                })
-            
-            # Эмитируем сигнал для отправки на карту
-            self.send_to_map.emit({
-                'type': 'devices_layout',
-                'devices': devices_data
-            })
-            
-            print(f"[SlavesView] Showing {len(devices_data)} devices on map")
-            
-        except Exception as e:
-            print(f"[SlavesView] Error showing devices on map: {e}")
+    # Удален отдельный показ на карте — координаты отправляются автоматически
     
     def update_combined_rssi(self, range_str: str, slave_id: str, rssi_rms: float):
         """Обновляет RSSI в объединенной таблице."""
@@ -939,10 +1074,24 @@ class ImprovedSlavesView(QWidget):
                 # Сохраняем существующие координаты
                 existing_coords = {}
                 for row in range(self.coordinates_table.rowCount()):
-                    slave_id = self.coordinates_table.item(row, 0).text()
-                    x = float(self.coordinates_table.item(row, 1).text())
-                    y = float(self.coordinates_table.item(row, 2).text())
-                    z = float(self.coordinates_table.item(row, 3).text())
+                    nickname_item = self.coordinates_table.item(row, 0)
+                    if not nickname_item or not nickname_item.text().strip():
+                        continue
+                        
+                    slave_id = nickname_item.text()
+                    
+                    # Безопасная конвертация координат
+                    def safe_float_convert(item, default=0.0):
+                        if not item or not item.text().strip():
+                            return default
+                        try:
+                            return float(item.text().strip())
+                        except (ValueError, AttributeError):
+                            return default
+                    
+                    x = safe_float_convert(self.coordinates_table.item(row, 2), 0.0)
+                    y = safe_float_convert(self.coordinates_table.item(row, 3), 0.0) 
+                    z = safe_float_convert(self.coordinates_table.item(row, 4), 0.0)
                     existing_coords[slave_id] = (x, y, z)
                 
                 # Обновляем таблицу с новыми устройствами
@@ -972,6 +1121,41 @@ class ImprovedSlavesView(QWidget):
                 
         except Exception as e:
             print(f"[SlavesView] Error updating available devices: {e}")
+
+    def update_coordinates_from_manager(self, devices_data: list):
+        """Получает от диспетчера уже подготовленный список устройств
+        для координатной таблицы и синхронизирует её без домыслов.
+        Ожидаемый формат каждого элемента:
+        {
+            'nickname': str,
+            'serial': str,
+            'driver': str,
+            'coords': (x, y, z),
+            'status': 'REFERENCE' | 'AVAILABLE' | 'UNAVAILABLE',
+            'is_reference': bool
+        }
+        """
+        try:
+            if not devices_data:
+                self._show_empty_coordinates_message()
+                return
+            # Прямо готовим список для внутреннего рендера
+            prepared = []
+            for d in devices_data:
+                try:
+                    prepared.append({
+                        'nickname': d.get('nickname') or f"SDR-{(d.get('serial') or '0000')[-4:]}",
+                        'serial': d.get('serial', ''),
+                        'coords': d.get('coords', (0.0, 0.0, 0.0)),
+                        'status': d.get('status', 'AVAILABLE'),
+                        'is_reference': bool(d.get('is_reference', False))
+                    })
+                except Exception:
+                    continue
+            self._update_coordinates_table_with_devices(prepared)
+            print(f"[SlavesView] Coordinates synced from manager: {len(prepared)} devices")
+        except Exception as e:
+            print(f"[SlavesView] Error syncing coordinates from manager: {e}")
     
     def _update_coordinates_table_with_devices(self, devices_list):
         """Обновляет таблицу координат с реальными SDR устройствами."""
@@ -981,23 +1165,27 @@ class ImprovedSlavesView(QWidget):
             
             # Если нет устройств, показываем сообщение
             if not devices_list:
-                self._initialize_coordinates_table()
+                self._show_empty_coordinates_message()
                 return
             
             self.coordinates_table.setRowCount(len(devices_list))
             
-            # Определяем опорное устройство (первое в списке)
-            reference_device = devices_list[0] if devices_list else None
+            # Ищем опорное устройство или назначаем первое
+            reference_found = any(d.get('is_reference', False) for d in devices_list)
             
             for row, device in enumerate(devices_list):
-                is_reference = (row == 0)  # Первое устройство - опорное
+                # Первое устройство становится опорным, если нет другого опорного
+                is_reference = device.get('is_reference', False) or (row == 0 and not reference_found)
                 
                 # Никнейм устройства
                 nickname = device.get('nickname', f"SDR-{device.get('serial', 'Unknown')[-4:]}")
                 nickname_item = QTableWidgetItem(nickname)
+                # Никнейм централизованно редактируется только в диспетчере устройств
+                nickname_item.setFlags(nickname_item.flags() & ~Qt.ItemIsEditable)
+                nickname_item.setToolTip("Никнейм редактируется в Диспетчере устройств")
                 
                 if is_reference:
-                    nickname_item.setBackground(QBrush(QColor(255, 215, 0, 100)))  # Золотой для опорного
+                    nickname_item.setBackground(QBrush(self._color_reference))  # Золотой для опорного
                     nickname_item.setToolTip("Опорное устройство (0,0,0)")
                 
                 self.coordinates_table.setItem(row, 0, nickname_item)
@@ -1036,7 +1224,7 @@ class ImprovedSlavesView(QWidget):
                 if is_reference:
                     for item in [x_item, y_item, z_item]:
                         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                        item.setBackground(QBrush(QColor(200, 200, 200, 100)))
+                        item.setBackground(QBrush(self._color_locked_bg))
                         item.setToolTip("Опорное устройство имеет фиксированные координаты (0,0,0)")
                 
                 self.coordinates_table.setItem(row, 2, x_item)
@@ -1047,13 +1235,13 @@ class ImprovedSlavesView(QWidget):
                 status = device.get('status', 'UNKNOWN')
                 if status == 'REFERENCE' or is_reference:
                     status_text = 'ОПОРНОЕ'
-                    status_color = QColor(255, 215, 0, 100)  # Золотой
+                    status_color = self._color_reference
                 elif status == 'AVAILABLE' or status == 'ACTIVE':
                     status_text = 'ДОСТУПНО'
-                    status_color = QColor(74, 222, 128, 100)  # Зеленый
+                    status_color = self._color_available
                 elif status == 'UNAVAILABLE':
                     status_text = 'НЕДОСТУПНО'
-                    status_color = QColor(248, 113, 113, 100)  # Красный
+                    status_color = self._color_unavailable
                 else:
                     status_text = 'НЕИЗВЕСТНО'
                     status_color = QColor(200, 200, 200, 100)  # Серый
@@ -1081,11 +1269,132 @@ class ImprovedSlavesView(QWidget):
                     nickname = device_data.get('nickname', 'Unknown')
                     print(f"[SlavesView] Role changed for {nickname}: {new_role}")
                     
-                    # Здесь можно добавить логику обработки изменения роли
-                    # например, обновить статус устройства или сохранить в конфигурацию
+                    # Если устройство стало опорным
+                    if new_role == "Опорное":
+                        self._handle_new_reference_device(sender)
                     
-                    # Автоматически сохраняем изменения
+                    # Автоматически сохраняем изменения и отправляем на карту сразу
                     self._save_coordinates()
+                    self._emit_current_coordinates_to_map()
                     
         except Exception as e:
             print(f"[SlavesView] Error handling role change: {e}")
+    
+    def _handle_new_reference_device(self, new_reference_combo):
+        """Обрабатывает назначение нового опорного устройства."""
+        try:
+            # Находим строку нового опорного устройства
+            new_reference_row = -1
+            for row in range(self.coordinates_table.rowCount()):
+                combo = self.coordinates_table.cellWidget(row, 1)
+                if combo == new_reference_combo:
+                    new_reference_row = row
+                    break
+            
+            if new_reference_row == -1:
+                return
+            
+            # Сбрасываем все устройства на "Измерительное" кроме нового опорного
+            for row in range(self.coordinates_table.rowCount()):
+                if row == new_reference_row:
+                    continue
+                    
+                combo = self.coordinates_table.cellWidget(row, 1)
+                if combo and combo.currentText() == "Опорное":
+                    combo.setCurrentText("Измерительное")
+                    # Разрешаем менять роль снова
+                    combo.setEnabled(True)
+                    
+                    # Разблокируем координаты предыдущего опорного
+                    for col in [2, 3, 4]:  # X, Y, Z колонки
+                        item = self.coordinates_table.item(row, col)
+                        if item:
+                            item.setFlags(item.flags() | Qt.ItemIsEditable)
+                            item.setBackground(QBrush(QColor(60, 60, 60)))
+                            item.setToolTip("")
+                    
+                    # Обновляем статус
+                    status_item = self.coordinates_table.item(row, 5)
+                    if status_item:
+                        status_item.setText("ДОСТУПНО")
+                        status_item.setBackground(QBrush(self._color_available))
+            
+            # Настраиваем новое опорное устройство
+            self._setup_reference_device(new_reference_row)
+            
+            print(f"[SlavesView] New reference device set at row {new_reference_row}")
+            
+        except Exception as e:
+            print(f"[SlavesView] Error handling new reference device: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _setup_reference_device(self, row):
+        """Настраивает устройство как опорное."""
+        try:
+            # Устанавливаем координаты (0,0,0)
+            for col, val in [(2, "0.0"), (3, "0.0"), (4, "0.0")]:
+                item = self.coordinates_table.item(row, col)
+                if item:
+                    item.setText(val)
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)  # Запрещаем редактирование
+                    item.setBackground(QBrush(QColor(200, 200, 200, 100)))
+                    item.setToolTip("Опорное устройство имеет фиксированные координаты (0,0,0)")
+            
+            # Обновляем никнейм с золотым фоном
+            nickname_item = self.coordinates_table.item(row, 0)
+            if nickname_item:
+                nickname_item.setBackground(QBrush(self._color_reference))
+                nickname_item.setToolTip("Опорное устройство (0,0,0)")
+            
+            # Обновляем статус
+            status_item = self.coordinates_table.item(row, 5)
+            if status_item:
+                status_item.setText("ОПОРНОЕ")
+                status_item.setBackground(QBrush(self._color_reference))
+            
+            # Блокируем изменение роли
+            combo = self.coordinates_table.cellWidget(row, 1)
+            if combo:
+                combo.setCurrentText("Опорное")
+                combo.setEnabled(False)
+                combo.setToolTip("Опорное устройство - основа координатной системы")
+            
+        except Exception as e:
+            print(f"[SlavesView] Error setting up reference device: {e}")
+
+    def _emit_current_coordinates_to_map(self):
+        """Собирает текущее состояние таблицы координат и мгновенно отправляет на карту."""
+        try:
+            devices = []
+            for row in range(self.coordinates_table.rowCount()):
+                nickname_item = self.coordinates_table.item(row, 0)
+                if not nickname_item or not nickname_item.text().strip():
+                    continue
+                nickname = nickname_item.text()
+                role_widget = self.coordinates_table.cellWidget(row, 1)
+                role = role_widget.currentText() if role_widget else "Измерительное"
+                
+                def safe_float_convert(item, default=0.0):
+                    if not item or not item.text().strip():
+                        return default
+                    try:
+                        return float(item.text().strip())
+                    except (ValueError, AttributeError):
+                        return default
+                x = safe_float_convert(self.coordinates_table.item(row, 2), 0.0)
+                y = safe_float_convert(self.coordinates_table.item(row, 3), 0.0)
+                z = safe_float_convert(self.coordinates_table.item(row, 4), 0.0)
+                devices.append({
+                    'id': nickname,
+                    'x': x, 'y': y, 'z': z,
+                    'type': 'sdr_device',
+                    'role': role,
+                    'is_reference': role == "Опорное"
+                })
+            self.send_to_map.emit({
+                'type': 'update_devices_coordinates',
+                'devices': devices
+            })
+        except Exception:
+            pass

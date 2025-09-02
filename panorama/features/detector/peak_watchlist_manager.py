@@ -78,22 +78,22 @@ class PeakWatchlistManager(QObject):
         # Загружаем настройки детектора
         detector_settings = load_detector_settings()
 
-        # Параметры детектора для видеосигналов
-        self.video_bandwidth_min_mhz = 1.0   # Разрешаем узкие сигналы
+        # Параметры детектора для видеосигналов (настроены для стабильной работы)
+        self.video_bandwidth_min_mhz = 2.0   # Минимум 2 МГц для видеосигналов
         self.video_bandwidth_max_mhz = 30.0  # Разрешаем широкие сигналы
         self.threshold_mode = "adaptive"      # "adaptive" или "fixed"
-        self.baseline_offset_db = 10.0       # Порог над baseline для adaptive
-        self.threshold_dbm = -70.0           # Фиксированный порог
-        self.min_snr_db = 5.0                # Минимальный SNR
-        self.min_peak_width_bins = 5         # Минимальная ширина в бинах
-        self.min_peak_distance_bins = 10     # Минимальное расстояние между пиками
+        self.baseline_offset_db = 15.0       # Увеличен порог над baseline для меньших ложных срабатываний
+        self.threshold_dbm = -65.0           # Фиксированный порог (повышен)
+        self.min_snr_db = 8.0                # Увеличен минимальный SNR для фильтрации шума
+        self.min_peak_width_bins = 10        # Увеличена минимальная ширина в бинах
+        self.min_peak_distance_bins = 20     # Увеличено минимальное расстояние между пиками
         self.merge_if_gap_hz = detector_settings.get("cluster", {}).get("merge_if_gap_hz", 2e6)  # Объединять кластеры при разрыве
 
         # Параметры watchlist
         self.watchlist_span_hz = 10e6        # Окно ±5 МГц вокруг пика по умолчанию
         self.max_watchlist_size = 10         # Максимум целей в watchlist
         self.peak_timeout_sec = 120.0        # Увеличенный таймаут, чтобы записи не исчезали быстро
-        self.min_confirmation_sweeps = 1     # Минимум свипов для подтверждения (добавляем сразу)
+        self.min_confirmation_sweeps = 3     # Требуем 3 подтверждения для добавления в watchlist
 
         # Состояние
         self.detected_peaks: Dict[str, VideoSignalPeak] = {}
@@ -269,11 +269,8 @@ class PeakWatchlistManager(QObject):
             cluster_bandwidth_mhz = cluster_bandwidth_hz / 1e6
 
             # Проверяем, подходит ли под видеосигнал
-            # Для 5.8 ГГц диапазона разрешаем более узкие сигналы
-            if region_freqs[0] > 5000e6:
-                min_width_mhz = 0.5
-            else:
-                min_width_mhz = self.video_bandwidth_min_mhz
+            # Используем единую минимальную ширину для всех диапазонов
+            min_width_mhz = self.video_bandwidth_min_mhz
 
             if cluster_bandwidth_mhz < min_width_mhz:
                 continue  # Слишком узкий
@@ -283,6 +280,11 @@ class PeakWatchlistManager(QObject):
             # Вычисляем SNR
             snr = peak_power - baseline
             if snr < self.min_snr_db:
+                continue
+                
+            # Дополнительная проверка на стабильность: пик должен быть значительно выше соседей
+            region_median = np.median(region_power)
+            if peak_power - region_median < 5.0:  # Пик должен быть минимум на 5 дБ выше медианы региона
                 continue
 
             # 4. Создаем объект пика с новыми метриками
