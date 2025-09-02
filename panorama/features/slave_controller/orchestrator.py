@@ -88,6 +88,12 @@ class Orchestrator(QObject):
         self._cleanup_timer.timeout.connect(self._cleanup_old)
         self._cleanup_timer.start(5000)
 
+        # Периодическое обновление измерений watchlist (постоянные замеры)
+        self.measure_interval_ms = 700  # интервал между повторными измерениями одной цели
+        self._last_measure_at: Dict[str, float] = {}
+        self._measure_timer = QTimer(self)
+        self._measure_timer.timeout.connect(self._tick_watchlist_measurements)
+
         # прокинем alias-сигнал
         self.target_update.connect(self._emit_target_detected)
 
@@ -147,12 +153,23 @@ class Orchestrator(QObject):
         self.manual_mode = False
         self.log.info("Orchestrator started (auto mode)")
         self._emit_status()
+        # Запускаем периодический цикл измерений
+        try:
+            if not self._measure_timer.isActive():
+                self._measure_timer.start(self.measure_interval_ms)
+        except Exception:
+            pass
 
     def stop(self):
         """Останавливает автоматическую постановку задач (очередь не чистится)."""
         self.is_running = False
         self.log.info("Orchestrator stopped")
         self._emit_status()
+        try:
+            if self._measure_timer.isActive():
+                self._measure_timer.stop()
+        except Exception:
+            pass
 
     def shutdown(self):
         """Полная остановка и очистка очереди."""
@@ -285,6 +302,35 @@ class Orchestrator(QObject):
             self.task_failed.emit(task)
             self.log.error("Failed to start measurement on slaves")
         self._emit_status()
+
+    def _tick_watchlist_measurements(self):
+        """Периодически переизмеряет все активные диапазоны в watchlist."""
+        if not self.is_running:
+            return
+        if not self.slave_manager:
+            return
+        if not self.trilateration_coordinator:
+            return
+        try:
+            pm = self.trilateration_coordinator.peak_manager
+            now = time.time()
+            # Обходим все активные записи watchlist и ставим задачи, если пришло время
+            for entry in list(pm.watchlist.values()):
+                peak_id = entry.peak_id
+                last_ts = self._last_measure_at.get(peak_id, 0.0)
+                if (now - last_ts) * 1000.0 < self.measure_interval_ms:
+                    continue
+                self._last_measure_at[peak_id] = now
+                try:
+                    self.enqueue_watchlist_task({
+                        'peak_id': peak_id,
+                        'center_freq_hz': float(entry.center_freq_hz),
+                        'span_hz': float(entry.span_hz)
+                    })
+                except Exception:
+                    pass
+        except Exception as e:
+            self._emit_error(f"tick_watchlist_measurements error: {e}")
 
     # ─────────────────────── slave → orchestrator ───────────────────────
 
