@@ -166,14 +166,7 @@ check_venv() {
         pip install -r requirements.txt
     fi
     
-    # Проверяем SoapySDR (важно для работы SDR)
-    python - <<'PY'
-try:
-    import SoapySDR  # noqa: F401
-    print('✓ SoapySDR установлен')
-except Exception as e:
-    print('⚠️  SoapySDR не установлен или недоступен:', e)
-PY
+    # SoapySDR больше не используется
     echo
 }
 

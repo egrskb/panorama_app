@@ -123,8 +123,28 @@ build_hackrf_slave() {
 check_conda_env() {
     echo "🐍 Проверка conda окружения..."
     
-    # Активируем conda
-    source "$CONDA_PATH/bin/activate" panorama_env
+    # Активируем conda окружение panorama_env (поддержка разных установок)
+    if command -v conda >/dev/null 2>&1; then
+        # Если conda в PATH, используем стандартную активацию
+        # Загружаем conda.sh, если доступен, чтобы гарантировать функцию 'conda'
+        [ -f "$CONDA_PATH/etc/profile.d/conda.sh" ] && . "$CONDA_PATH/etc/profile.d/conda.sh"
+        conda activate panorama_env || {
+            echo "❌ Не удалось активировать окружение panorama_env через conda"
+            exit 1
+        }
+    else
+        # Фолбэк: source activate из bin
+        if [ -f "$CONDA_PATH/bin/activate" ]; then
+            # shellcheck disable=SC1090
+            . "$CONDA_PATH/bin/activate" panorama_env || {
+                echo "❌ Не удалось активировать окружение panorama_env через $CONDA_PATH/bin/activate"
+                exit 1
+            }
+        else
+            echo "❌ Не найден conda и отсутствует $CONDA_PATH/bin/activate"
+            exit 1
+        fi
+    fi
     
     # Проверяем Python
     if ! python --version > /dev/null 2>&1; then
@@ -132,12 +152,7 @@ check_conda_env() {
         exit 1
     fi
     
-    # Проверяем SoapySDR в активированном окружении
-    if ! source "$CONDA_PATH/bin/activate" panorama_env && python -c "import SoapySDR" > /dev/null 2>&1; then
-        echo "❌ SoapySDR не установлен"
-        echo "Выполните: conda activate panorama_env && conda install -c conda-forge soapysdr=0.8.1"
-        exit 1
-    fi
+    # SoapySDR больше не используется
     
     echo "✓ Conda окружение готово"
     echo
@@ -148,7 +163,24 @@ run_panorama() {
     echo "🚀 Запуск Panorama App..."
     
     # Активируем conda окружение
-    source "$CONDA_PATH/bin/activate" panorama_env
+    if command -v conda >/dev/null 2>&1; then
+        [ -f "$CONDA_PATH/etc/profile.d/conda.sh" ] && . "$CONDA_PATH/etc/profile.d/conda.sh"
+        conda activate panorama_env || {
+            echo "❌ Не удалось активировать окружение panorama_env через conda"
+            exit 1
+        }
+    else
+        if [ -f "$CONDA_PATH/bin/activate" ]; then
+            # shellcheck disable=SC1090
+            . "$CONDA_PATH/bin/activate" panorama_env || {
+                echo "❌ Не удалось активировать окружение panorama_env через $CONDA_PATH/bin/activate"
+                exit 1
+            }
+        else
+            echo "❌ Не найден conda и отсутствует $CONDA_PATH/bin/activate"
+            exit 1
+        fi
+    fi
     
     # Очищаем переменные окружения
     unset DYLD_LIBRARY_PATH

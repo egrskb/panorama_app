@@ -9,9 +9,7 @@ import os
 import logging
 from pathlib import Path
 
-# ОТКЛЮЧАЕМ AVAHI В SOAPYSDR ДО ВСЕХ ИМПОРТОВ
-# Это предотвращает ошибки "avahi_service_browser_new() failed: Bad state"
-os.environ['SOAPY_SDR_DISABLE_AVAHI'] = '1'
+# SoapySDR больше не используется
 
 # Добавляем корневую директорию в путь
 sys.path.insert(0, str(Path(__file__).parent))
@@ -93,16 +91,8 @@ def setup_environment():
     return True
 
 def check_dependencies():
-    """Проверяет зависимости для работы с SDR."""
-    print("\nПроверка зависимостей SDR:")
-    
-    # Проверяем SoapySDR
-    try:
-        import SoapySDR
-        print("✓ SoapySDR доступен")
-    except ImportError:
-        print("✗ SoapySDR не найден. Установите: pip install SoapySDR")
-        print("  Примечание: для работы с SDR устройствами")
+    """Проверяет зависимости приложения."""
+    print("\nПроверка зависимостей:")
     
     # Проверяем CFFI-библиотеку HackRF Master
     try:

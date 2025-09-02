@@ -25,13 +25,10 @@ TARGET_DIR = .
 # Файлы
 SOURCES = hackrf_slave.c
 OBJECTS = $(SOURCES:%.c=$(BUILD_DIR)/%.o)
-TARGET = libhackrf_slave.dylib
-
-# macOS также может использовать .so расширение
-ALT_TARGET = libhackrf_slave.so
+TARGET = libhackrf_slave.so
 
 # Основная цель
-all: $(TARGET_DIR)/$(TARGET) $(TARGET_DIR)/$(ALT_TARGET)
+all: $(TARGET_DIR)/$(TARGET)
 
 # Создание директории для сборки
 $(BUILD_DIR):
@@ -41,18 +38,14 @@ $(BUILD_DIR):
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-# Сборка разделяемой библиотеки (.dylib)
+# Сборка разделяемой библиотеки (.so)
 $(TARGET_DIR)/$(TARGET): $(OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
-
-# Создаем также .so версию для совместимости
-$(TARGET_DIR)/$(ALT_TARGET): $(TARGET_DIR)/$(TARGET)
-	cp $(TARGET_DIR)/$(TARGET) $(TARGET_DIR)/$(ALT_TARGET)
 
 # Очистка
 clean:
 	rm -rf $(BUILD_DIR)
-	rm -f $(TARGET_DIR)/$(TARGET) $(TARGET_DIR)/$(ALT_TARGET)
+	rm -f $(TARGET_DIR)/$(TARGET)
 
 # Установка зависимостей (для разработчика)
 install-deps:
@@ -73,7 +66,6 @@ install: all
 	@LIB_DIR="../../../lib"; \
 	mkdir -p "$$LIB_DIR"; \
 	cp $(TARGET_DIR)/$(TARGET) "$$LIB_DIR/"; \
-	cp $(TARGET_DIR)/$(ALT_TARGET) "$$LIB_DIR/"; \
-	echo "✓ Библиотеки установлены в $$LIB_DIR/"
+	echo "✓ Библиотека установлена в $$LIB_DIR/"
 
 .PHONY: all clean install-deps test-build install
