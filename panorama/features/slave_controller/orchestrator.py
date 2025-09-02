@@ -7,6 +7,7 @@ Core orchestrator: формирует окна измерений для slaves 
 from __future__ import annotations
 import time
 import logging
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 from collections import deque, defaultdict
@@ -436,6 +437,29 @@ class Orchestrator(QObject):
                 for entry in pm.watchlist.values():
                     # entry: WatchlistEntry
                     rssi_vals = entry.rssi_measurements if entry.rssi_measurements else {}
+                    # Нормализуем ключи слейвов к виду slave0/slave1/slave2
+                    rssi_vals_norm: Dict[str, float] = {}
+                    for sid_orig, val in rssi_vals.items():
+                        sid = str(sid_orig).strip().lower()
+                        if sid.startswith('slave'):
+                            digits = ''.join(ch for ch in sid if ch.isdigit())
+                            if digits:
+                                try:
+                                    idx = int(digits)
+                                except Exception:
+                                    idx = 0
+                                sid = f"slave{idx}"
+                            else:
+                                sid = "slave0"
+                        rssi_vals_norm[sid] = val
+
+                    # Предпочтительный порядок отображения и резервный фоллбек на первые три измерения
+                    preferred = ['slave0', 'slave1', 'slave2']
+                    order: List[str] = [k for k in preferred if k in rssi_vals_norm]
+                    for k in rssi_vals_norm.keys():
+                        if k not in order:
+                            order.append(k)
+                    vals: List[Optional[float]] = [rssi_vals_norm.get(order[i]) if i < len(order) else None for i in range(3)]
                     # Рассчитываем halfspan и количество бинов
                     halfspan = entry.span_hz / 2.0 / 1e6  # halfspan в МГц
                     # Примерно оцениваем количество бинов (зависит от разрешения спектра)
@@ -447,13 +471,13 @@ class Orchestrator(QObject):
                         'freq': entry.center_freq_hz / 1e6,
                         'span': (entry.freq_stop_hz - entry.freq_start_hz) / 1e6,
                         'halfspan': halfspan,
-                        'rms_1': rssi_vals.get('slave0'),
-                        'rms_2': rssi_vals.get('slave1'), 
-                        'rms_3': rssi_vals.get('slave2'),
+                        'rms_1': vals[0],
+                        'rms_2': vals[1], 
+                        'rms_3': vals[2],
                         'total_bins': total_bins,
-                        'bins_used_1': total_bins if rssi_vals.get('slave0') is not None else 0,
-                        'bins_used_2': total_bins if rssi_vals.get('slave1') is not None else 0,
-                        'bins_used_3': total_bins if rssi_vals.get('slave2') is not None else 0,
+                        'bins_used_1': total_bins if vals[0] is not None else 0,
+                        'bins_used_2': total_bins if vals[1] is not None else 0,
+                        'bins_used_3': total_bins if vals[2] is not None else 0,
                         'timestamp_1': time.strftime('%H:%M:%S', time.localtime(entry.last_update)),
                         'timestamp_2': time.strftime('%H:%M:%S', time.localtime(entry.last_update)),
                         'timestamp_3': time.strftime('%H:%M:%S', time.localtime(entry.last_update)),
