@@ -379,31 +379,41 @@ static void compute_psd(const fftwf_complex* fft_out,
                        const float* window,
                        uint32_t fft_size,
                        uint32_t sample_rate) {
-    // Нормализация окна
-    float window_sum = 0.0f;
-    if (window != NULL) {
+    // Приводим расчёт к формуле master_hackrf.c (dbFS + поправки)
+    // 1) Нормировка FFT
+    const float fft_norm = 1.0f / (float)fft_size;
+
+    // 2) Коррекции окна: потери мощности окна и ENBW
+    //   Повторяем логику calculate_window_corrections() из master:
+    double sum_linear = 0.0, sum_squared = 0.0;
+    if (window) {
         for (uint32_t i = 0; i < fft_size; i++) {
-            window_sum += window[i] * window[i];
+            sum_linear  += window[i];
+            sum_squared += (double)window[i] * (double)window[i];
         }
     } else {
-        window_sum = fft_size;
+        // rectangular window
+        sum_linear = fft_size;
+        sum_squared = fft_size;
     }
-    
-    // Вычисление PSD в dBm
-    float scale_factor = 1.0f / (window_sum * sample_rate);
-    
+    double coherent_gain   = sum_linear / (double)fft_size;
+    double processing_gain = sum_squared / (double)fft_size;
+    float window_loss_db = -10.0f * log10f((float)processing_gain);
+    double enbw = (double)fft_size * processing_gain / (coherent_gain * coherent_gain);
+    float enbw_corr_db = 10.0f * log10f((float)enbw);
+
+    // 3) Складываем поправки
+    const float total_corr = window_loss_db + enbw_corr_db;
+
     for (uint32_t i = 0; i < fft_size; i++) {
-        float re = fft_out[i][0];
-        float im = fft_out[i][1];
-        float power = (re * re + im * im) * scale_factor;
-        
-        // Преобразование в dBm (относительно 1 мВт)
-        // Формула: dBm = 10 * log10(P) - 174 + 10 * log10(SR/N)
-        if (power > 0.0f) {
-            psd[i] = 10.0f * log10f(power) - 174.0f + 10.0f * log10f((float)sample_rate / fft_size);
-        } else {
-            psd[i] = -200.0f; // Минимальное значение
-        }
+        float re = fft_out[i][0] * fft_norm;
+        float im = fft_out[i][1] * fft_norm;
+        float mag2 = re * re + im * im;
+        if (mag2 < 1e-20f) mag2 = 1e-20f;
+        float dbfs = 10.0f * log10f(mag2);
+        // Базовая поправка -10 дБ как в master + оконные/ENBW поправки;
+        // абсолютную калибровку добавляем позже вне этой функции (через config.calibration_db)
+        psd[i] = dbfs + total_corr - 10.0f;
     }
 }
 
