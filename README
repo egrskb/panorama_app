@@ -1,0 +1,44 @@
+# Panorama App
+
+Приложение для работы с HackRF и анализа спектра.
+
+## Быстрый запуск
+
+### macOS
+```bash
+./run_macos.sh
+```
+
+### Linux
+```bash
+./run_linux.sh
+```
+
+## Опции
+
+### macOS
+```bash
+./run_macos.sh --help      # Справка
+./run_macos.sh --install   # Только установка
+./run_macos.sh --build     # Только сборка библиотеки
+./run_macos.sh --run       # Только запуск
+```
+
+### Linux
+```bash
+./run_linux.sh --help      # Справка
+./run_linux.sh --install   # Только установка
+./run_linux.sh --build     # Только сборка библиотеки
+./run_linux.sh --usb       # Настройка USB прав
+./run_linux.sh --run       # Только запуск
+```
+
+## Проверка окружения
+```bash
+./check_environment.sh
+```
+
+## Требования
+- Conda с окружением panorama_env
+- HackRF устройство
+- Python 3.10+

@@ -1,15 +1,15 @@
-# Makefile для hackrf_master driver
+# Makefile для hackrf_master driver на Linux
 # Компилирует C-библиотеку с исправлениями спектра
 
 CC = gcc
 CFLAGS = -shared -fPIC -O3 -Wall -Wextra
 LIBS = -lhackrf -lfftw3f -lm -pthread
 
-# Пути к заголовочным файлам
+# Пути к заголовочным файлам (Linux)
 HACKRF_CFLAGS = $(shell pkg-config --cflags libhackrf 2>/dev/null || echo "-I/usr/include/hackrf")
 FFTW_CFLAGS = $(shell pkg-config --cflags fftw3f 2>/dev/null || echo "-I/usr/include")
 
-# Пути к библиотекам
+# Пути к библиотекам (Linux)
 HACKRF_LIBS = $(shell pkg-config --libs libhackrf 2>/dev/null || echo "-L/usr/lib -lhackrf")
 FFTW_LIBS = $(shell pkg-config --libs fftw3f 2>/dev/null || echo "-L/usr/lib -lfftw3f")
 
@@ -22,20 +22,20 @@ HEADER = hackrf_master.h
 # Основная цель
 all: $(TARGET)
 
+# Компиляция объектного файла
+$(OBJECT): $(SOURCE) $(HEADER)
+	@echo "Компиляция $(SOURCE) для Linux..."
+	$(CC) -c -fPIC $(SOURCE) -o $@ $(HACKRF_CFLAGS) $(FFTW_CFLAGS)
+
 # Компиляция библиотеки
 $(TARGET): $(OBJECT)
-	@echo "Создание библиотеки $(TARGET)..."
+	@echo "Создание библиотеки $(TARGET) для Linux..."
 	$(CC) $(CFLAGS) -o $@ $< $(HACKRF_LIBS) $(FFTW_LIBS) $(LIBS)
 	@echo "Библиотека $(TARGET) создана успешно"
 
-# Компиляция объектного файла
-$(OBJECT): $(SOURCE) $(HEADER)
-	@echo "Компиляция $(SOURCE)..."
-	$(CC) -c -fPIC $(SOURCE) -o $@ $(HACKRF_CFLAGS) $(FFTW_CFLAGS)
-
-# Установка
+# Установка в систему
 install: $(TARGET)
-	@echo "Установка библиотеки..."
+	@echo "Установка библиотеки в Linux..."
 	sudo cp $(TARGET) /usr/local/lib/
 	sudo ldconfig
 	@echo "Библиотека установлена в /usr/local/lib/"
@@ -51,20 +51,10 @@ rebuild: clean all
 
 # Проверка зависимостей
 check-deps:
-	@echo "Проверка зависимостей..."
+	@echo "Проверка зависимостей для Linux..."
 	@echo "HackRF: $(shell pkg-config --exists libhackrf && echo "✓ найдена" || echo "✗ не найдена")"
 	@echo "FFTW3: $(shell pkg-config --exists fftw3f && echo "✓ найдена" || echo "✗ не найдена")"
 	@echo "GCC: $(shell which gcc && echo "✓ найдена" || echo "✗ не найдена")"
-
-# Помощь
-help:
-	@echo "Доступные команды:"
-	@echo "  all        - компиляция библиотеки (по умолчанию)"
-	@echo "  install    - установка в систему"
-	@echo "  clean      - очистка временных файлов"
-	@echo "  rebuild    - пересборка с нуля"
-	@echo "  check-deps - проверка зависимостей"
-	@echo "  help       - показать эту справку"
 
 # Установка зависимостей (Ubuntu/Debian)
 install-deps-ubuntu:
@@ -79,9 +69,16 @@ install-deps-centos:
 	# или для Fedora:
 	# sudo dnf install -y hackrf-devel fftw3-devel gcc make pkgconfig
 
-# Установка зависимостей (macOS)
-install-deps-macos:
-	@echo "Установка зависимостей для macOS..."
-	brew install hackrf fftw pkg-config
+# Помощь
+help:
+	@echo "Доступные команды:"
+	@echo "  all        - компиляция библиотеки (по умолчанию)"
+	@echo "  install    - установка в систему"
+	@echo "  clean      - очистка временных файлов"
+	@echo "  rebuild    - пересборка с нуля"
+	@echo "  check-deps - проверка зависимостей"
+	@echo "  install-deps-ubuntu - установка зависимостей (Ubuntu/Debian)"
+	@echo "  install-deps-centos - установка зависимостей (CentOS/RHEL/Fedora)"
+	@echo "  help       - показать эту справку"
 
-.PHONY: all install clean rebuild check-deps help install-deps-ubuntu install-deps-centos install-deps-macos
+.PHONY: all install clean rebuild check-deps install-deps-ubuntu install-deps-centos help

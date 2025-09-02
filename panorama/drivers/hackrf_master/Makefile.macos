@@ -1,0 +1,75 @@
+# Makefile для hackrf_master driver на macOS
+# Компилирует C-библиотеку с исправлениями спектра
+
+CC = gcc
+CFLAGS = -shared -fPIC -O3 -Wall -Wextra
+LIBS = -lhackrf -lfftw3f -lm -pthread
+
+# Пути к заголовочным файлам (macOS Homebrew)
+HACKRF_CFLAGS = $(shell pkg-config --cflags libhackrf 2>/dev/null || echo "-I/opt/homebrew/include/libhackrf")
+FFTW_CFLAGS = $(shell pkg-config --cflags fftw3f 2>/dev/null || echo "-I/opt/homebrew/include")
+
+# Пути к библиотекам (macOS Homebrew)
+HACKRF_LIBS = $(shell pkg-config --libs libhackrf 2>/dev/null || echo "-L/opt/homebrew/lib -lhackrf")
+FFTW_LIBS = $(shell pkg-config --libs fftw3f 2>/dev/null || echo "-L/opt/homebrew/lib -lfftw3f")
+
+# Целевые файлы
+TARGET = libhackrf_master.so
+SOURCE = hackrf_master.c
+OBJECT = hackrf_master.o
+HEADER = hackrf_master.h
+
+# Основная цель
+all: $(TARGET)
+
+# Компиляция объектного файла
+$(OBJECT): $(SOURCE) $(HEADER)
+	@echo "Компиляция $(SOURCE) для macOS..."
+	$(CC) -c -fPIC $(SOURCE) -o $@ $(HACKRF_CFLAGS) $(FFTW_CFLAGS)
+
+# Компиляция библиотеки
+$(TARGET): $(OBJECT)
+	@echo "Создание библиотеки $(TARGET) для macOS..."
+	$(CC) $(CFLAGS) -o $@ $< $(HACKRF_LIBS) $(FFTW_LIBS) $(LIBS)
+	@echo "Библиотека $(TARGET) создана успешно"
+
+# Установка в систему
+install: $(TARGET)
+	@echo "Установка библиотеки в macOS..."
+	sudo cp $(TARGET) /usr/local/lib/
+	sudo chmod 755 /usr/local/lib/$(TARGET)
+	@echo "Библиотека установлена в /usr/local/lib/"
+
+# Очистка
+clean:
+	@echo "Очистка..."
+	rm -f $(OBJECT) $(TARGET)
+	@echo "Очистка завершена"
+
+# Пересборка
+rebuild: clean all
+
+# Проверка зависимостей
+check-deps:
+	@echo "Проверка зависимостей для macOS..."
+	@echo "HackRF: $(shell pkg-config --exists libhackrf && echo "✓ найдена" || echo "✗ не найдена")"
+	@echo "FFTW3: $(shell pkg-config --exists fftw3f && echo "✓ найдена" || echo "✗ не найдена")"
+	@echo "GCC: $(shell which gcc && echo "✓ найдена" || echo "✗ не найдена")"
+
+# Установка зависимостей (macOS)
+install-deps:
+	@echo "Установка зависимостей для macOS..."
+	brew install hackrf fftw pkg-config
+
+# Помощь
+help:
+	@echo "Доступные команды:"
+	@echo "  all        - компиляция библиотеки (по умолчанию)"
+	@echo "  install    - установка в систему"
+	@echo "  clean      - очистка временных файлов"
+	@echo "  rebuild    - пересборка с нуля"
+	@echo "  check-deps - проверка зависимостей"
+	@echo "  install-deps - установка зависимостей"
+	@echo "  help       - показать эту справку"
+
+.PHONY: all install clean rebuild check-deps install-deps help
