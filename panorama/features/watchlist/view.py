@@ -16,6 +16,8 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtGui import QFont, QColor, QBrush
 
+from .web_table_widget import WebTableWidget
+
 
 class ImprovedSlavesView(QWidget):
     """Исправленный виджет управления слейвами с RSSI матрицей."""
@@ -33,10 +35,14 @@ class ImprovedSlavesView(QWidget):
         self.watchlist = []
         self.tasks_data = []
         
+        # Веб-таблица для RSSI измерений
+        self.web_table_widget = None
+        
         # Заглушки для обратной совместимости
         self.watchlist_table = None
         self.lbl_watchlist_count = None
         self.rssi_table = None
+        self.combined_table = None  # Будет заменена веб-таблицей
         
         # Создаем UI
         self._create_ui()
@@ -102,114 +108,111 @@ class ImprovedSlavesView(QWidget):
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
-        # Информационная панель
-        info = QLabel(
-            "📍 Диапазоны добавляются автоматически при обнаружении сигналов. "
-            "Таблица показывает RSSI от каждого слейва и результаты трилатерации."
-        )
-        info.setWordWrap(True)
-        info.setStyleSheet("""
-            QLabel {
-                background-color: rgba(100, 100, 255, 30);
-                padding: 8px;
-                border-radius: 4px;
-                margin-bottom: 5px;
-            }
-        """)
-        layout.addWidget(info)
+        # Информационная панель удалена по требованиям
         
-        # Элементы управления
-        controls = QHBoxLayout()
+        # Управляющие элементы (фильтры/пороги/очистка) удалены — система работает автономно
         
-        # Фильтр диапазонов  
-        self.range_filter = QComboBox()
-        self.range_filter.addItem("Все диапазоны")
-        self.range_filter.currentTextChanged.connect(self._filter_combined_table)
-        controls.addWidget(QLabel("Фильтр:"))
-        controls.addWidget(self.range_filter)
+        # Веб-таблица вместо QTableWidget для лучшей производительности
+        self.web_table_widget = WebTableWidget()
         
-        # Порог RSSI
-        self.threshold_spin = QSpinBox()
-        self.threshold_spin.setRange(-120, 0)
-        self.threshold_spin.setValue(-80)
-        self.threshold_spin.setSuffix(" дБм")
-        self.threshold_spin.valueChanged.connect(self._update_combined_colors)
-        controls.addWidget(QLabel("Порог:"))
-        controls.addWidget(self.threshold_spin)
+        # Подключаем сигналы веб-таблицы
+        self.web_table_widget.export_requested.connect(self._on_web_table_export)
+        self.web_table_widget.map_navigate_requested.connect(self._on_web_table_map_navigate) 
+        self.web_table_widget.clear_data_requested.connect(self._on_web_table_clear_data)
         
-        # Автообновление
-        self.auto_update_cb = QCheckBox("Автообновление")
-        self.auto_update_cb.setChecked(True)
-        controls.addWidget(self.auto_update_cb)
+        layout.addWidget(self.web_table_widget)
         
-        controls.addStretch()
+        # Создаем заглушку для обратной совместимости
+        self.combined_table = self._create_combined_table_proxy()
         
-        # Кнопки управления: очищение измерений оставляем
-        self.btn_clear_combined = QPushButton("🗑️ Очистить измерения")
-        self.btn_clear_combined.clicked.connect(self._clear_combined_data)
-        controls.addWidget(self.btn_clear_combined)
-        
-        layout.addLayout(controls)
-        
-        # Объединенная таблица
-        self.combined_table = QTableWidget()
-        self.combined_table.setColumnCount(12)
-        self.combined_table.setHorizontalHeaderLabels([
-            "Диапазон (МГц)", "Центр (МГц)", "Ширина",
-            "Slave0 (дБм)", "Slave1 (дБм)", "Slave2 (дБм)", 
-            "X", "Y", "Доверие", "Время", "На карту", "Статус"
-        ])
-        self.combined_table.setAlternatingRowColors(True)
-        # Запрещаем редактирование ячеек в таблице измерений
-        try:
-            from PyQt5.QtWidgets import QAbstractItemView
-            self.combined_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        except Exception:
-            pass
-        
-        # Настройка столбцов: избегаем ResizeToContents (дорого на каждом апдейте)
-        header = self.combined_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Interactive)
-        header.setSectionResizeMode(0, QHeaderView.Stretch)  # Диапазон тянется
-        try:
-            # Разумные стартовые ширины для стабильного лайв-обновления
-            self.combined_table.setColumnWidth(1, 90)   # Центр
-            self.combined_table.setColumnWidth(2, 60)   # Ширина
-            for c in (3, 4, 5):
-                self.combined_table.setColumnWidth(c, 95)  # RSSI колонки
-            for c in (6, 7):
-                self.combined_table.setColumnWidth(c, 60)   # X/Y
-            self.combined_table.setColumnWidth(8, 80)   # Доверие
-            self.combined_table.setColumnWidth(9, 70)   # Время
-            self.combined_table.setColumnWidth(10, 70)  # На карту
-            self.combined_table.setColumnWidth(11, 90)  # Статус
-        except Exception:
-            pass
-
-        # Двойной клик по строке — отправка на карту
-        try:
-            self.combined_table.itemDoubleClicked.connect(self._on_combined_item_double_clicked)
-        except Exception:
-            pass
-        
-        layout.addWidget(self.combined_table)
-        # Полностью отключаем QSS для таблицы измерений и высоте строк
-        self.combined_table.setStyleSheet("")
-        self.combined_table.verticalHeader().setDefaultSectionSize(22)
-        
-        # Статистика
-        stats_layout = QHBoxLayout()
-        self.lbl_combined_count = QLabel("Записей: 0")
-        self.lbl_avg_rssi_combined = QLabel("Сред. RSSI: — дБм")
-        self.lbl_active_ranges = QLabel("Активных: 0")
-        
-        for lbl in [self.lbl_combined_count, self.lbl_avg_rssi_combined, self.lbl_active_ranges]:
-            stats_layout.addWidget(lbl)
-        
-        stats_layout.addStretch()
-        layout.addLayout(stats_layout)
+        # Статистика в нативной таблице скрыта — веб-таблица содержит собственные метрики
         
         return widget
+    
+    def _create_combined_table_proxy(self):
+        """Создает прокси-объект для обратной совместимости с combined_table."""
+        class CombinedTableProxy:
+            def __init__(self, web_widget):
+                self.web_widget = web_widget
+                self._row_count = 0
+            
+            def rowCount(self):
+                return self._row_count
+            
+            def setRowCount(self, count):
+                self._row_count = count
+                if count == 0:
+                    self.web_widget.clear_all_data()
+            
+            def insertRow(self, row):
+                self._row_count += 1
+                return self._row_count - 1
+            
+            def setItem(self, row, col, item):
+                # Заглушка - данные будут обновляться через веб-интерфейс
+                pass
+            
+            def item(self, row, col):
+                # Возвращаем заглушку
+                class ItemProxy:
+                    def __init__(self, text=""):
+                        self._text = text
+                    def text(self):
+                        return self._text
+                    def setText(self, text):
+                        self._text = text
+                return ItemProxy()
+        
+        return CombinedTableProxy(self.web_table_widget)
+    
+    def _on_web_table_export(self, format_name: str):
+        """Обрабатывает запрос на экспорт из веб-таблицы."""
+        try:
+            # Экспортируем данные через веб-таблицу
+            data = self.web_table_widget.export_data(format_name)
+            
+            # Сохраняем в файл
+            from PyQt5.QtWidgets import QFileDialog, QMessageBox
+            import json
+            
+            filename, _ = QFileDialog.getSaveFileName(
+                self,
+                f"Экспорт RSSI данных ({format_name})",
+                f"rssi_data_{time.strftime('%Y%m%d_%H%M%S')}.json",
+                "JSON files (*.json)"
+            )
+            
+            if filename:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                
+                QMessageBox.information(
+                    self, 
+                    "Экспорт завершен",
+                    f"Данные экспортированы в файл:\n{filename}"
+                )
+                
+        except Exception as e:
+            print(f"[SlavesView] Export error: {e}")
+    
+    def _on_web_table_map_navigate(self, lat: float, lng: float):
+        """Обрабатывает запрос на навигацию по карте из веб-таблицы."""
+        try:
+            # Эмитируем сигнал для карты
+            self.send_to_map.emit({
+                'type': 'navigate_to_coordinates',
+                'lat': lat,
+                'lng': lng
+            })
+        except Exception as e:
+            print(f"[SlavesView] Map navigation error: {e}")
+    
+    def _on_web_table_clear_data(self):
+        """Обрабатывает запрос на очистку данных из веб-таблицы."""
+        try:
+            self._clear_combined_data()
+        except Exception as e:
+            print(f"[SlavesView] Clear data error: {e}")
 
 
     def _create_tasks_tab(self) -> QWidget:
@@ -325,8 +328,7 @@ class ImprovedSlavesView(QWidget):
         widget.setFrameStyle(QFrame.Box)
         layout = QHBoxLayout(widget)
         
-        self.lbl_last_update = QLabel("Обновлено: —")
-        layout.addWidget(self.lbl_last_update)
+        # Нижняя панель статуса скрыта — метрики отображает веб-таблица
         
         return widget
 
@@ -338,12 +340,8 @@ class ImprovedSlavesView(QWidget):
 
     def _get_rssi_color(self, rssi: float) -> QColor:
         """Цвет для RSSI."""
-        # Используем фиксированные пороги, так как threshold_spin теперь в объединенной таблице
-        threshold = getattr(self, 'threshold_spin', None)
-        if threshold:
-            threshold_val = threshold.value()
-        else:
-            threshold_val = -80  # Значение по умолчанию
+        # Фиксированный порог для раскраски
+        threshold_val = -80
         
         if rssi >= threshold_val + 20:
             return QColor(74, 222, 128, 100)  # Зеленый
@@ -356,16 +354,18 @@ class ImprovedSlavesView(QWidget):
         """Периодическое обновление данных."""
         if self.orchestrator and hasattr(self.orchestrator, "get_ui_snapshot"):
             try:
-                # Учитываем флаг автообновления
-                if getattr(self, 'auto_update_cb', None) is None or self.auto_update_cb.isChecked():
-                    snapshot = self.orchestrator.get_ui_snapshot()
-                    if snapshot:
-                        self.update_from_orchestrator(snapshot)
+                snapshot = self.orchestrator.get_ui_snapshot()
+                if snapshot:
+                    self.update_from_orchestrator(snapshot)
             except Exception as e:
                 print(f"[SlavesView] Error: {e}")
         
-        # Время обновления
-        self.lbl_last_update.setText(f"Обновлено: {time.strftime('%H:%M:%S')}")
+        # Время обновления → отправляем только в веб-таблицу
+        try:
+            if self.web_table_widget:
+                self.web_table_widget.update_performance_stats({'last_update': time.strftime('%H:%M:%S')})
+        except Exception:
+            pass
 
     def update_from_orchestrator(self, data: Dict[str, Any]):
         """Обновляет данные из оркестратора."""
@@ -392,25 +392,27 @@ class ImprovedSlavesView(QWidget):
         self._update_combined_from_watchlist(watchlist_data)
     
     def _update_combined_from_watchlist(self, watchlist_data: List[Dict]):
-        """Обновляет объединенную таблицу данными из watchlist."""
-        for data in watchlist_data:
-            try:
-                freq = float(data.get('freq', 0))
-                span = float(data.get('span', 2.0))
-                
-                # Создаем диапазон
-                freq_start = freq - span/2
-                freq_end = freq + span/2
-                range_str = f"{freq_start:.1f}-{freq_end:.1f}"
-                
-                # Находим или создаем строку
-                row = self._find_or_create_combined_row(range_str, freq)
-                
-                if row >= 0:
-                    # Обновляем ширину
-                    self.combined_table.setItem(row, 2, QTableWidgetItem(f"{span:.1f}"))
+        """Обновляет веб-таблицу данными из watchlist."""
+        if not self.web_table_widget:
+            return
+            
+        try:
+            # Преобразуем данные watchlist для веб-таблицы
+            rssi_data = {}
+            targets_info = {}
+            
+            for data in watchlist_data:
+                try:
+                    freq = float(data.get('freq', 0))
+                    span = float(data.get('span', 2.0))
                     
-                    # Обновляем RSSI для каждого slave
+                    # Создаем диапазон
+                    freq_start = freq - span/2
+                    freq_end = freq + span/2
+                    range_str = f"{freq_start:.1f}-{freq_end:.1f}"
+                    
+                    # Собираем RSSI данные для каждого slave
+                    range_rssi = {}
                     for i in range(3):
                         rms_key = f'rms_{i+1}'
                         val = data.get(rms_key)
@@ -418,46 +420,34 @@ class ImprovedSlavesView(QWidget):
                         if val is not None:
                             rssi_val = float(val)
                             slave_id = f"slave{i}"
-                            col = 3 + i  # Колонки RSSI в объединенной таблице
-                            
-                            item = QTableWidgetItem(f"{rssi_val:.1f}")
-                            item.setTextAlignment(Qt.AlignCenter)
-                            color = self._get_rssi_color(rssi_val)
-                            item.setBackground(QBrush(color))
-                            try:
-                                item.setData(Qt.BackgroundRole, QBrush(color))
-                            except Exception:
-                                pass
-                            
-                            # Tooltip с дополнительной информацией
-                            bins_used = data.get(f'bins_used_{i+1}', 'N/A')
-                            timestamp = data.get(f'timestamp_{i+1}', '')
-                            item.setToolTip(f"Slave: {slave_id}\nБинов: {bins_used}\nВремя: {timestamp}")
-                            
-                            self.combined_table.setItem(row, col, item)
+                            range_rssi[slave_id] = rssi_val
                     
-                    # Обновляем время
-                    updated_time = data.get('updated', time.strftime('%H:%M:%S'))
-                    self.combined_table.setItem(row, 9, QTableWidgetItem(updated_time))
-                    
-                    # Колонка "На карту" — лёгкая иконка-текст вместо кнопки
-                    map_item = self.combined_table.item(row, 10)
-                    if not map_item:
-                        map_item = QTableWidgetItem("📍")
-                        map_item.setTextAlignment(Qt.AlignCenter)
-                        map_item.setFlags(map_item.flags() & ~Qt.ItemIsEditable)
-                        self.combined_table.setItem(row, 10, map_item)
-                    
-                    # Статус - переводим на русский
-                    has_measurements = any(data.get(f'rms_{i+1}') for i in range(3))
-                    status = "ИЗМЕРЕНИЕ" if has_measurements else "ОЖИДАНИЕ"
-                    self.combined_table.setItem(row, 11, QTableWidgetItem(status))
+                    if range_rssi:  # Добавляем только если есть RSSI данные
+                        rssi_data[range_str] = range_rssi
+                        
+                        # Информация о цели
+                        targets_info[range_str] = {
+                            'center_freq': freq,
+                            'span': span,
+                            'updated': data.get('updated', time.strftime('%H:%M:%S')),
+                            'status': 'ИЗМЕРЕНИЕ' if range_rssi else 'ОЖИДАНИЕ',
+                            'bins_used': {f'slave{i}': data.get(f'bins_used_{i+1}', 'N/A') for i in range(3)},
+                            'timestamps': {f'slave{i}': data.get(f'timestamp_{i+1}', '') for i in range(3)}
+                        }
+                
+                except Exception as e:
+                    print(f"[SlavesView] Error processing watchlist item: {e}")
             
-            except Exception as e:
-                print(f"[SlavesView] Error updating combined row: {e}")
-        
-        # Обновляем статистику
-        self._update_combined_stats()
+            # Обновляем веб-таблицу
+            if rssi_data:
+                self.web_table_widget.update_rssi_data(rssi_data)
+                self.web_table_widget.update_targets_info(targets_info)
+            
+            # Обновляем статистику
+            self._update_combined_stats()
+            
+        except Exception as e:
+            print(f"[SlavesView] Error updating web table from watchlist: {e}")
 
     def _render_tasks(self, tasks_data: List[Dict]):
         """Отрисовывает задачи."""
@@ -528,41 +518,47 @@ class ImprovedSlavesView(QWidget):
         self.lbl_completed_tasks.setText(f"Завершено: {stats['completed']}")
 
     def add_transmitter(self, result):
-        """Добавляет результат трилатерации в объединенную таблицу."""
+        """Добавляет результат трилатерации в веб-таблицу."""
         try:
-            # Находим или создаем строку для данного диапазона
+            if not self.web_table_widget:
+                return
+                
+            # Получаем данные результата трилатерации
             peak_id = getattr(result, 'peak_id', 'unknown')
             freq = getattr(result, 'freq_mhz', 0.0)
             x = getattr(result, 'x', 0.0)
             y = getattr(result, 'y', 0.0)
             confidence = getattr(result, 'confidence', 0.0)
             
-            # Ищем существующую строку по частоте
-            range_str = f"{freq-1.0:.1f}-{freq+1.0:.1f}"  # Примерный диапазон
-            row = self._find_or_create_combined_row(range_str, freq)
+            # Формируем диапазон
+            range_str = f"{freq-1.0:.1f}-{freq+1.0:.1f}"
             
-            if row >= 0:
-                # Обновляем колонки с результатами трилатерации
-                self.combined_table.setItem(row, 6, QTableWidgetItem(f"{x:.1f}"))  # X
-                self.combined_table.setItem(row, 7, QTableWidgetItem(f"{y:.1f}"))  # Y
-                self.combined_table.setItem(row, 8, QTableWidgetItem(f"{confidence*100:.0f}%"))  # Доверие
-                self.combined_table.setItem(row, 9, QTableWidgetItem(time.strftime("%H:%M:%S")))  # Время
-                
-                # Лёгкая иконка в колонке "На карту"
-                map_item = self.combined_table.item(row, 10)
-                if not map_item:
-                    map_item = QTableWidgetItem("📍")
-                    map_item.setTextAlignment(Qt.AlignCenter)
-                    map_item.setFlags(map_item.flags() & ~Qt.ItemIsEditable)
-                    self.combined_table.setItem(row, 10, map_item)
-                
-                # Статус
-                self.combined_table.setItem(row, 11, QTableWidgetItem("ОБНАРУЖЕН"))
-                
-                self._update_combined_stats()
+            # Обновляем информацию о цели с результатами трилатерации
+            current_data = self.web_table_widget.get_current_data()
+            targets_info = current_data.get('targets_info', {})
+            
+            if range_str not in targets_info:
+                targets_info[range_str] = {}
+            
+            targets_info[range_str].update({
+                'center_freq': freq,
+                'x': x,
+                'y': y,
+                'confidence': confidence,
+                'peak_id': peak_id,
+                'status': 'ОБНАРУЖЕН',
+                'trilateration_time': time.strftime("%H:%M:%S"),
+                'has_trilateration': True
+            })
+            
+            # Обновляем веб-таблицу
+            self.web_table_widget.update_targets_info(targets_info)
+            
+            # Обновляем статистику
+            self._update_combined_stats()
             
         except Exception as e:
-            print(f"[SlavesView] Error adding transmitter: {e}")
+            print(f"[SlavesView] Error adding transmitter to web table: {e}")
     
     def _find_or_create_combined_row(self, range_str: str, center_freq: float) -> int:
         """Находит или создает строку в объединенной таблице."""
@@ -657,39 +653,49 @@ class ImprovedSlavesView(QWidget):
                         pass
     
     def _clear_combined_data(self):
-        """Очищает объединенную таблицу."""
-        self.combined_table.setRowCount(0)
+        """Очищает веб-таблицу."""
+        if self.web_table_widget:
+            self.web_table_widget.clear_all_data()
+        # Также очищаем прокси-таблицу для совместимости
+        if hasattr(self.combined_table, 'setRowCount'):
+            self.combined_table.setRowCount(0)
         self._update_combined_stats()
     
     def _update_combined_stats(self):
-        """Обновляет статистику объединенной таблицы."""
-        total_count = self.combined_table.rowCount()
-        active_count = 0
-        all_rssi = []
-        
-        for row in range(total_count):
-            # Проверяем активность (есть ли RSSI данные)
-            has_rssi = False
-            for col in range(3, 6):
-                item = self.combined_table.item(row, col)
-                if item and item.text() != "—":
-                    has_rssi = True
-                    try:
-                        all_rssi.append(float(item.text()))
-                    except:
-                        pass
+        """Обновляет статистику веб-таблицы."""
+        if not self.web_table_widget:
+            return
             
-            if has_rssi:
-                active_count += 1
-        
-        self.lbl_combined_count.setText(f"Записей: {total_count}")
-        self.lbl_active_ranges.setText(f"Активных: {active_count}")
-        
-        if all_rssi:
-            avg_rssi = np.mean(all_rssi)
-            self.lbl_avg_rssi_combined.setText(f"Сред. RSSI: {avg_rssi:.1f} дБм")
-        else:
-            self.lbl_avg_rssi_combined.setText("Сред. RSSI: — дБм")
+        try:
+            current_data = self.web_table_widget.get_current_data()
+            rssi_data = current_data.get('rssi_data', {})
+            
+            total_count = len(rssi_data)
+            active_count = 0
+            all_rssi = []
+            
+            for range_str, slaves_rssi in rssi_data.items():
+                if slaves_rssi:  # Есть RSSI данные
+                    active_count += 1
+                    for slave_id, rssi_val in slaves_rssi.items():
+                        try:
+                            all_rssi.append(float(rssi_val))
+                        except:
+                            pass
+            
+            # Отправляем статистику в веб-таблицу
+            stats = {
+                'total_ranges': total_count,
+                'active_ranges': active_count,
+                'avg_rssi': float(np.mean(all_rssi)) if all_rssi else None,
+                'total_measurements': len(all_rssi),
+                'last_update': time.strftime('%H:%M:%S')
+            }
+            
+            self.web_table_widget.update_performance_stats(stats)
+            
+        except Exception as e:
+            print(f"[SlavesView] Error updating web table stats: {e}")
     
     # Методы для работы с координатами
     def _initialize_coordinates_table(self):
@@ -970,46 +976,29 @@ class ImprovedSlavesView(QWidget):
     # Удален отдельный показ на карте — координаты отправляются автоматически
     
     def update_combined_rssi(self, range_str: str, slave_id: str, rssi_rms: float):
-        """Обновляет RSSI в объединенной таблице."""
+        """Обновляет RSSI через веб-таблицу."""
         try:
-            # Находим строку с данным диапазоном
-            row = -1
-            for r in range(self.combined_table.rowCount()):
-                item = self.combined_table.item(r, 0)
-                if item and item.text() == range_str:
-                    row = r
-                    break
+            if not self.web_table_widget:
+                return
             
-            if row == -1:
-                # Создаем новую строку
-                center_freq = sum(float(x) for x in range_str.split('-')) / 2
-                row = self._find_or_create_combined_row(range_str, center_freq)
+            # Обновляем данные в веб-таблице
+            current_data = self.web_table_widget.get_current_data()
+            rssi_data = current_data.get('rssi_data', {})
             
-            # Определяем колонку по slave_id
-            col_map = {"slave0": 3, "slave1": 4, "slave2": 5}
-            col = col_map.get(slave_id.lower(), -1)
+            # Добавляем новое RSSI значение
+            if range_str not in rssi_data:
+                rssi_data[range_str] = {}
             
-            if col > 0 and row >= 0:
-                item = QTableWidgetItem(f"{rssi_rms:.1f}")
-                item.setTextAlignment(Qt.AlignCenter)
-                color = self._get_rssi_color(rssi_rms)
-                item.setBackground(QBrush(color))
-                try:
-                    item.setData(Qt.BackgroundRole, QBrush(color))
-                except Exception:
-                    pass
-                self.combined_table.setItem(row, col, item)
-                
-                # Обновляем статистику
-                self._update_combined_stats()
-                
-                # Добавляем в фильтр, если нужно
-                if range_str not in [self.range_filter.itemText(i) 
-                                   for i in range(self.range_filter.count())]:
-                    self.range_filter.addItem(range_str)
+            rssi_data[range_str][slave_id] = rssi_rms
+            
+            # Обновляем веб-таблицу
+            self.web_table_widget.update_rssi_data(rssi_data)
+            
+            # Обновляем статистику
+            self._update_combined_stats()
         
         except Exception as e:
-            print(f"[SlavesView] Error updating combined RSSI: {e}")
+            print(f"[SlavesView] Error updating web table RSSI: {e}")
 
     def _on_combined_item_double_clicked(self, item: QTableWidgetItem):
         """Двойной клик — отправка записи на карту (без тяжёлых кнопок)."""

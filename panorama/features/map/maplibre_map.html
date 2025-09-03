@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>PANORAMA MapLibre GL JS Map</title>
+    <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no">
+    <script src="https://unpkg.com/maplibre-gl@3.3.1/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@3.3.1/dist/maplibre-gl.css" rel="stylesheet">
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+        }
+        #map {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 100%;
+            height: 100vh;
+        }
+        .maplibregl-popup-content {
+            min-width: 200px;
+            padding: 15px;
+        }
+        .sdr-info {
+            margin: 5px 0;
+        }
+        .sdr-info strong {
+            color: #2c3e50;
+        }
+        .control-panel {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            z-index: 1000;
+            width: 250px;
+        }
+        .control-group {
+            margin-bottom: 15px;
+        }
+        .control-group h3 {
+            margin: 0 0 8px 0;
+            font-size: 14px;
+            color: #2c3e50;
+        }
+        button {
+            background: #3498db;
+            color: white;
+            border: none;
+            padding: 8px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            margin: 2px;
+        }
+        button:hover {
+            background: #2980b9;
+        }
+        button:disabled {
+            background: #bdc3c7;
+            cursor: not-allowed;
+        }
+        #coordinates {
+            font-size: 12px;
+            color: #7f8c8d;
+            background: rgba(255, 255, 255, 0.9);
+            padding: 5px 8px;
+            border-radius: 4px;
+        }
+        .status-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 5px;
+        }
+        .status-connected {
+            background-color: #27ae60;
+        }
+        .status-disconnected {
+            background-color: #e74c3c;
+        }
+        .legend {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            font-size: 12px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin: 5px 0;
+        }
+        .legend-color {
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+            margin-right: 8px;
+        }
+        .drag-info {
+            position: absolute;
+            bottom: 60px;
+            left: 10px;
+            background: rgba(52, 152, 219, 0.9);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 11px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    
+    <div class="control-panel">
+        <div class="control-group">
+            <h3>🎯 PANORAMA Control</h3>
+            <div>
+                <span id="connection-status" class="status-indicator status-disconnected"></span>
+                <span id="status-text">Disconnected</span>
+            </div>
+        </div>
+        
+        <div class="control-group">
+            <h3>📡 SDR Stations</h3>
+            <button onclick="centerOnSDRs()">Center on SDRs</button>
+            <button onclick="toggleSDRLabels()">Toggle Labels</button>
+            <div id="coordinates">No coordinates</div>
+        </div>
+        
+        <div class="control-group">
+            <h3>🎯 Targets</h3>
+            <button onclick="clearTargets()">Clear All</button>
+            <button onclick="exportData()">Export Data</button>
+        </div>
+        
+        <div class="control-group">
+            <h3>🗺️ Map</h3>
+            <button onclick="toggleStyle()">Switch Style</button>
+            <button onclick="resetView()">Reset View</button>
+        </div>
+    </div>
+    
+    <div class="legend">
+        <h4 style="margin: 0 0 10px 0; color: #2c3e50;">Legend</h4>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #e74c3c;"></div>
+            <span>Reference SDR</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #3498db;"></div>
+            <span>Measurement SDR</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #f39c12;"></div>
+            <span>Detected Target</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #9b59b6;"></div>
+            <span>Tracked Target</span>
+        </div>
+    </div>
+    
+    <div class="drag-info" id="drag-info">
+        Drag SDR stations to reposition them
+    </div>
+
+    <script>
+        // Global variables
+        let map;
+        let sdrStations = new Map();
+        let targets = new Map();
+        let isDarkStyle = false;
+        let showLabels = true;
+        let isDragging = false;
+        let draggedStation = null;
+
+        // Map styles
+        const LIGHT_STYLE = 'https://demotiles.maplibre.org/style.json';
+        const DARK_STYLE = {
+            'version': 8,
+            'sources': {
+                'raster-tiles': {
+                    'type': 'raster',
+                    'tiles': ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+                    'tileSize': 256,
+                    'attribution': '&copy; OpenStreetMap contributors'
+                }
+            },
+            'layers': [
+                {
+                    'id': 'simple-tiles',
+                    'type': 'raster',
+                    'source': 'raster-tiles',
+                    'minzoom': 0,
+                    'maxzoom': 22
+                }
+            ]
+        };
+
+        // Check WebGL support
+        function checkWebGLSupport() {
+            try {
+                const canvas = document.createElement('canvas');
+                const context = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+                return !!context;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        // Initialize map with WebGL fallback
+        function initMap() {
+            try {
+                // Check WebGL support
+                if (!checkWebGLSupport()) {
+                    console.warn('WebGL not supported, using fallback mode');
+                    initFallbackMap();
+                    return;
+                }
+
+                map = new maplibregl.Map({
+                    container: 'map',
+                    style: LIGHT_STYLE,
+                    center: [0, 0], // Will be updated when first SDR is added
+                    zoom: 15,
+                    pitch: 0,
+                    bearing: 0,
+                    failIfMajorPerformanceCaveat: false, // Allow software rendering
+                    preserveDrawingBuffer: true
+                });
+
+                map.on('load', function() {
+                    console.log('Map loaded successfully');
+                    setupMapLayers();
+                    setupEventHandlers();
+                    updateConnectionStatus(true);
+                });
+
+                map.on('error', function(e) {
+                    console.error('Map error:', e);
+                    // Try fallback on error
+                    initFallbackMap();
+                });
+
+                // Mouse coordinates (if map exists)
+                map.on('mousemove', function(e) {
+                    const coords = e.lngLat;
+                    document.getElementById('coordinates').innerHTML = 
+                        `Lng: ${coords.lng.toFixed(6)}<br>Lat: ${coords.lat.toFixed(6)}`;
+                });
+
+            } catch (error) {
+                console.error('Failed to initialize MapLibre:', error);
+                initFallbackMap();
+            }
+        }
+
+        // Fallback map implementation
+        function initFallbackMap() {
+            console.log('Initializing fallback map (no WebGL)');
+            
+            const mapContainer = document.getElementById('map');
+            mapContainer.innerHTML = `
+                <div style="
+                    display: flex;
+                    flex-direction: column;
+                    justify-content: center;
+                    align-items: center;
+                    height: 100%;
+                    background: linear-gradient(135deg, #74b9ff 0%, #0984e3 100%);
+                    color: white;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                ">
+                    <div style="text-align: center; padding: 40px;">
+                        <h2 style="margin: 0 0 20px 0;">🗺️ PANORAMA Map</h2>
+                        <p style="margin: 0 0 20px 0; opacity: 0.9;">
+                            WebGL не поддерживается в данном окружении.<br>
+                            Отображение карты недоступно, но система продолжает работать.
+                        </p>
+                        <div id="sdr-list" style="
+                            background: rgba(255,255,255,0.1);
+                            border-radius: 8px;
+                            padding: 20px;
+                            min-width: 300px;
+                        ">
+                            <h3 style="margin: 0 0 15px 0;">SDR Устройства:</h3>
+                            <div id="sdr-items">Нет данных</div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            // Create mock map object for compatibility
+            window.map = {
+                getSource: () => null,
+                setStyle: () => {},
+                setCenter: () => {},
+                setLayoutProperty: () => {},
+                addSource: () => {},
+                addLayer: () => {},
+                getLayer: () => null,
+                removeLayer: () => {},
+                on: () => {},
+                off: () => {},
+                flyTo: () => {}
+            };
+            
+            updateConnectionStatus(true);
+        }
+
+        // Setup map layers for SDRs and targets
+        function setupMapLayers() {
+            if (!map || !map.getSource) return;
+            
+            try {
+                // SDR stations layer
+                map.addSource('sdr-stations', {
+                    type: 'geojson',
+                    data: {
+                        type: 'FeatureCollection',
+                        features: []
+                    }
+                });
+
+            // SDR circles (for better visibility)
+            map.addLayer({
+                id: 'sdr-circles',
+                type: 'circle',
+                source: 'sdr-stations',
+                paint: {
+                    'circle-radius': [
+                        'case',
+                        ['==', ['get', 'is_reference'], true], 15, 12
+                    ],
+                    'circle-color': [
+                        'case',
+                        ['==', ['get', 'is_reference'], true], '#e74c3c', '#3498db'
+                    ],
+                    'circle-stroke-width': 2,
+                    'circle-stroke-color': '#ffffff',
+                    'circle-opacity': 0.8
+                }
+            });
+
+            // SDR labels
+            map.addLayer({
+                id: 'sdr-labels',
+                type: 'symbol',
+                source: 'sdr-stations',
+                layout: {
+                    'text-field': ['get', 'label'],
+                    'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+                    'text-size': 11,
+                    'text-offset': [0, 2],
+                    'text-anchor': 'top'
+                },
+                paint: {
+                    'text-color': '#2c3e50',
+                    'text-halo-color': '#ffffff',
+                    'text-halo-width': 1
+                }
+            });
+
+            // Targets layer
+            map.addSource('targets', {
+                type: 'geojson',
+                data: {
+                    type: 'FeatureCollection',
+                    features: []
+                }
+            });
+
+            map.addLayer({
+                id: 'targets',
+                type: 'circle',
+                source: 'targets',
+                paint: {
+                    'circle-radius': [
+                        'case',
+                        ['==', ['get', 'type'], 'tracked'], 10, 8
+                    ],
+                    'circle-color': [
+                        'case',
+                        ['==', ['get', 'type'], 'tracked'], '#9b59b6', '#f39c12'
+                    ],
+                    'circle-stroke-width': 2,
+                    'circle-stroke-color': '#ffffff',
+                    'circle-opacity': 0.9
+                }
+            });
+
+            // Target labels
+            map.addLayer({
+                id: 'target-labels',
+                type: 'symbol',
+                source: 'targets',
+                layout: {
+                    'text-field': ['get', 'label'],
+                    'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+                    'text-size': 10,
+                    'text-offset': [0, 2],
+                    'text-anchor': 'top'
+                },
+                paint: {
+                    'text-color': '#2c3e50',
+                    'text-halo-color': '#ffffff',
+                    'text-halo-width': 1
+                }
+            });
+            
+            } catch (error) {
+                console.error('Error setting up map layers:', error);
+            }
+        }
+
+        // Setup event handlers
+        function setupEventHandlers() {
+            if (!map || !map.on) return;
+            
+            try {
+                // SDR station hover and drag
+                map.on('mouseenter', 'sdr-circles', function() {
+                map.getCanvas().style.cursor = 'move';
+                document.getElementById('drag-info').style.display = 'block';
+            });
+
+            map.on('mouseleave', 'sdr-circles', function() {
+                if (!isDragging) {
+                    map.getCanvas().style.cursor = '';
+                    document.getElementById('drag-info').style.display = 'none';
+                }
+            });
+
+            // SDR drag functionality
+            map.on('mousedown', 'sdr-circles', function(e) {
+                e.preventDefault();
+                const feature = e.features[0];
+                
+                if (feature.properties.is_reference) {
+                    // Don't allow dragging reference station
+                    return;
+                }
+
+                isDragging = true;
+                draggedStation = feature.properties.id;
+                map.getCanvas().style.cursor = 'grabbing';
+
+                map.on('mousemove', onDrag);
+                map.once('mouseup', onDragEnd);
+            });
+
+            function onDrag(e) {
+                if (!isDragging || !draggedStation) return;
+                
+                const coords = [e.lngLat.lng, e.lngLat.lat];
+                updateSDRPosition(draggedStation, coords);
+            }
+
+            function onDragEnd() {
+                isDragging = false;
+                draggedStation = null;
+                map.getCanvas().style.cursor = '';
+                document.getElementById('drag-info').style.display = 'none';
+                map.off('mousemove', onDrag);
+                
+                // Emit position update to Python
+                emitSDRPositionsUpdate();
+            }
+
+            // Popup for SDR stations
+            map.on('click', 'sdr-circles', function(e) {
+                if (isDragging) return;
+                
+                const feature = e.features[0];
+                const props = feature.properties;
+                
+                const popup = new maplibregl.Popup()
+                    .setLngLat(e.lngLat)
+                    .setHTML(`
+                        <div class="sdr-info">
+                            <strong>📡 ${props.label}</strong><br>
+                            <div>Role: ${props.is_reference ? 'Reference' : 'Measurement'}</div>
+                            <div>Position: (${props.x}m, ${props.y}m, ${props.z}m)</div>
+                            <div>Coordinates: ${e.lngLat.lng.toFixed(6)}, ${e.lngLat.lat.toFixed(6)}</div>
+                            ${!props.is_reference ? '<div style="color: #3498db; font-size: 11px; margin-top: 5px;">💡 Drag to reposition</div>' : ''}
+                        </div>
+                    `)
+                    .addTo(map);
+            });
+
+            // Popup for targets
+            map.on('click', 'targets', function(e) {
+                const feature = e.features[0];
+                const props = feature.properties;
+                
+                const popup = new maplibregl.Popup()
+                    .setLngLat(e.lngLat)
+                    .setHTML(`
+                        <div class="sdr-info">
+                            <strong>🎯 ${props.label}</strong><br>
+                            <div>Type: ${props.type === 'tracked' ? 'Tracked Target' : 'Detected Target'}</div>
+                            <div>Frequency: ${props.frequency || 'Unknown'} MHz</div>
+                            <div>Confidence: ${props.confidence || 'Unknown'}</div>
+                            <div>Position: (${props.x}m, ${props.y}m, ${props.z}m)</div>
+                            <div>Time: ${props.timestamp || 'Unknown'}</div>
+                        </div>
+                    `)
+                    .addTo(map);
+            });
+            
+            } catch (error) {
+                console.error('Error setting up event handlers:', error);
+            }
+        }
+
+        // Convert local coordinates to geographic coordinates
+        function localToGeoCoords(x, y, referencePoint = [0, 0]) {
+            // Simple conversion: 1 meter ≈ 0.00001 degrees (approximate)
+            const scale = 0.00001;
+            return [
+                referencePoint[0] + (x * scale),
+                referencePoint[1] + (y * scale)
+            ];
+        }
+
+        // Convert geographic coordinates to local coordinates
+        function geoCoordsToLocal(lng, lat, referencePoint = [0, 0]) {
+            const scale = 0.00001;
+            return [
+                (lng - referencePoint[0]) / scale,
+                (lat - referencePoint[1]) / scale
+            ];
+        }
+
+        // Add or update SDR station
+        function addOrUpdateSDRStation(data) {
+            const coords = localToGeoCoords(data.x, data.y);
+            
+            const feature = {
+                type: 'Feature',
+                geometry: {
+                    type: 'Point',
+                    coordinates: coords
+                },
+                properties: {
+                    id: data.id,
+                    label: data.id,
+                    x: data.x,
+                    y: data.y,
+                    z: data.z || 0,
+                    is_reference: data.is_reference || false,
+                    role: data.role || 'measurement'
+                }
+            };
+
+            sdrStations.set(data.id, feature);
+            updateSDRLayer();
+            
+            // Center map on first SDR
+            if (sdrStations.size === 1 && map && map.setCenter) {
+                map.setCenter(coords);
+                map.setZoom(16);
+            }
+            
+            console.log(`Updated SDR station: ${data.id} at (${data.x}, ${data.y})`);
+        }
+
+        // Update SDR position during drag
+        function updateSDRPosition(stationId, newCoords) {
+            const station = sdrStations.get(stationId);
+            if (!station) return;
+
+            // Update coordinates
+            station.geometry.coordinates = newCoords;
+            
+            // Convert back to local coordinates
+            const localCoords = geoCoordsToLocal(newCoords[0], newCoords[1]);
+            station.properties.x = localCoords[0];
+            station.properties.y = localCoords[1];
+
+            updateSDRLayer();
+        }
+
+        // Update SDR layer on map
+        function updateSDRLayer() {
+            if (!map || !map.getSource) return;
+            
+            try {
+                const source = map.getSource('sdr-stations');
+                if (source) {
+                    const features = Array.from(sdrStations.values());
+                    source.setData({
+                        type: 'FeatureCollection',
+                        features: features
+                    });
+                }
+            } catch (error) {
+                console.error('Error updating SDR layer:', error);
+            }
+        }
+
+        // Add or update target
+        function addOrUpdateTarget(data) {
+            const coords = localToGeoCoords(data.x, data.y);
+            
+            const feature = {
+                type: 'Feature',
+                geometry: {
+                    type: 'Point',
+                    coordinates: coords
+                },
+                properties: {
+                    id: data.id || `target_${Date.now()}`,
+                    label: data.label || `Target ${data.frequency || ''}MHz`,
+                    x: data.x,
+                    y: data.y,
+                    z: data.z || 0,
+                    type: data.type || 'detected',
+                    frequency: data.frequency,
+                    confidence: data.confidence,
+                    timestamp: data.timestamp
+                }
+            };
+
+            targets.set(feature.properties.id, feature);
+            updateTargetsLayer();
+            
+            console.log(`Updated target: ${feature.properties.id} at (${data.x}, ${data.y})`);
+        }
+
+        // Update targets layer on map
+        function updateTargetsLayer() {
+            if (!map || !map.getSource) return;
+            
+            try {
+                const source = map.getSource('targets');
+                if (source) {
+                    const features = Array.from(targets.values());
+                    source.setData({
+                        type: 'FeatureCollection',
+                        features: features
+                    });
+                }
+            } catch (error) {
+                console.error('Error updating targets layer:', error);
+            }
+        }
+
+        // Emit SDR positions update to Python
+        function emitSDRPositionsUpdate() {
+            const positions = {};
+            sdrStations.forEach((station, id) => {
+                positions[id] = {
+                    x: station.properties.x,
+                    y: station.properties.y,
+                    z: station.properties.z
+                };
+            });
+            
+            // Send to Python via Qt bridge
+            if (window.qt && window.qt.webChannelTransport) {
+                window.mapInterface.updateSDRPositions(JSON.stringify(positions));
+            }
+            
+            console.log('Updated SDR positions:', positions);
+        }
+
+        // Control functions
+        function centerOnSDRs() {
+            if (sdrStations.size === 0 || !map || !map.fitBounds) return;
+            
+            try {
+                const bounds = new maplibregl.LngLatBounds();
+                sdrStations.forEach(station => {
+                    bounds.extend(station.geometry.coordinates);
+                });
+                
+                map.fitBounds(bounds, { padding: 50 });
+            } catch (error) {
+                console.error('Error centering on SDRs:', error);
+            }
+        }
+
+        function toggleSDRLabels() {
+            if (!map || !map.setLayoutProperty) return;
+            
+            try {
+                showLabels = !showLabels;
+                map.setLayoutProperty('sdr-labels', 'visibility', showLabels ? 'visible' : 'none');
+                map.setLayoutProperty('target-labels', 'visibility', showLabels ? 'visible' : 'none');
+            } catch (error) {
+                console.error('Error toggling SDR labels:', error);
+            }
+        }
+
+        function clearTargets() {
+            targets.clear();
+            updateTargetsLayer();
+        }
+
+        function exportData() {
+            const data = {
+                sdr_stations: Array.from(sdrStations.values()),
+                targets: Array.from(targets.values()),
+                timestamp: new Date().toISOString()
+            };
+            
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `panorama_map_data_${Date.now()}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        function toggleStyle() {
+            if (!map || !map.setStyle) return;
+            
+            try {
+                isDarkStyle = !isDarkStyle;
+                map.setStyle(isDarkStyle ? DARK_STYLE : LIGHT_STYLE);
+                
+                // Re-add layers after style change
+                map.once('styledata', function() {
+                    setupMapLayers();
+                    updateSDRLayer();
+                    updateTargetsLayer();
+                });
+            } catch (error) {
+                console.error('Error toggling style:', error);
+            }
+        }
+
+        function resetView() {
+            if (!map || !map.setCenter) return;
+            
+            try {
+                map.setCenter([0, 0]);
+                map.setZoom(15);
+                map.setPitch(0);
+                map.setBearing(0);
+            } catch (error) {
+                console.error('Error resetting view:', error);
+            }
+        }
+
+        function updateConnectionStatus(connected) {
+            const statusIndicator = document.getElementById('connection-status');
+            const statusText = document.getElementById('status-text');
+            
+            if (connected) {
+                statusIndicator.className = 'status-indicator status-connected';
+                statusText.textContent = 'Connected';
+            } else {
+                statusIndicator.className = 'status-indicator status-disconnected';
+                statusText.textContent = 'Disconnected';
+            }
+        }
+
+        // API for Python integration
+        window.mapAPI = {
+            addOrUpdateSDR: addOrUpdateSDRStation,
+            addOrUpdateTarget: addOrUpdateTarget,
+            clearTargets: clearTargets,
+            centerOnSDRs: centerOnSDRs,
+            updateConnectionStatus: updateConnectionStatus
+        };
+
+        // Initialize map when page loads
+        document.addEventListener('DOMContentLoaded', function() {
+            initMap();
+        });
+
+        // Handle messages from Python
+        window.addEventListener('message', function(event) {
+            const data = event.data;
+            
+            switch(data.type) {
+                case 'update_sdr':
+                    addOrUpdateSDRStation(data.data);
+                    break;
+                case 'update_target':
+                    addOrUpdateTarget(data.data);
+                    break;
+                case 'clear_targets':
+                    clearTargets();
+                    break;
+                case 'center_map':
+                    centerOnSDRs();
+                    break;
+                default:
+                    console.log('Unknown message type:', data.type);
+            }
+        });
+    </script>
+</body>
+</html>

@@ -459,6 +459,7 @@ class PeakWatchlistManager(QObject):
     def _add_to_watchlist(self, peak: VideoSignalPeak, span_hz: float):
         """
         Добавляет пик в watchlist для мониторинга slave устройствами.
+        Использует F_max или centroid в зависимости от center_mode.
         """
         # Проверяем лимит watchlist
         if len(self.watchlist) >= self.max_watchlist_size:
@@ -467,13 +468,21 @@ class PeakWatchlistManager(QObject):
                           key=lambda k: self.watchlist[k].created_at)
             del self.watchlist[oldest_id]
 
+        # Выбираем центр для RSSI окна в зависимости от режима
+        if self.center_mode == 'centroid' and peak.centroid_freq_hz > 0.0:
+            rssi_center_hz = peak.centroid_freq_hz
+            print(f"[Watchlist] Using centroid center: {rssi_center_hz/1e6:.3f} MHz")
+        else:
+            rssi_center_hz = peak.center_freq_hz  # F_max
+            print(f"[Watchlist] Using F_max center: {rssi_center_hz/1e6:.3f} MHz")
+
         # Создаем запись watchlist
         entry = WatchlistEntry(
             peak_id=peak.id,
-            center_freq_hz=peak.center_freq_hz,
+            center_freq_hz=rssi_center_hz,  # Используем выбранный центр
             span_hz=span_hz,
-            freq_start_hz=peak.center_freq_hz - span_hz/2,
-            freq_stop_hz=peak.center_freq_hz + span_hz/2,
+            freq_start_hz=rssi_center_hz - span_hz/2,
+            freq_stop_hz=rssi_center_hz + span_hz/2,
             created_at=time.time(),
             last_update=time.time()
         )

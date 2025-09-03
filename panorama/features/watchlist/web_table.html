@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ПАНОРАМА матрица</title>
+    <script type="text/javascript" src="qrc:///qtwebchannel/qwebchannel.js"></script>
+    <style>
+        :root {
+            --primary-color: #2c3e50;
+            --secondary-color: #546e7a;
+            --success-color: #4caf50;
+            --warning-color: #ff9800;
+            --danger-color: #f44336;
+            --light-bg: #fafafa;
+            --dark-bg: #37474f;
+            --border-color: #e0e0e0;
+            --text-color: #212121;
+            --muted-color: #757575;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--light-bg);
+            color: var(--text-color);
+            line-height: 1.6;
+            padding: 10px;
+        }
+
+        .container {
+            max-width: 100%;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            backdrop-filter: blur(10px);
+        }
+
+        .header h1 {
+            color: var(--primary-color);
+            margin-bottom: 10px;
+            font-size: 24px;
+        }
+
+        .status-bar {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: var(--light-bg);
+            border-radius: 6px;
+            font-size: 14px;
+        }
+
+        .status-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        .status-connected { background-color: var(--success-color); }
+        .status-measuring { background-color: var(--warning-color); }
+        .status-disconnected { background-color: var(--danger-color); }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .controls {
+            background: white;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        }
+
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.3s ease;
+            font-weight: 500;
+        }
+
+        .btn-primary {
+            background: var(--secondary-color);
+            color: white;
+        }
+
+        .btn-success {
+            background: var(--success-color);
+            color: white;
+        }
+
+        .btn-warning {
+            background: var(--warning-color);
+            color: white;
+        }
+
+        .btn-danger {
+            background: var(--danger-color);
+            color: white;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
+
+        .rssi-matrix {
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+
+        .table-container {
+            overflow-x: auto;
+            max-height: 60vh;
+            overflow-y: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+
+        th {
+            background: var(--primary-color);
+            color: white;
+            padding: 12px 8px;
+            text-align: center;
+            font-weight: 600;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+
+        td {
+            padding: 8px;
+            text-align: center;
+            border-bottom: 1px solid #eee;
+            position: relative;
+            transition: all 0.3s ease;
+        }
+
+        tr:hover td {
+            background-color: #f8f9fa;
+        }
+
+        .freq-cell {
+            font-weight: 600;
+            color: var(--primary-color);
+            text-align: left;
+            min-width: 100px;
+        }
+
+        .rssi-cell {
+            min-width: 80px;
+            font-weight: 600;
+            position: relative;
+        }
+
+        .rssi-good { 
+            background: linear-gradient(135deg, #27ae60, #2ecc71);
+            color: white;
+        }
+
+        .rssi-medium { 
+            background: linear-gradient(135deg, #f39c12, #e67e22);
+            color: white;
+        }
+
+        .rssi-poor { 
+            background: linear-gradient(135deg, #e74c3c, #c0392b);
+            color: white;
+        }
+
+        .rssi-none {
+            background: #ecf0f1;
+            color: var(--muted-color);
+        }
+
+        .confidence-cell {
+            font-weight: 600;
+        }
+
+        .confidence-high { color: var(--success-color); }
+        .confidence-medium { color: var(--warning-color); }
+        .confidence-low { color: var(--danger-color); }
+
+        .timestamp-cell {
+            color: var(--muted-color);
+            font-size: 11px;
+        }
+
+        .stats {
+            background: white;
+            border-radius: 10px;
+            padding: 15px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+
+        .stat-item {
+            text-align: center;
+            padding: 10px;
+            background: var(--light-bg);
+            border-radius: 6px;
+        }
+
+        .stat-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--secondary-color);
+            margin-bottom: 5px;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: var(--muted-color);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: var(--muted-color);
+        }
+
+        .empty-state img {
+            width: 64px;
+            height: 64px;
+            opacity: 0.5;
+            margin-bottom: 15px;
+        }
+
+        .tooltip {
+            position: absolute;
+            background: rgba(0,0,0,0.9);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 11px;
+            pointer-events: none;
+            z-index: 1000;
+            opacity: 0;
+            transition: opacity 0.2s;
+            max-width: 200px;
+        }
+
+        .updating {
+            animation: glow 1s infinite alternate;
+        }
+
+        @keyframes glow {
+            from { box-shadow: 0 0 5px rgba(52, 152, 219, 0.5); }
+            to { box-shadow: 0 0 15px rgba(52, 152, 219, 0.8); }
+        }
+
+        .new-data {
+            animation: highlight 2s ease-in-out;
+        }
+
+        @keyframes highlight {
+            0% { background-color: rgba(52, 152, 219, 0.3); }
+            100% { background-color: transparent; }
+        }
+
+        @media (max-width: 768px) {
+            .header h1 { font-size: 20px; }
+            .status-bar { flex-direction: column; align-items: stretch; }
+            .control-group { flex-direction: column; }
+            table { font-size: 11px; }
+            th, td { padding: 6px 4px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>ПАНОРАМА матрица</h1>
+            <div class="status-bar">
+                <div class="status-item">
+                    <div id="connection-status" class="status-indicator status-disconnected"></div>
+                    <span id="connection-text">Отключено</span>
+                </div>
+                <div class="status-item">
+                    <div id="measurement-status" class="status-indicator status-disconnected"></div>
+                    <span id="measurement-text">Бездействие</span>
+                </div>
+                <div class="status-item">
+                    <span id="last-update">Нет обновлений</span>
+                </div>
+                <div class="status-item">
+                    <span id="update-rate">0 Гц</span>
+                </div>
+            </div>
+        </div>
+        <!-- Управление скрыто: система работает автономно -->
+
+        <div class="rssi-matrix">
+            <div class="table-container">
+                <table id="rssi-table">
+                    <thead>
+                        <tr>
+                            <th>Диапазон</th>
+                            <th title="RMS от Slave 0">RMS1</th>
+                            <th title="RMS от Slave 1">RMS2</th>
+                            <th title="RMS от Slave 2">RMS3</th>
+                            <th>Уверенность</th>
+                            <th>Действия</th>
+                        </tr>
+                    </thead>
+                    <tbody id="rssi-tbody">
+                        <tr>
+                            <td colspan="6" class="empty-state">
+                                <div>🔍 Нет доступных измерений</div>
+                                <div style="font-size: 12px; margin-top: 10px;">Ожидание данных SDR...</div>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Блок статистики под таблицей удалён по требованиям -->
+    </div>
+
+    <div class="tooltip" id="tooltip"></div>
+
+    <script>
+        // Global state
+        let measurementData = new Map();
+        let isConnected = false;
+        let isMeasuring = false;
+        let updateCount = 0;
+        let lastUpdateTime = Date.now();
+        let updateRate = 0;
+
+        // Update rate calculation
+        setInterval(() => {
+            const now = Date.now();
+            const timeDiff = (now - lastUpdateTime) / 1000;
+            updateRate = timeDiff > 0 ? (updateCount / timeDiff).toFixed(1) : 0;
+            updateCount = 0;
+            lastUpdateTime = now;
+            
+            const rate = document.getElementById('update-rate');
+            if (rate) rate.textContent = `${updateRate} Гц`;
+        }, 2000);
+
+        // Connection status
+        function updateConnectionStatus(connected) {
+            isConnected = connected;
+            const indicator = document.getElementById('connection-status');
+            const text = document.getElementById('connection-text');
+            
+            if (connected) {
+                indicator.className = 'status-indicator status-connected';
+                text.textContent = 'Подключено';
+            } else {
+                indicator.className = 'status-indicator status-disconnected';
+                text.textContent = 'Отключено';
+            }
+        }
+
+        // Measurement status
+        function updateMeasurementStatus(measuring) {
+            isMeasuring = measuring;
+            const indicator = document.getElementById('measurement-status');
+            const text = document.getElementById('measurement-text');
+            
+            if (measuring) {
+                indicator.className = 'status-indicator status-measuring';
+                text.textContent = 'Измерение';
+            } else {
+                indicator.className = 'status-indicator status-connected';
+                text.textContent = 'Бездействие';
+            }
+        }
+
+        // Add or update measurement data
+        function addOrUpdateMeasurement(data) {
+            updateCount++;
+            // Ключ — диапазон вида "f1-f2" если есть, иначе частота
+            const rangeKey = data.range || `${(data.freq_mhz || data.frequency || 0 - (data.span||5)/2).toFixed(1)}-${(data.freq_mhz || data.frequency || 0 + (data.span||5)/2).toFixed(1)}`;
+            const prev = measurementData.get(rangeKey) || {};
+            measurementData.set(rangeKey, {
+                rssi: {...(prev.rssi||{}), ...(data.rssi||{})},
+                confidence: data.confidence ?? prev.confidence ?? 0,
+                timestamp: Date.now(),
+                peak_id: data.peak_id || prev.peak_id || rangeKey
+            });
+            renderTable();
+            updateStats();
+            updateLastUpdateTime();
+        }
+
+        // Update RSSI data
+        function updateRSSI(peakId, slaveId, rssiValue) {
+            // Автообновление всегда включено в автономном режиме
+            
+            updateCount++;
+            
+            for (let [key, measurement] of measurementData) {
+                if (measurement.peak_id === peakId) {
+                    if (!measurement.rssi) measurement.rssi = {};
+                    measurement.rssi[slaveId] = rssiValue;
+                    measurement.timestamp = Date.now();
+                    
+                    renderTable();
+                    updateStats();
+                    updateLastUpdateTime();
+                    break;
+                }
+            }
+        }
+
+        // Get RSSI color class
+        function getRSSIColorClass(rssi) {
+            const threshold = -80; // фиксированный порог для раскраски
+            
+            if (rssi === null || rssi === undefined || rssi === '—') {
+                return 'rssi-none';
+            }
+            
+            const value = parseFloat(rssi);
+            if (value >= threshold + 20) return 'rssi-good';
+            if (value >= threshold + 10) return 'rssi-medium';
+            return 'rssi-poor';
+        }
+
+        // Get confidence class
+        function getConfidenceClass(confidence) {
+            if (confidence >= 0.8) return 'confidence-high';
+            if (confidence >= 0.5) return 'confidence-medium';
+            return 'confidence-low';
+        }
+
+        // Render table
+        function renderTable() {
+            const tbody = document.getElementById('rssi-tbody');
+            
+            if (measurementData.size === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="6" class="empty-state">
+                            <div>🔍 Нет доступных измерений</div>
+                            <div style="font-size: 12px; margin-top: 10px;">Ожидание данных SDR...</div>
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
+
+            const rows = Array.from(measurementData.entries())
+                .sort((a, b) => b[1].timestamp - a[1].timestamp)
+                .map(([rangeStr, m]) => {
+                    const r0 = m.rssi?.slave0 ?? m.rssi?.['0'] ?? '—';
+                    const r1 = m.rssi?.slave1 ?? m.rssi?.['1'] ?? '—';
+                    const r2 = m.rssi?.slave2 ?? m.rssi?.['2'] ?? '—';
+                    const confidence = m.confidence ? `${(m.confidence * 100).toFixed(1)}%` : '—';
+                    return `
+                        <tr class="new-data" data-peak-id="${m.peak_id || 'unknown'}">
+                            <td class="freq-cell">${rangeStr}</td>
+                            <td class="rssi-cell ${getRSSIColorClass(r0)}" title="RMS от Slave 0">${typeof r0==='number'? r0.toFixed(1):'—'}</td>
+                            <td class="rssi-cell ${getRSSIColorClass(r1)}" title="RMS от Slave 1">${typeof r1==='number'? r1.toFixed(1):'—'}</td>
+                            <td class="rssi-cell ${getRSSIColorClass(r2)}" title="RMS от Slave 2">${typeof r2==='number'? r2.toFixed(1):'—'}</td>
+                            <td class="${getConfidenceClass(m.confidence)}">${confidence}</td>
+                            <td>
+                                <button class="btn btn-primary" style="padding: 4px 8px; font-size: 10px;" 
+                                        onclick="showOnMap('${m.peak_id || 'unknown'}')">Map</button>
+                            </td>
+                        </tr>
+                    `;
+                }).join('');
+
+            tbody.innerHTML = rows;
+
+            // Remove animation after a short delay
+            setTimeout(() => {
+                document.querySelectorAll('.new-data').forEach(el => {
+                    el.classList.remove('new-data');
+                });
+            }, 2000);
+        }
+
+        // Update statistics
+        function updateStats() {
+            const totalTargets = measurementData.size;
+            const activeTargets = Array.from(measurementData.values())
+                .filter(m => Date.now() - m.timestamp < 10000).length; // Active in last 10s
+            
+            const allRSSI = [];
+            measurementData.forEach(measurement => {
+                if (measurement.rssi) {
+                    Object.values(measurement.rssi).forEach(rssi => {
+                        if (typeof rssi === 'number') allRSSI.push(rssi);
+                    });
+                }
+            });
+            
+            const avgRSSI = allRSSI.length > 0 ? 
+                (allRSSI.reduce((a, b) => a + b, 0) / allRSSI.length).toFixed(1) + ' dBm' : 
+                '— dBm';
+
+            document.getElementById('total-targets').textContent = totalTargets;
+            document.getElementById('active-measurements').textContent = activeTargets;
+            document.getElementById('avg-rssi').textContent = avgRSSI;
+        }
+
+        // Update last update time
+        function updateLastUpdateTime() {
+            const lastUpdate = document.getElementById('last-update');
+            if (lastUpdate) {
+                lastUpdate.textContent = `Обновлено: ${new Date().toLocaleTimeString()}`;
+            }
+        }
+
+        // Control functions
+        function startMeasurement() {
+            updateMeasurementStatus(true);
+            if (window.pyInterface) {
+                window.pyInterface.startMeasurement();
+            }
+        }
+
+        function pauseMeasurement() {
+            updateMeasurementStatus(false);
+            if (window.pyInterface) {
+                window.pyInterface.pauseMeasurement();
+            }
+        }
+
+        function clearData() {
+            measurementData.clear();
+            renderTable();
+            updateStats();
+            if (window.pyInterface) {
+                window.pyInterface.clearData();
+            }
+        }
+
+        function exportData() {
+            const data = Array.from(measurementData.values());
+            const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `panorama_rssi_${Date.now()}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        function centerMap() {
+            if (window.pyInterface) {
+                window.pyInterface.centerMap();
+            }
+        }
+
+        function showOnMap(peakId) {
+            if (window.pyInterface) {
+                window.pyInterface.showOnMap(peakId);
+            }
+        }
+
+        // RSSI threshold change handler
+        // Порог фиксирован, обработчик не нужен
+
+        // Initialize
+        updateConnectionStatus(false);
+        updateMeasurementStatus(false);
+        renderTable();
+
+        // API for Python integration
+        window.tableAPI = {
+            updateConnection: updateConnectionStatus,
+            updateMeasurementStatus: updateMeasurementStatus,
+            addMeasurement: addOrUpdateMeasurement,
+            updateRSSI: updateRSSI,
+            clearData: clearData
+        };
+
+        // QWebChannel integration
+        window.pyBridge = null;
+        
+        // QWebChannel setup (if available)
+        if (typeof QWebChannel !== 'undefined') {
+            new QWebChannel(qt.webChannelTransport, function(channel) {
+                window.pyBridge = channel.objects.pyBridge;
+                console.log('QWebChannel bridge connected');
+            });
+        }
+        
+        // API functions for Python communication
+        function updateRSSIData(rssiData) {
+            // rssiData: {"f1-f2": {slave0: -50, slave1: -60, ...}}
+            measurementData.clear();
+            const now = Date.now();
+            for (const [rangeStr, slaveData] of Object.entries(rssiData)) {
+                measurementData.set(rangeStr, {
+                    rssi: slaveData,
+                    timestamp: now,
+                    peak_id: rangeStr
+                });
+            }
+            renderTable();
+            updateStats();
+        }
+        
+        function updateSlavesInfo(slavesInfo) {
+            // Store slaves information for display
+            window.slavesInfo = slavesInfo;
+            renderTable();
+        }
+        
+        function updateTargetsInfo(targetsInfo) {
+            // Добавляем уверенность при наличии
+            for (const [rangeStr, info] of Object.entries(targetsInfo||{})) {
+                const row = measurementData.get(rangeStr) || {};
+                row.confidence = info.confidence ?? row.confidence ?? 0;
+                row.peak_id = info.peak_id || row.peak_id || rangeStr;
+                row.timestamp = Date.now();
+                measurementData.set(rangeStr, row);
+            }
+            renderTable();
+            updateStats();
+        }
+        
+        function updatePerformanceStats(stats) {
+            // Статистика удалена из UI, но обновляем время если элемент есть
+            if (stats.last_update) {
+                const lastUpdate = document.getElementById('last-update');
+                if (lastUpdate) {
+                    lastUpdate.textContent = `Обновлено: ${stats.last_update}`;
+                }
+            }
+        }
+        
+        function setTheme(theme) {
+            document.body.className = theme === 'dark' ? 'dark-theme' : '';
+        }
+        
+        function setColorScheme(scheme) {
+            // Color scheme changes can be implemented here
+            window.currentColorScheme = scheme;
+            renderTable(); // Re-render with new colors
+        }
+        
+        function clearAllData() {
+            measurementData.clear();
+            renderTable();
+            updateStats();
+        }
+        
+        // Export functions
+        window.updateRSSIData = updateRSSIData;
+        window.updateSlavesInfo = updateSlavesInfo;
+        window.updateTargetsInfo = updateTargetsInfo;
+        window.updatePerformanceStats = updatePerformanceStats;
+        window.setTheme = setTheme;
+        window.setColorScheme = setColorScheme;
+        window.clearAllData = clearAllData;
+
+        // Handle messages from Python
+        window.addEventListener('message', function(event) {
+            const data = event.data;
+            
+            switch(data.type) {
+                case 'connection_status':
+                    updateConnectionStatus(data.connected);
+                    break;
+                case 'measurement_status':
+                    updateMeasurementStatus(data.measuring);
+                    break;
+                case 'new_measurement':
+                    addOrUpdateMeasurement(data.data);
+                    break;
+                case 'rssi_update':
+                    updateRSSI(data.peak_id, data.slave_id, data.rssi);
+                    break;
+                case 'clear_data':
+                    clearData();
+                    break;
+                default:
+                    console.log('Unknown message type:', data.type);
+            }
+        });
+    </script>
+</body>
+</html>

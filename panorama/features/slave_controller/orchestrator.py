@@ -142,6 +142,17 @@ class Orchestrator(QObject):
                 best_peak_id = pid
         if best_peak_id is not None and best_delta <= 1e3:
             return best_peak_id
+        
+        # Если не найдено в карте, ищем в watchlist напрямую с увеличенным допуском
+        if self.trilateration_coordinator and hasattr(self.trilateration_coordinator, 'peak_manager'):
+            for entry in self.trilateration_coordinator.peak_manager.watchlist.values():
+                delta = abs(entry.center_freq_hz - center_hz)
+                if delta < best_delta and delta <= 5e3:  # 5 кГц допуск
+                    best_delta = delta
+                    best_peak_id = entry.peak_id
+            if best_peak_id is not None:
+                return best_peak_id
+                
         return None
 
     # ─────────────────────── public API (UI) ───────────────────────
@@ -363,11 +374,22 @@ class Orchestrator(QObject):
                         for m in meas_list:
                             peak_id_any = self._get_peak_id_for_freq(m.center_hz)
                             if peak_id_any:
+                                self.log.debug(f"Updating RSSI for peak_id={peak_id_any}, slave={m.slave_id}, rssi={m.band_rssi_dbm:.1f} dBm")
                                 self.trilateration_coordinator.peak_manager.update_rssi_measurement(
                                     peak_id_any, m.slave_id, m.band_rssi_dbm
                                 )
-                except Exception:
-                    pass
+                            else:
+                                self.log.warning(f"No peak_id found for freq {m.center_hz/1e6:.1f} MHz from slave {m.slave_id}")
+                                # Попробуем найти с большим допуском
+                                for entry in list(self.trilateration_coordinator.peak_manager.watchlist.values()):
+                                    if abs(m.center_hz - entry.center_freq_hz) < 5e3:  # 5 кГц допуск
+                                        self.log.info(f"Found close match: peak_id={entry.peak_id} for freq {m.center_hz/1e6:.1f} MHz")
+                                        self.trilateration_coordinator.peak_manager.update_rssi_measurement(
+                                            entry.peak_id, m.slave_id, m.band_rssi_dbm
+                                        )
+                                        break
+                except Exception as e:
+                    self.log.error(f"Error updating RSSI measurements: {e}")
 
                 # триггерим трилатерацию только если >= 3 slaves отдали валидные данные
                 valid = [m for m in meas_list if m.snr_db >= self.min_snr_threshold and m.flags.get("valid", True)]

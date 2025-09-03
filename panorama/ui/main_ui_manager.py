@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                             QTableWidgetItem, QComboBox, QCheckBox, QSplitter, 
                             QFrame, QMessageBox, QFileDialog, QFormLayout)
 
-from panorama.ui import SpectrumView, ImprovedSlavesView, OpenLayersMapWidget
+from panorama.ui import SpectrumView, ImprovedSlavesView, MapLibreWidget
 from panorama.features.spectrum.master_adapter import MasterSourceAdapter
 
 
@@ -39,7 +39,7 @@ class PanoramaUI(QObject):
         self.log = logger or logging.getLogger(__name__)
         
         # Ссылки на основные виджеты
-        self.map_view: Optional[OpenLayersMapWidget] = None
+        self.map_view: Optional[MapLibreWidget] = None
         self.spectrum_view: Optional[SpectrumView] = None
         self.slaves_view: Optional[ImprovedSlavesView] = None
     
@@ -121,7 +121,7 @@ class PanoramaUI(QObject):
         tab_widget = QTabWidget()
         
         # Вкладка карты
-        self.map_view = OpenLayersMapWidget()
+        self.map_view = MapLibreWidget()
         tab_widget.addTab(self.map_view, "🗺️ Карта")
         
         # Вкладка спектра
@@ -212,7 +212,7 @@ class PanoramaUI(QObject):
         except Exception as e:
             self.log.error(f"Error updating stations from config: {e}")
     
-    def get_map_view(self) -> Optional[OpenLayersMapWidget]:
+    def get_map_view(self) -> Optional[MapLibreWidget]:
         """Возвращает виджет карты."""
         return self.map_view
     

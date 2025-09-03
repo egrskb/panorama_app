@@ -13,7 +13,7 @@ from pathlib import Path
 from PyQt5.QtCore import QObject, pyqtSignal, QTimer
 
 from .config import MapConfig, StationConfig, VisualizationMode
-from .openlayers_widget_v10 import OpenLayersMapWidget
+from .maplibre_widget import MapLibreWidget
 
 
 logger = logging.getLogger(__name__)
@@ -207,7 +207,7 @@ class MapManager(QObject):
         
         # Компоненты
         self.data_manager = MapDataManager(self.config)
-        self.widget: Optional[OpenLayersMapWidget] = None
+        self.widget: Optional[MapLibreWidget] = None
         
         # Состояние
         self._is_initialized = False
@@ -218,10 +218,10 @@ class MapManager(QObject):
         
         logger.info("MapManager initialized")
     
-    def initialize_widget(self, parent=None) -> OpenLayersMapWidget:
+    def initialize_widget(self, parent=None) -> MapLibreWidget:
         """Инициализирует виджет карты."""
         if self.widget is None:
-            self.widget = OpenLayersMapWidget(parent)
+            self.widget = MapLibreWidget(parent)
             self.widget.mapReady.connect(self._on_map_ready)
             self.widget.droneSelected.connect(self._on_drone_selected)
             self.widget.stationSelected.connect(self._on_station_selected)

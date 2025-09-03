@@ -104,10 +104,10 @@ def check_dependencies():
     
     # Проверяем существующие модули
     try:
-        from panorama.features.map import OpenLayersMapWidget
-        print("✓ OpenLayersMapWidget доступен")
+        from panorama.features.map import MapLibreWidget
+        print("✓ MapLibreWidget доступен")
     except ImportError:
-        print("✗ OpenLayersMapWidget не найден")
+        print("✗ MapLibreWidget не найден")
         print("  Примечание: для отображения карты")
     
     try:

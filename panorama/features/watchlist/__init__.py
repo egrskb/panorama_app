@@ -5,5 +5,6 @@
 """
 
 from .view import ImprovedSlavesView
+from .web_table_widget import WebTableWidget
 
-__all__ = ['ImprovedSlavesView']
+__all__ = ['ImprovedSlavesView', 'WebTableWidget']

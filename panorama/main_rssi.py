@@ -1082,7 +1082,7 @@ class PanoramaAppWindow(QMainWindow):
                     )
         except Exception:
             pass
-        # TODO: Добавить метод update_target_position в OpenLayersMapWidget
+        # TODO: Добавить метод update_target_position в MapLibreWidget
         # self.trilateration_coordinator.target_updated.connect(
         #     self.map_view.update_target_position
         # )
