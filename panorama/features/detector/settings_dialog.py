@@ -37,6 +37,7 @@ class DetectorSettings:
 
     # RMS параметры для трилатерации (единый параметр)
     rms_halfspan_mhz: float = 2.5  # Полуширина полосы для RMS расчета
+    center_mode: str = "fmax"  # "fmax" | "centroid"
 
     # Временные параметры
     peak_timeout_sec: float = 5.0  # Таймаут для удаления неактивных пиков
@@ -66,6 +67,7 @@ class DetectorSettings:
             'watchlist_dwell_ms': self.watchlist_dwell_ms,
             'max_watchlist_size': self.max_watchlist_size,
             'rms_halfspan_mhz': self.rms_halfspan_mhz,
+            'center_mode': self.center_mode,
             'peak_timeout_sec': self.peak_timeout_sec,
             'measurement_interval_sec': self.measurement_interval_sec,
             'min_confirmation_sweeps': self.min_confirmation_sweeps,
@@ -357,6 +359,17 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         lbl_rms.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
         watchlist_layout.addRow("", lbl_rms)
 
+        # Режим центра: F_max или центроид
+        self.combo_center_mode = QtWidgets.QComboBox()
+        self.combo_center_mode.addItems(["F_max", "Centroid"])
+        try:
+            current_mode = getattr(self.settings, 'center_mode', 'fmax')
+            self.combo_center_mode.setCurrentIndex(0 if current_mode == 'fmax' else 1)
+        except Exception:
+            self.combo_center_mode.setCurrentIndex(0)
+        self.combo_center_mode.setToolTip("Чем центрироваться при измерении: F_max или центроид кластера")
+        watchlist_layout.addRow("Центр полосы:", self.combo_center_mode)
+
         self.spin_watchlist_dwell = QtWidgets.QSpinBox()
         self.spin_watchlist_dwell.setRange(10, 1000)
         self.spin_watchlist_dwell.setValue(self.settings.watchlist_dwell_ms)
@@ -489,6 +502,7 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         # Обновление примера при изменении параметров
         self.spin_watchlist_dwell.valueChanged.connect(self._update_example_plot)
         self.spin_rms_halfspan.valueChanged.connect(self._update_example_plot)
+        self.combo_center_mode.currentIndexChanged.connect(self._update_example_plot)
 
     def _update_threshold_widgets(self):
         """Обновляет доступность виджетов порогов."""
@@ -506,10 +520,11 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         left = 2450 - rms_halfspan
         right = 2450 + rms_halfspan
 
+        center_label = "F_max" if self.combo_center_mode.currentIndex() == 0 else "Centroid"
         text = (
             "<div style='color: #ffffff; padding: 20px;'>"
             "<h3>Пример RMS измерения</h3>"
-            f"<p>Центральная частота пика (F_max): 2450.0 МГц</p>"
+            f"<p>Центральная частота ({center_label}): 2450.0 МГц</p>"
             f"<p><b>RMS полоса: ±{rms_halfspan:.1f} МГц ({left:.1f} - {right:.1f} МГц)</b></p>"
             f"<p>Полная ширина измерения: {full_span:.1f} МГц</p>"
             f"<p>Время накопления: {dwell} мс</p>"
@@ -694,6 +709,7 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
             watchlist_dwell_ms=int(self.spin_watchlist_dwell.value()),
             max_watchlist_size=int(self.spin_max_watchlist.value()),
             rms_halfspan_mhz=self.spin_rms_halfspan.value(),
+            center_mode=('fmax' if self.combo_center_mode.currentIndex() == 0 else 'centroid'),
             # Таймаут и интервал остаются прежними (не редактируются в UI)
             peak_timeout_sec=self.settings.peak_timeout_sec,
             measurement_interval_sec=self.settings.measurement_interval_sec,
@@ -769,6 +785,8 @@ def apply_settings_to_watchlist_manager(settings: DetectorSettings, manager):
         manager.watchlist_span_hz = settings.rms_halfspan_mhz * 2e6  # Полная ширина = 2 × halfspan
 
     manager.max_watchlist_size = settings.max_watchlist_size
+    if hasattr(manager, 'center_mode'):
+        manager.center_mode = settings.center_mode
     manager.peak_timeout_sec = settings.peak_timeout_sec
     manager.min_confirmation_sweeps = settings.min_confirmation_sweeps
 

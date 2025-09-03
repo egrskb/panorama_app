@@ -80,6 +80,11 @@ class PanoramaAppWindow(QMainWindow):
         
         # Подключаем трилатерацию к спектру (после создания UI)
         self._connect_trilateration()
+        # Синхронизируем позиции станций в движке трилатерации из конфигурации
+        try:
+            self._sync_trilateration_stations_from_config()
+        except Exception:
+            pass
         
         # Обновляем карту с текущими настройками
         if hasattr(self, 'sdr_settings') and self.sdr_settings:
@@ -294,6 +299,11 @@ class PanoramaAppWindow(QMainWindow):
                 self.ui_manager.update_stations_from_config(self.sdr_settings)
             except Exception:
                 pass
+            # После изменения конфигурации обновляем позиции станций в трилатерации
+            try:
+                self._sync_trilateration_stations_from_config()
+            except Exception:
+                pass
         def _on_slaves_available(slaves_data: list):
             # Обновляем координаты слейвов во вкладке
             if hasattr(self, 'slaves_view') and self.slaves_view:
@@ -319,6 +329,27 @@ class PanoramaAppWindow(QMainWindow):
         dlg.slavesAvailable.connect(_on_slaves_available)
         dlg.devicesForCoordinatesTable.connect(_on_devices_for_coordinates)
         dlg.exec_()
+
+    def _sync_trilateration_stations_from_config(self):
+        """Синхронизирует позиции станций в движке трилатерации из текущей конфигурации.
+        Приводит идентификаторы к slave0/slave1/slave2..., чтобы совпадали с измерениями."""
+        try:
+            config = self.sdr_settings or self.config_manager.get_full_config()
+            slaves_cfg = (config or {}).get('slaves', [])
+            positions = {}
+            # Гарантируем наличие slave0 в (0,0,0)
+            positions['slave0'] = (0.0, 0.0, 0.0)
+            for idx, s in enumerate(slaves_cfg, start=1):
+                pos = s.get('pos', [0.0, 0.0, 0.0])
+                x = float(pos[0]) if len(pos) > 0 else 0.0
+                y = float(pos[1]) if len(pos) > 1 else 0.0
+                z = float(pos[2]) if len(pos) > 2 else 0.0
+                positions[f'slave{idx}'] = (x, y, z)
+            if hasattr(self.trilateration_coordinator, 'set_slave_positions'):
+                self.trilateration_coordinator.set_slave_positions(positions)
+                self.log.info(f"Трилатерация: обновлены позиции станций ({len(positions)} шт.)")
+        except Exception as e:
+            self.log.error(f"Не удалось синхронизировать позиции станций: {e}")
     
     def _load_calibration(self):
         """Загружает калибровку по умолчанию."""

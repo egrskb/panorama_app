@@ -94,6 +94,7 @@ class PeakWatchlistManager(QObject):
         self.max_watchlist_size = 10         # Максимум целей в watchlist
         self.peak_timeout_sec = 120.0        # Увеличенный таймаут, чтобы записи не исчезали быстро
         self.min_confirmation_sweeps = 3     # Требуем 3 подтверждения для добавления в watchlist
+        self.center_mode: str = 'fmax'       # 'fmax' | 'centroid'
 
         # Состояние
         self.detected_peaks: Dict[str, VideoSignalPeak] = {}
@@ -295,8 +296,9 @@ class PeakWatchlistManager(QObject):
                 continue
 
             # 4. Создаем объект пика с новыми метриками
+            center_choice = peak_freq if self.center_mode == 'fmax' else centroid_freq
             peak = VideoSignalPeak(
-                center_freq_hz=peak_freq,                    # F_max - частота максимума
+                center_freq_hz=center_choice,                # Выбранный центр окна
                 peak_power_dbm=peak_power,                   # Мощность в максимуме
                 bandwidth_hz=cluster_bandwidth_hz,           # Полная ширина кластера (для совместимости)
                 snr_db=snr,
