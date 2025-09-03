@@ -41,10 +41,10 @@ class ImprovedSlavesView(QWidget):
         # Создаем UI
         self._create_ui()
         
-        # Таймер обновления
+        # Таймер обновления (лайв-данные)
         self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self._update_data)
-        self.update_timer.start(2000)
+        self.update_timer.start(300)  # ~3-4 FPS для живых обновлений
 
     def _create_ui(self):
         layout = QVBoxLayout(self)
@@ -160,6 +160,12 @@ class ImprovedSlavesView(QWidget):
             "X", "Y", "Доверие", "Время", "На карту", "Статус"
         ])
         self.combined_table.setAlternatingRowColors(True)
+        # Запрещаем редактирование ячеек в таблице измерений
+        try:
+            from PyQt5.QtWidgets import QAbstractItemView
+            self.combined_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        except Exception:
+            pass
         
         # Настройка столбцов
         header = self.combined_table.horizontalHeader()
@@ -202,6 +208,12 @@ class ImprovedSlavesView(QWidget):
             "ID", "Диапазон", "Статус", "Прогресс", "Время", "Приоритет"
         ])
         layout.addWidget(self.tasks_table)
+        # Таблица задач — только для просмотра
+        try:
+            from PyQt5.QtWidgets import QAbstractItemView
+            self.tasks_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        except Exception:
+            pass
         
         # Статистика
         stats = QHBoxLayout()
@@ -246,11 +258,17 @@ class ImprovedSlavesView(QWidget):
             "Никнейм", "Роль", "X (метры)", "Y (метры)", "Z (метры)", "Статус"
         ])
         self.coordinates_table.setAlternatingRowColors(True)
-        # Цвета под qdarkstyle
-        self._color_reference = QColor(212, 175, 55, 160)  # muted gold
-        self._color_available = QColor(76, 175, 80, 140)   # muted green
-        self._color_unavailable = QColor(244, 67, 54, 140) # muted red
-        self._color_locked_bg = QColor(120, 120, 120, 120) # disabled gray
+        # Ячейки координатной таблицы редактируются только там, где разрешено явно
+        try:
+            from PyQt5.QtWidgets import QAbstractItemView
+            self.coordinates_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        except Exception:
+            pass
+        # Цвета устойчивые к темам
+        self._color_reference = QColor(255, 215, 0, 180)
+        self._color_available = QColor(76, 175, 80, 180)
+        self._color_unavailable = QColor(244, 67, 54, 180)
+        self._color_locked_bg = QColor(200, 200, 200, 120)
         
         # Настройка столбцов
         header = self.coordinates_table.horizontalHeader()
@@ -259,7 +277,8 @@ class ImprovedSlavesView(QWidget):
         layout.addWidget(self.coordinates_table)
         
         # Инициализация координат
-        self._initialize_coordinates_table()
+        # Не инициализируем автоматом при старте. Ждём данных из диспетчера устройств
+        # self._initialize_coordinates_table()
         
         # Кнопки управления координатами
         buttons_layout = QHBoxLayout()
@@ -311,9 +330,11 @@ class ImprovedSlavesView(QWidget):
         """Периодическое обновление данных."""
         if self.orchestrator and hasattr(self.orchestrator, "get_ui_snapshot"):
             try:
-                snapshot = self.orchestrator.get_ui_snapshot()
-                if snapshot:
-                    self.update_from_orchestrator(snapshot)
+                # Учитываем флаг автообновления
+                if getattr(self, 'auto_update_cb', None) is None or self.auto_update_cb.isChecked():
+                    snapshot = self.orchestrator.get_ui_snapshot()
+                    if snapshot:
+                        self.update_from_orchestrator(snapshot)
             except Exception as e:
                 print(f"[SlavesView] Error: {e}")
         
@@ -375,7 +396,12 @@ class ImprovedSlavesView(QWidget):
                             
                             item = QTableWidgetItem(f"{rssi_val:.1f}")
                             item.setTextAlignment(Qt.AlignCenter)
-                            item.setBackground(QBrush(self._get_rssi_color(rssi_val)))
+                            color = self._get_rssi_color(rssi_val)
+                            item.setBackground(QBrush(color))
+                            try:
+                                item.setData(Qt.BackgroundRole, QBrush(color))
+                            except Exception:
+                                pass
                             
                             # Tooltip с дополнительной информацией
                             bins_used = data.get(f'bins_used_{i+1}', 'N/A')
@@ -688,22 +714,8 @@ class ImprovedSlavesView(QWidget):
     
     def _show_empty_coordinates_message(self):
         """Показывает сообщение о отсутствии SDR устройств."""
-        self.coordinates_table.setRowCount(1)
-        info_item = QTableWidgetItem("Нет настроенных SDR устройств")
-        info_item.setTextAlignment(Qt.AlignCenter)
-        info_item.setFlags(Qt.NoItemFlags)  # Неселектируемый
-        info_item.setBackground(QBrush(QColor(240, 240, 240, 100)))
-        
-        # Объединяем все колонки для сообщения
-        self.coordinates_table.setItem(0, 0, info_item)
-        for col in range(1, 6):
-            empty_item = QTableWidgetItem("")
-            empty_item.setFlags(Qt.NoItemFlags)
-            empty_item.setBackground(QBrush(QColor(240, 240, 240, 100)))
-            self.coordinates_table.setItem(0, col, empty_item)
-        
-        # Объединяем ячейки для информационного сообщения
-        self.coordinates_table.setSpan(0, 0, 1, 6)
+        # Пустая таблица без добавления строк
+        self.coordinates_table.setRowCount(0)
     
     def _load_saved_devices_from_json(self):
         """Загружает сохраненные устройства из JSON файла."""
@@ -774,7 +786,7 @@ class ImprovedSlavesView(QWidget):
                 nickname_item.setToolTip("Никнейм редактируется в Диспетчере устройств")
                 
                 if is_reference:
-                    nickname_item.setBackground(QBrush(QColor(255, 215, 0, 100)))  # Золотой
+                    nickname_item.setBackground(QBrush(self._color_reference))
                     nickname_item.setToolTip("Опорное устройство (0,0,0)")
                 
                 self.coordinates_table.setItem(row, 0, nickname_item)
@@ -808,7 +820,7 @@ class ImprovedSlavesView(QWidget):
                 if is_reference:
                     for item in [x_item, y_item, z_item]:
                         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                        item.setBackground(QBrush(QColor(200, 200, 200, 100)))
+                        item.setBackground(QBrush(self._color_locked_bg))
                         item.setToolTip("Опорное устройство имеет фиксированные координаты (0,0,0)")
                 
                 self.coordinates_table.setItem(row, 2, x_item)
@@ -819,7 +831,7 @@ class ImprovedSlavesView(QWidget):
                 status = device.get('status', 'UNKNOWN')
                 if status == 'REFERENCE' or is_reference:
                     status_text = 'ОПОРНОЕ'
-                    status_color = QColor(255, 215, 0, 100)  # Золотой
+                    status_color = self._color_reference
                 elif status == 'AVAILABLE' or status == 'ACTIVE':
                     status_text = 'ДОСТУПНО'
                     status_color = QColor(74, 222, 128, 100)  # Зеленый
@@ -955,7 +967,12 @@ class ImprovedSlavesView(QWidget):
             if col > 0 and row >= 0:
                 item = QTableWidgetItem(f"{rssi_rms:.1f}")
                 item.setTextAlignment(Qt.AlignCenter)
-                item.setBackground(QBrush(self._get_rssi_color(rssi_rms)))
+                color = self._get_rssi_color(rssi_rms)
+                item.setBackground(QBrush(color))
+                try:
+                    item.setData(Qt.BackgroundRole, QBrush(color))
+                except Exception:
+                    pass
                 self.combined_table.setItem(row, col, item)
                 
                 # Обновляем статистику

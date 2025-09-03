@@ -126,15 +126,8 @@ build_hackrf_slave() {
         # Показываем зависимости
         echo "Library dependencies:"
         ldd libhackrf_slave.so
-        
-        # Копируем в общую папку библиотек если нужно
-        LIB_DIR="../../../../lib"
-        if [ ! -d "$LIB_DIR" ]; then
-            mkdir -p "$LIB_DIR"
-        fi
-        cp libhackrf_slave.so "$LIB_DIR/"
-        echo "✓ Библиотека скопирована в $LIB_DIR/"
-        
+        # Локальное использование: библиотека остается в каталоге hackrf_slaves
+        # Код приложения загружает её напрямую из panorama/drivers/hackrf/hackrf_slaves
     else
         echo "❌ libhackrf_slave.so не найдена после сборки"
         cd "$original_dir"

@@ -140,7 +140,7 @@ def main():
     
     try:
         # Импортируем и запускаем главное приложение
-        from panorama.main_rssi import main as app_main
+        from panorama.app import main as app_main
         app_main()
         return 0
         

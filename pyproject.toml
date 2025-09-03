@@ -43,7 +43,8 @@ include = ["panorama*"]
 "panorama" = [
   "docs/**",
   "features/**/assets/*",
-  "drivers/hackrf_lib/native/*",
+  "drivers/hackrf_lib/native/*", 
   "data/**",
   "configs/*.yaml",
+  "resources/**/*",
 ]

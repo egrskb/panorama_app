@@ -12,13 +12,11 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                             QTableWidgetItem, QComboBox, QCheckBox, QSplitter, 
                             QFrame, QMessageBox, QFileDialog, QFormLayout)
 
-from panorama.features.map import OpenLayersMapWidget
-from panorama.features.spectrum import SpectrumView
-from panorama.features.watchlist.view import ImprovedSlavesView
+from panorama.ui import SpectrumView, ImprovedSlavesView, OpenLayersMapWidget
 from panorama.features.spectrum.master_adapter import MasterSourceAdapter
 
 
-class MainUIManager(QObject):
+class PanoramaUI(QObject):
     """Менеджер для создания и управления главным UI."""
     
     # Сигналы для подключения к главному окну
@@ -31,6 +29,7 @@ class MainUIManager(QObject):
     clear_slaves_requested = pyqtSignal()
     about_requested = pyqtSignal()
     device_manager_requested = pyqtSignal()
+    theme_toggle_requested = pyqtSignal()
     
     def __init__(self, main_window: QMainWindow, orchestrator=None, logger: Optional[logging.Logger] = None):
         super().__init__()
@@ -64,7 +63,7 @@ class MainUIManager(QObject):
         self._create_menu()
         self._create_toolbar()
         
-        self.log.info("Main UI setup completed")
+        self.log.info("Panorama UI setup completed")
     
     def _setup_window_properties(self):
         """Настраивает свойства окна."""
@@ -72,13 +71,24 @@ class MainUIManager(QObject):
         self.main_window.setGeometry(100, 100, 1400, 900)
     
     def _setup_theme(self):
-        """Настраивает тему приложения."""
-        # Современная тёмная тема: qdarkstyle (если доступен), иначе fallback на палитру
+        """Инициализация темы через PyQtDarkTheme (qdarktheme), с поддержкой старых версий (<1.0)."""
         try:
-            import qdarkstyle  # type: ignore
-            self.main_window.setStyleSheet(qdarkstyle.load_stylesheet_pyqt5())
+            import qdarktheme as _qdt
+            app = QtWidgets.QApplication.instance()
+            if hasattr(_qdt, 'setup_theme'):
+                _qdt.setup_theme('light')
+            else:
+                # Старые версии: применяем палитру и стиль вручную
+                if app is not None:
+                    pal = _qdt.load_palette(theme='light') if hasattr(_qdt, 'load_palette') else None
+                    ss = _qdt.load_stylesheet(theme='light') if hasattr(_qdt, 'load_stylesheet') else ''
+                    if pal is not None:
+                        app.setPalette(pal)
+                    if ss:
+                        app.setStyleSheet(ss)
         except Exception:
-            self._setup_dark_palette()
+            # Если библиотеки нет — оставляем стандартную тему
+            pass
     
     def _setup_dark_palette(self):
         """Настраивает тёмную палитру как fallback."""
@@ -96,9 +106,11 @@ class MainUIManager(QObject):
         dark.setColor(QtGui.QPalette.Link, QtGui.QColor(42, 130, 218))
         dark.setColor(QtGui.QPalette.Highlight, QtGui.QColor(42, 130, 218))
         dark.setColor(QtGui.QPalette.HighlightedText, QtCore.Qt.black)
-        
-        self.main_window.setPalette(dark)
-        self.main_window.setStyleSheet("QToolTip { color: #ffffff; background-color: #2a82da; border: 1px solid white; }")
+
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.setPalette(dark)
+            app.setStyleSheet("QToolTip { color: #ffffff; background-color: #2a82da; border: 1px solid white; }")
     
     def _create_main_panel(self) -> QWidget:
         """Создает основную панель с вкладками."""
@@ -160,6 +172,36 @@ class MainUIManager(QObject):
         """Создает панель инструментов."""
         toolbar = self.main_window.addToolBar('Основная панель')
         toolbar.addAction('🧭 Диспетчер устройств').triggered.connect(self.device_manager_requested.emit)
+        # Выпадающий список темы (Light/Dark)
+        try:
+            theme_label = QLabel('Тема: ')
+            toolbar.addWidget(theme_label)
+            self.theme_combo = QComboBox()
+            self.theme_combo.addItems(["Light", "Dark"]) 
+            self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
+            toolbar.addWidget(self.theme_combo)
+        except Exception:
+            pass
+
+    def _on_theme_changed(self, name: str):
+        target = 'dark' if name.lower() == 'dark' else 'light'
+        try:
+            import qdarktheme as _qdt
+            app = QtWidgets.QApplication.instance()
+            if hasattr(_qdt, 'setup_theme'):
+                _qdt.setup_theme(target)
+            else:
+                # Старые версии: вручную
+                if app is not None:
+                    pal = _qdt.load_palette(theme=target) if hasattr(_qdt, 'load_palette') else None
+                    ss = _qdt.load_stylesheet(theme=target) if hasattr(_qdt, 'load_stylesheet') else ''
+                    if pal is not None:
+                        app.setPalette(pal)
+                    if ss:
+                        app.setStyleSheet(ss)
+        except Exception:
+            pass
+        # done
     
     
     def update_stations_from_config(self, config: dict):
@@ -181,3 +223,6 @@ class MainUIManager(QObject):
     def get_slaves_view(self) -> Optional[ImprovedSlavesView]:
         """Возвращает виджет слейвов."""
         return self.slaves_view
+
+# Backward compatibility alias (after full class definition)
+MainUIManager = PanoramaUI

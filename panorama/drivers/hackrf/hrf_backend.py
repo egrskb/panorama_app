@@ -35,12 +35,8 @@ def _find_slave_library() -> str:
     """Ищем slave библиотеку в разных местах."""
     here = os.path.abspath(os.path.dirname(__file__))
     names = ["libhackrf_slave.so", "libhackrf_slave.dylib", "hackrf_slave.dll"]
-    
-    candidates = [
-        os.path.join(here, "hackrf_slaves", name) for name in names
-    ] + [
-        os.path.join(here, "..", "drivers", "hackrf_slaves", name) for name in names
-    ] + names
+    # Ограничиваемся только пакетным путём внутри репозитория
+    candidates = [os.path.join(here, "hackrf_slaves", name) for name in names]
     
     for path in candidates:
         if os.path.exists(path):

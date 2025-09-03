@@ -89,7 +89,7 @@ class Orchestrator(QObject):
         self._cleanup_timer.start(5000)
 
         # Периодическое обновление измерений watchlist (постоянные замеры)
-        self.measure_interval_ms = 700  # интервал между повторными измерениями одной цели
+        self.measure_interval_ms = 300  # более частые замеры для лайв-данных
         self._last_measure_at: Dict[str, float] = {}
         self._measure_timer = QTimer(self)
         self._measure_timer.timeout.connect(self._tick_watchlist_measurements)
@@ -357,6 +357,18 @@ class Orchestrator(QObject):
                 self.completed.append(task)
                 self.log.info(f"Task completed: {tid} with {len(meas_list)} measurements")
 
+                # Всегда обновляем RMS в watchlist для UI (даже при низком SNR)
+                try:
+                    if self.trilateration_coordinator:
+                        for m in meas_list:
+                            peak_id_any = self._get_peak_id_for_freq(m.center_hz)
+                            if peak_id_any:
+                                self.trilateration_coordinator.peak_manager.update_rssi_measurement(
+                                    peak_id_any, m.slave_id, m.band_rssi_dbm
+                                )
+                except Exception:
+                    pass
+
                 # триггерим трилатерацию только если >= 3 slaves отдали валидные данные
                 valid = [m for m in meas_list if m.snr_db >= self.min_snr_threshold and m.flags.get("valid", True)]
                 if len(valid) >= 3 and self.trilateration_engine:
@@ -370,10 +382,9 @@ class Orchestrator(QObject):
                     except Exception as e:
                         self._emit_error(f"Trilateration error: {e}")
                 
-                # Передаем в координатор трилатерации
+                # Передаем в координатор трилатерации только валидные измерения (для трекинга)
                 if self.trilateration_coordinator:
                     for measurement in valid:
-                        # Извлекаем peak_id из сопоставления
                         peak_id = self._get_peak_id_for_freq(measurement.center_hz)
                         if peak_id:
                             self.trilateration_coordinator.add_slave_rssi_measurement(

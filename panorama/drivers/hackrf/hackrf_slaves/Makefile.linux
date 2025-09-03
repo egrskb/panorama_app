@@ -59,11 +59,8 @@ test-build: all
 	@echo "Библиотека $(TARGET) успешно собрана на Linux"
 	@ldd $(TARGET_DIR)/$(TARGET)
 
-# Копирование в lib директорию
+# Установка отключена: библиотека используется напрямую из текущей папки
 install: all
-	@LIB_DIR="../../../lib"; \
-	mkdir -p "$$LIB_DIR"; \
-	cp $(TARGET_DIR)/$(TARGET) "$$LIB_DIR/"; \
-	echo "✓ Библиотека установлена в $$LIB_DIR/"
+	@echo "✓ Установка не требуется: $(TARGET) используется из panorama/drivers/hackrf/hackrf_slaves"
 
 .PHONY: all clean install-deps test-build install

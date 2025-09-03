@@ -100,15 +100,8 @@ build_hackrf_slave() {
         # Показываем зависимости
         echo "Library dependencies:"
         otool -L "$LIBFILE" || ldd "$LIBFILE" 2>/dev/null || true
-        
-        # Копируем в общую папку библиотек если нужно
-        LIB_DIR="../../../../lib"
-        if [ ! -d "$LIB_DIR" ]; then
-            mkdir -p "$LIB_DIR"
-        fi
-        cp "$LIBFILE" "$LIB_DIR/"
-        echo "✓ Библиотека скопирована в $LIB_DIR/"
-        
+        # Локальное использование: библиотека остается в каталоге hackrf_slaves
+        # Приложение загружает её напрямую из panorama/drivers/hackrf/hackrf_slaves
     else
         echo "❌ libhackrf_slave не найдена после сборки"
         cd "$original_dir"

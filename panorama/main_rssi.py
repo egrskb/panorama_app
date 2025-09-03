@@ -8,6 +8,7 @@ import sys
 import logging
 import time
 from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QTableWidgetItem, QMessageBox, QFileDialog
+import numpy as np
 
 # Импортируем наши модули
 from panorama.core.status_manager import SystemStatusManager
@@ -15,20 +16,32 @@ from panorama.core.config_manager import ConfigurationManager
 from panorama.core.components_manager import ComponentsManager
 from panorama.core.error_handler import ErrorHandler, safe_method
 from panorama.ui.main_ui_manager import MainUIManager
+# from panorama.ui.theme_manager import ThemeManager  # removed
 
 # Импортируем модули для диалогов
 from panorama.features.settings.manager_improved import ImprovedDeviceManagerDialog
-from panorama.features.detector.settings_dialog import DetectorSettingsDialog, DetectorSettings
+from panorama.ui import DetectorSettingsDialog, DetectorSettings
 
 
-class RSSIPanoramaMainWindow(QMainWindow):
+class PanoramaAppWindow(QMainWindow):
     """Главное окно приложения ПАНОРАМА RSSI."""
     
     def __init__(self):
         super().__init__()
+        # Устанавливаем иконку окна (левый верхний угол)
+        try:
+            from PyQt5.QtGui import QIcon
+            from pathlib import Path
+            icon_path = Path(__file__).parent / "resources" / "icons" / "logo.png"
+            if icon_path.exists():
+                self.setWindowIcon(QIcon(str(icon_path)))
+        except Exception:
+            pass
         
         # Настройка логирования
         self._setup_logging()
+        
+        # Менеджер тем удален; тема управляется через выпадающий список в тулбаре
         
         # Обработчик ошибок
         self.error_handler = ErrorHandler(self.log, self)
@@ -87,7 +100,7 @@ class RSSIPanoramaMainWindow(QMainWindow):
         self._setup_status_callbacks()
         
         # Устанавливаем фиксированный заголовок окна
-        self.setWindowTitle("ПАНОРАМА RSSI")
+        self.setWindowTitle("PANORAMA")
         
         self.log.info("ПАНОРАМА RSSI initialized")
     
@@ -939,6 +952,8 @@ class RSSIPanoramaMainWindow(QMainWindow):
                          "Поддерживает множественные SDR станции\n\n"
                          "© 2024 ПАНОРАМА Team")
     
+    # Тема управляется через combo в тулбаре (MainUIManager)
+    
     def _connect_trilateration(self):
         """Подключает систему трилатерации к спектру."""
         # Когда приходят данные от Master
@@ -1052,7 +1067,6 @@ def main():
         QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_UseSoftwareOpenGL)
     except Exception:
         pass
-
     app = QApplication(sys.argv)
     
     # Настройка приложения
@@ -1060,8 +1074,19 @@ def main():
     app.setApplicationVersion("1.0")
     app.setOrganizationName("ПАНОРАМА Team")
     
+    # Тема: по умолчанию оставляем стандартную; управляется из тулбара
+    
     # Создание главного окна
-    window = RSSIPanoramaMainWindow()
+    window = PanoramaAppWindow()
+    try:
+        from PyQt5.QtGui import QIcon
+        from pathlib import Path
+        icon_path = Path(__file__).parent / "resources" / "icons" / "logo.png"
+        if icon_path.exists():
+            app.setWindowIcon(QIcon(str(icon_path)))
+            window.setWindowIcon(QIcon(str(icon_path)))
+    except Exception:
+        pass
     window.show()
     
     # Запуск приложения

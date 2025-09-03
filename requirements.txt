@@ -6,8 +6,8 @@ numpy>=1.20.0
 # For CFFI/libhackrf support
 cffi>=1.15.0
 
-# UI theme (dark)
-qdarkstyle<3
+# UI theme (optional). If available, we'll apply Light theme.
+pyqtdarktheme
 
 # For color palettes (optional but recommended)
 matplotlib>=3.3.0
