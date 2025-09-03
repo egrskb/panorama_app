@@ -167,12 +167,35 @@ class ImprovedSlavesView(QWidget):
         except Exception:
             pass
         
-        # Настройка столбцов
+        # Настройка столбцов: избегаем ResizeToContents (дорого на каждом апдейте)
         header = self.combined_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(0, QHeaderView.Stretch)  # Диапазон
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)  # Диапазон тянется
+        try:
+            # Разумные стартовые ширины для стабильного лайв-обновления
+            self.combined_table.setColumnWidth(1, 90)   # Центр
+            self.combined_table.setColumnWidth(2, 60)   # Ширина
+            for c in (3, 4, 5):
+                self.combined_table.setColumnWidth(c, 95)  # RSSI колонки
+            for c in (6, 7):
+                self.combined_table.setColumnWidth(c, 60)   # X/Y
+            self.combined_table.setColumnWidth(8, 80)   # Доверие
+            self.combined_table.setColumnWidth(9, 70)   # Время
+            self.combined_table.setColumnWidth(10, 70)  # На карту
+            self.combined_table.setColumnWidth(11, 90)  # Статус
+        except Exception:
+            pass
+
+        # Двойной клик по строке — отправка на карту
+        try:
+            self.combined_table.itemDoubleClicked.connect(self._on_combined_item_double_clicked)
+        except Exception:
+            pass
         
         layout.addWidget(self.combined_table)
+        # Полностью отключаем QSS для таблицы измерений и высоте строк
+        self.combined_table.setStyleSheet("")
+        self.combined_table.verticalHeader().setDefaultSectionSize(22)
         
         # Статистика
         stats_layout = QHBoxLayout()
@@ -214,6 +237,9 @@ class ImprovedSlavesView(QWidget):
             self.tasks_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         except Exception:
             pass
+        # Отключаем стили для таблицы задач
+        self.tasks_table.setStyleSheet("")
+        self.tasks_table.verticalHeader().setDefaultSectionSize(22)
         
         # Статистика
         stats = QHBoxLayout()
@@ -414,13 +440,13 @@ class ImprovedSlavesView(QWidget):
                     updated_time = data.get('updated', time.strftime('%H:%M:%S'))
                     self.combined_table.setItem(row, 9, QTableWidgetItem(updated_time))
                     
-                    # Кнопка на карту: не даем повторно добавлять одно и то же измерение
-                    existing_btn = self.combined_table.cellWidget(row, 10)
-                    if not (existing_btn and existing_btn.property('sent_to_map')):
-                        btn = QPushButton("📍")
-                        btn.setProperty('sent_to_map', False)
-                        btn.clicked.connect(lambda _, r=row, d=data: self._on_add_measurement_to_map(r, d))
-                        self.combined_table.setCellWidget(row, 10, btn)
+                    # Колонка "На карту" — лёгкая иконка-текст вместо кнопки
+                    map_item = self.combined_table.item(row, 10)
+                    if not map_item:
+                        map_item = QTableWidgetItem("📍")
+                        map_item.setTextAlignment(Qt.AlignCenter)
+                        map_item.setFlags(map_item.flags() & ~Qt.ItemIsEditable)
+                        self.combined_table.setItem(row, 10, map_item)
                     
                     # Статус - переводим на русский
                     has_measurements = any(data.get(f'rms_{i+1}') for i in range(3))
@@ -522,14 +548,13 @@ class ImprovedSlavesView(QWidget):
                 self.combined_table.setItem(row, 8, QTableWidgetItem(f"{confidence*100:.0f}%"))  # Доверие
                 self.combined_table.setItem(row, 9, QTableWidgetItem(time.strftime("%H:%M:%S")))  # Время
                 
-                # Кнопка на карту: не даем повторно добавлять одно и то же измерение
-                existing_btn = self.combined_table.cellWidget(row, 10)
-                if not (existing_btn and existing_btn.property('sent_to_map')):
-                    btn = QPushButton("📍")
-                    btn.setProperty('sent_to_map', False)
-                    payload = {'id': peak_id, 'freq': freq, 'x': x, 'y': y}
-                    btn.clicked.connect(lambda _, r=row, d=payload: self._on_add_measurement_to_map(r, d))
-                    self.combined_table.setCellWidget(row, 10, btn)
+                # Лёгкая иконка в колонке "На карту"
+                map_item = self.combined_table.item(row, 10)
+                if not map_item:
+                    map_item = QTableWidgetItem("📍")
+                    map_item.setTextAlignment(Qt.AlignCenter)
+                    map_item.setFlags(map_item.flags() & ~Qt.ItemIsEditable)
+                    self.combined_table.setItem(row, 10, map_item)
                 
                 # Статус
                 self.combined_table.setItem(row, 11, QTableWidgetItem("ОБНАРУЖЕН"))
@@ -985,6 +1010,26 @@ class ImprovedSlavesView(QWidget):
         
         except Exception as e:
             print(f"[SlavesView] Error updating combined RSSI: {e}")
+
+    def _on_combined_item_double_clicked(self, item: QTableWidgetItem):
+        """Двойной клик — отправка записи на карту (без тяжёлых кнопок)."""
+        try:
+            row = item.row()
+            # Собираем полезную нагрузку из строки
+            range_item = self.combined_table.item(row, 0)
+            center_item = self.combined_table.item(row, 1)
+            x_item = self.combined_table.item(row, 6)
+            y_item = self.combined_table.item(row, 7)
+            payload = {
+                'type': 'target',
+                'range': range_item.text() if range_item else '',
+                'freq': float(center_item.text()) if center_item and center_item.text() else 0.0,
+                'x': float(x_item.text()) if x_item and x_item.text() else 0.0,
+                'y': float(y_item.text()) if y_item and y_item.text() else 0.0,
+            }
+            self.send_to_map.emit(payload)
+        except Exception:
+            pass
             
     
     # Дополнительные методы для удобства

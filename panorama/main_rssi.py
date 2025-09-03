@@ -545,6 +545,54 @@ class PanoramaAppWindow(QMainWindow):
     def _on_trilateration_error(self, error_msg):
         """Обрабатывает ошибку трилатерации."""
         self.log.info(f"Ошибка трилатерации: {error_msg}")
+
+    def _on_trilateration_target_detected(self, result):
+        """Адаптер: приводит результат трилатерации к dict для карты и UI."""
+        try:
+            payload = {
+                'id': getattr(result, 'peak_id', 'Unknown'),
+                'freq': float(getattr(result, 'freq_mhz', 0.0)),
+                'x': float(getattr(result, 'x', 0.0)),
+                'y': float(getattr(result, 'y', 0.0)),
+                'confidence': float(getattr(result, 'confidence', 0.0)),
+            }
+            if hasattr(self, 'map_view') and self.map_view:
+                if hasattr(self.map_view, 'add_target_from_detector'):
+                    self.map_view.add_target_from_detector(payload)
+            # Дублируем в SlavesView если нужно
+            if hasattr(self, 'slaves_view') and self.slaves_view:
+                if hasattr(self.slaves_view, 'add_transmitter'):
+                    # SlavesView ожидает объект с атрибутами; создадим лёгкий адаптер
+                    class _R:
+                        pass
+                    r = _R()
+                    r.peak_id = payload['id']
+                    r.freq_mhz = payload['freq']
+                    r.x = payload['x']
+                    r.y = payload['y']
+                    r.confidence = payload['confidence']
+                    self.slaves_view.add_transmitter(r)
+        except Exception as e:
+            self.log.error(f"_on_trilateration_target_detected error: {e}")
+
+    def _on_trilateration_target_updated(self, result):
+        """Адаптер для обновления цели (dict к SlavesView и карте)."""
+        try:
+            payload = {
+                'id': getattr(result, 'peak_id', 'Unknown'),
+                'freq': float(getattr(result, 'freq_mhz', 0.0)),
+                'x': float(getattr(result, 'x', 0.0)),
+                'y': float(getattr(result, 'y', 0.0)),
+                'confidence': float(getattr(result, 'confidence', 0.0)),
+            }
+            if hasattr(self, 'map_view') and self.map_view:
+                if hasattr(self.map_view, 'add_target_from_detector'):
+                    self.map_view.add_target_from_detector(payload)
+            if hasattr(self, 'slaves_view') and self.slaves_view:
+                if hasattr(self.slaves_view, 'update_transmitter_position'):
+                    self.slaves_view.update_transmitter_position(payload)
+        except Exception as e:
+            self.log.error(f"_on_trilateration_target_updated error: {e}")
     
     def _on_measurement_error(self, error_msg):
         """Обрабатывает ошибку измерения."""
@@ -982,20 +1030,24 @@ class PanoramaAppWindow(QMainWindow):
             'slave2': (0.0, 10.0, 0.0)
         })
         
-        # Подключаем к карте
+        # Подключаем к карте через адаптер: преобразуем объект в dict
+        try:
+            self.trilateration_coordinator.target_detected.disconnect()
+        except Exception:
+            pass
         self.trilateration_coordinator.target_detected.connect(
-            self.map_view.add_target_from_detector
+            self._on_trilateration_target_detected
         )
         # И в UI слейвов — добавлять передатчики
         try:
             if hasattr(self, 'slaves_view') and self.slaves_view:
+                # через адаптеры, чтобы формат был dict для update_transmitter_position
                 self.trilateration_coordinator.target_detected.connect(
-                    self.slaves_view.add_transmitter
+                    self._on_trilateration_target_detected
                 )
-                # Обновление трекинга — позиция и уверенность
                 if hasattr(self.trilateration_coordinator, 'target_updated'):
                     self.trilateration_coordinator.target_updated.connect(
-                        self.slaves_view.update_transmitter_position
+                        self._on_trilateration_target_updated
                     )
         except Exception:
             pass

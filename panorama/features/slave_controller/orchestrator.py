@@ -373,7 +373,15 @@ class Orchestrator(QObject):
                 valid = [m for m in meas_list if m.snr_db >= self.min_snr_threshold and m.flags.get("valid", True)]
                 if len(valid) >= 3 and self.trilateration_engine:
                     try:
-                        result: Optional[TrilaterationResult] = self.trilateration_engine.calculate_position(valid)
+                        # Преобразуем список измерений в словарь RSSI для движка
+                        rssi_dict: Dict[str, float] = {m.slave_id: float(m.band_rssi_dbm) for m in valid}
+                        # Извлекаем peak_id по частоте (берём из первого валидного измерения)
+                        freq_hz = float(valid[0].center_hz)
+                        freq_mhz = freq_hz / 1e6
+                        peak_id_guess = self._get_peak_id_for_freq(freq_hz) or f"peak_{int(freq_mhz)}MHz"
+                        result: Optional[TrilaterationResult] = self.trilateration_engine.calculate_position(
+                            rssi_dict, peak_id=peak_id_guess, freq_mhz=freq_mhz
+                        )
                         if result:
                             self.target_update.emit(result)  # alias уйдёт автоматически
                             self.log.info(

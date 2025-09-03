@@ -121,12 +121,8 @@ class OpenLayersMapWidget(QWidget):
         self._bridge = MapBridge()
         self._page_loaded = False
         
-        # Позиции станций (Slave0 всегда в центре)
-        self._stations = {
-            'slave0': (0.0, 0.0, 0.0),     # Центр координат
-            'slave1': (200.0, 200.0, 0.0),  # Пример позиции
-            'slave2': (-200.0, 200.0, 0.0)  # Пример позиции
-        }
+        # Позиции станций — пусто до синхронизации из конфигурации/слейвов
+        self._stations = {}
         
         # Активные дроны
         self._active_drones: Dict[str, DroneUpdate] = {}
@@ -196,7 +192,7 @@ class OpenLayersMapWidget(QWidget):
         if success:
             self._page_loaded = True
             logger.info("RSSI Trilateration map loaded successfully")
-            self._initialize_stations()
+            # Не отправляем станции до первого апдейта извне
             self._initialize_rssi_settings()
         else:
             logger.error("Failed to load map")

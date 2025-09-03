@@ -109,6 +109,9 @@ class PeakWatchlistManager(QObject):
         self.cleanup_timer.timeout.connect(self._cleanup_old_entries)
         self.cleanup_timer.start(5000)  # Каждые 5 секунд
 
+        # Анти-дубликат: минимальная пауза между соседними добавлениями (сек)
+        self._add_hysteresis_sec = 4.0
+
     def process_spectrum(self, freqs_hz: np.ndarray, power_dbm: np.ndarray,
                          user_span_hz: Optional[float] = None) -> List[VideoSignalPeak]:
         """
@@ -194,10 +197,11 @@ class PeakWatchlistManager(QObject):
                         # Если достигнуто требуемое число подтверждений — добавляем в watchlist
                         if (existing_peak.consecutive_detections >= max(1, self.min_confirmation_sweeps)
                                 and peak_id not in self.watchlist):
-                            # Добавляем только если такой центр ещё не добавлялся ранее
-                            if not any(abs(existing_peak.center_freq_hz - c) < 1e6 for c in self._ever_added_centers):
-                                self._add_to_watchlist(existing_peak, user_span_hz or self.watchlist_span_hz)
-                                self._ever_added_centers.add(existing_peak.center_freq_hz)
+                            proposed_span = float(user_span_hz or self.watchlist_span_hz)
+                            if self._should_add_entry(existing_peak.center_freq_hz, proposed_span):
+                                if not any(abs(existing_peak.center_freq_hz - c) < 1e6 for c in self._ever_added_centers):
+                                    self._add_to_watchlist(existing_peak, proposed_span)
+                                    self._ever_added_centers.add(existing_peak.center_freq_hz)
                         break
             else:
                 # Новый пик
@@ -207,9 +211,11 @@ class PeakWatchlistManager(QObject):
 
                 # Добавляем в watchlist если подтвержден и ранее не добавляли такой центр
                 if peak.consecutive_detections >= max(1, self.min_confirmation_sweeps):
-                    if not any(abs(peak.center_freq_hz - c) < 1e6 for c in self._ever_added_centers):
-                        self._add_to_watchlist(peak, user_span_hz or self.watchlist_span_hz)
-                        self._ever_added_centers.add(peak.center_freq_hz)
+                    proposed_span = float(user_span_hz or self.watchlist_span_hz)
+                    if self._should_add_entry(peak.center_freq_hz, proposed_span):
+                        if not any(abs(peak.center_freq_hz - c) < 1e6 for c in self._ever_added_centers):
+                            self._add_to_watchlist(peak, proposed_span)
+                            self._ever_added_centers.add(peak.center_freq_hz)
 
         # Эмитим сигналы для новых пиков
         for peak in new_peaks:
@@ -250,8 +256,9 @@ class PeakWatchlistManager(QObject):
         # 1. Находим связные области
         regions = self._find_connected_regions(above_threshold)
 
-        # 2. Объединяем близко расположенные регионы
-        merged_regions = self._merge_nearby_regions(regions, freqs_hz)
+        # 2. Объединяем близко расположенные регионы (динамический порог = 0.25×span)
+        current_span_hz = float(self.watchlist_span_hz)
+        merged_regions = self._merge_nearby_regions(regions, freqs_hz, merge_gap_hz=max(0.0, 0.25 * current_span_hz))
 
         for start_idx, end_idx in merged_regions:
             region_freqs = freqs_hz[start_idx:end_idx+1]
@@ -325,7 +332,7 @@ class PeakWatchlistManager(QObject):
 
         return regions
 
-    def _merge_nearby_regions(self, regions: List[Tuple[int, int]], freqs_hz: np.ndarray) -> List[Tuple[int, int]]:
+    def _merge_nearby_regions(self, regions: List[Tuple[int, int]], freqs_hz: np.ndarray, merge_gap_hz: Optional[float] = None) -> List[Tuple[int, int]]:
         """
         Объединяет близко расположенные регионы если разрыв меньше merge_if_gap_hz.
         """
@@ -335,10 +342,11 @@ class PeakWatchlistManager(QObject):
         merged = []
         current_start, current_end = regions[0]
 
+        allowed_gap = float(self.merge_if_gap_hz if merge_gap_hz is None else merge_gap_hz)
         for start, end in regions[1:]:
             # Проверяем разрыв между регионами
             gap_hz = freqs_hz[start] - freqs_hz[current_end]
-            if gap_hz <= self.merge_if_gap_hz:
+            if gap_hz <= allowed_gap:
                 # Объединяем регионы
                 current_end = end
             else:
@@ -349,6 +357,35 @@ class PeakWatchlistManager(QObject):
         # Добавляем последний регион
         merged.append((current_start, current_end))
         return merged
+
+    def _should_add_entry(self, center_hz: float, span_hz: float) -> bool:
+        """Проверяет, что новая запись не вложена/не дубликат существующей.
+        Условия запрета:
+        - перекрытие окон ≥ 60% меньшего окна
+        - |Δf| < 0.5 × span существующей записи
+        - запись рядом моложе hysteresis
+        """
+        if not self.watchlist:
+            return True
+        now = time.time()
+        new_start = center_hz - span_hz / 2.0
+        new_end = center_hz + span_hz / 2.0
+        for entry in self.watchlist.values():
+            exist_start = entry.freq_start_hz
+            exist_end = entry.freq_stop_hz
+            # Перекрытие
+            inter = max(0.0, min(new_end, exist_end) - max(new_start, exist_start))
+            if inter > 0:
+                ref_span = min(span_hz, entry.span_hz)
+                if ref_span > 0 and (inter / ref_span) >= 0.60:
+                    return False
+            # Близость центров
+            if abs(center_hz - entry.center_freq_hz) < 0.5 * entry.span_hz:
+                return False
+            # Хистерезис (время)
+            if (now - entry.created_at) < self._add_hysteresis_sec and abs(center_hz - entry.center_freq_hz) < entry.span_hz:
+                return False
+        return True
 
     def _calculate_cluster_metrics(self, freqs_hz: np.ndarray, power_dbm: np.ndarray,
                                  start_idx: int, end_idx: int) -> Tuple[float, float, float, float, float, float]:
