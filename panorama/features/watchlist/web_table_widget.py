@@ -178,6 +178,42 @@ class WebTableWidget(QWebEngineView):
         }}
         """
         self.page().runJavaScript(js_code)
+
+    def append_log_entry(self, entry: Dict[str, Any]):
+        """Добавляет строку в веб-лог измерений под таблицей."""
+        js_code = f"""
+        if (window.tableAPI && typeof window.tableAPI.appendLog === 'function') {{
+            window.tableAPI.appendLog({json.dumps(entry)});
+        }} else {{
+            console.warn('appendLog function not available');
+        }}
+        """
+        self.page().runJavaScript(js_code)
+
+    def push_rssi_update(self, peak_id: str, slave_id: str, rssi_value: float):
+        """Пушит точечное обновление RSSI в веб-таблицу по peak_id.
+
+        Используется, когда идентификатор строки уже стабилен.
+        """
+        js_code = f"""
+        if (window.tableAPI && typeof window.tableAPI.updateRSSI === 'function') {{
+            window.tableAPI.updateRSSI('{peak_id}', '{slave_id}', {float(rssi_value)});
+        }} else {{
+            console.warn('updateRSSI function not available');
+        }}
+        """
+        self.page().runJavaScript(js_code)
+
+    def push_rssi_update_by_range(self, range_str: str, slave_id: str, rssi_value: float):
+        """Фоллбек-обновление RSSI по текстовому диапазону (когда peak_id ещё не зафиксирован)."""
+        js_code = f"""
+        if (window.tableAPI && typeof window.tableAPI.updateRSSIByRange === 'function') {{
+            window.tableAPI.updateRSSIByRange('{range_str}', '{slave_id}', {float(rssi_value)});
+        }} else {{
+            console.warn('updateRSSIByRange function not available');
+        }}
+        """
+        self.page().runJavaScript(js_code)
     
     def set_theme(self, theme: str):
         """Устанавливает тему интерфейса."""

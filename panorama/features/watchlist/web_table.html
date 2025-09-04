@@ -363,14 +363,38 @@
             </div>
         </div>
 
-        <!-- Блок статистики под таблицей удалён по требованиям -->
+        <!-- Таблица лога измерений по поддиапазонам -->
+        <div class="rssi-matrix">
+            <div class="table-container">
+                <table id="log-table">
+                    <thead>
+                        <tr>
+                            <th>Время</th>
+                            <th>PeakID</th>
+                            <th>Slave</th>
+                            <th>Центр (МГц)</th>
+                            <th>Halfspan (МГц)</th>
+                            <th>RMS (дБм)</th>
+                            <th>Шум (дБм)</th>
+                            <th>SNR (дБ)</th>
+                        </tr>
+                    </thead>
+                    <tbody id="log-tbody">
+                        <tr>
+                            <td colspan="8" class="empty-state">Лог измерений пуст</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
     </div>
 
     <div class="tooltip" id="tooltip"></div>
 
     <script>
         // Global state
-        let measurementData = new Map();
+        let measurementData = new Map(); // key: peak_id (stable); value: row object
+        let rangeToId = new Map();       // transient mapping: display range -> peak_id
         let isConnected = false;
         let isMeasuring = false;
         let updateCount = 0;
@@ -426,12 +450,14 @@
             const freqVal = (data.freq_mhz ?? data.frequency ?? 0);
             const spanVal = (data.span ?? 5);
             const rangeKey = data.range || `${(freqVal - spanVal/2).toFixed(1)}-${(freqVal + spanVal/2).toFixed(1)}`;
-            const prev = measurementData.get(rangeKey) || {};
-            measurementData.set(rangeKey, {
+            const id = data.peak_id || rangeToId.get(rangeKey) || rangeKey; // prefer stable id when known
+            const prev = measurementData.get(id) || {};
+            measurementData.set(id, {
                 rssi: {...(prev.rssi||{}), ...(data.rssi||{})},
                 confidence: data.confidence ?? prev.confidence ?? 0,
                 timestamp: Date.now(),
-                peak_id: data.peak_id || prev.peak_id || rangeKey,
+                peak_id: data.peak_id || prev.peak_id || id,
+                displayRange: rangeKey,
                 baseline: data.baseline || prev.baseline,
                 sub_centers: data.sub_centers || prev.sub_centers,
                 sub_halfspan: data.sub_halfspan || prev.sub_halfspan
@@ -441,25 +467,41 @@
             updateLastUpdateTime();
         }
 
-        // Update RSSI data
-        function updateRSSI(peakId, slaveId, rssiValue) {
-            // Автообновление всегда включено в автономном режиме
-            
+        // Internal helper: set RSSI into in-memory state by id or range and refresh UI once
+        function setRSSIValue({peakId, rangeStr, slaveId, rssiValue}) {
             updateCount++;
-            
-            for (let [key, measurement] of measurementData) {
-                if (measurement.peak_id === peakId) {
-                    if (!measurement.rssi) measurement.rssi = {};
-                    measurement.rssi[slaveId] = rssiValue;
-                    measurement.timestamp = Date.now();
-                    
-                    renderTable();
-                    updateStats();
-                    updateLastUpdateTime();
-                    break;
+            const trySet = (row) => {
+                if (!row) return false;
+                if (!row.rssi) row.rssi = {};
+                row.rssi[slaveId] = rssiValue;
+                row.timestamp = Date.now();
+                return true;
+            };
+
+            // 1) by stable id
+            if (peakId && measurementData.has(peakId)) {
+                trySet(measurementData.get(peakId));
+            } else if (rangeStr) {
+                // 2) by mapped id
+                const mapped = rangeToId.get(rangeStr);
+                if (mapped && measurementData.has(mapped)) {
+                    trySet(measurementData.get(mapped));
+                } else {
+                    // 3) by displayRange scan
+                    for (let [k, row] of measurementData.entries()) {
+                        if (row.displayRange === rangeStr) { trySet(row); break; }
+                    }
                 }
             }
+
+            renderTable();
+            updateStats();
+            updateLastUpdateTime();
         }
+
+        // Public API wrappers used from Python
+        function updateRSSI(peakId, slaveId, rssiValue) { setRSSIValue({peakId, slaveId, rssiValue}); }
+        function updateRSSIByRange(rangeStr, slaveId, rssiValue) { setRSSIValue({rangeStr, slaveId, rssiValue}); }
 
         function getSlaveTooltip(slaveId) {
             const info = (window.slavesInfo && (window.slavesInfo[slaveId] || window.slavesInfo[String(slaveId)])) || null;
@@ -492,6 +534,7 @@
 
         // Get confidence class
         function getConfidenceClass(confidence) {
+            if (typeof confidence !== 'number') return 'confidence-low';
             if (confidence >= 0.8) return 'confidence-high';
             if (confidence >= 0.5) return 'confidence-medium';
             return 'confidence-low';
@@ -513,9 +556,23 @@
                 return;
             }
 
+            // Стабильная сортировка по центру диапазона (МГц), чтобы строки не прыгали
+            const getCenterMHz = (m) => {
+                const parts = String(m.displayRange || '').split('-');
+                const start = parseFloat(parts[0]);
+                const end = parseFloat(parts[1]);
+                if (isFinite(start) && isFinite(end)) return (start + end) / 2;
+                return 0;
+            };
             const rows = Array.from(measurementData.entries())
-                .sort((a, b) => b[1].timestamp - a[1].timestamp)
-                .flatMap(([rangeStr, m]) => {
+                .sort((a, b) => {
+                    const ca = getCenterMHz(a[1]);
+                    const cb = getCenterMHz(b[1]);
+                    if (ca !== cb) return ca - cb; // по возрастанию частоты
+                    return String(a[0]).localeCompare(String(b[0])); // стабильность
+                })
+                .flatMap(([id, m]) => {
+                    const rangeStr = m.displayRange || '—';
                     const r0 = m.rssi?.slave0 ?? m.rssi?.['0'] ?? '—';
                     const r1 = m.rssi?.slave1 ?? m.rssi?.['1'] ?? '—';
                     const r2 = m.rssi?.slave2 ?? m.rssi?.['2'] ?? '—';
@@ -526,65 +583,30 @@
                     const b2 = m.baseline?.slave2 ?? (window.slavesInfo?.slave2?.noise_baseline_dbm) ?? '—';
                     const baselineStr = `${typeof b0==='number'? b0.toFixed(1):'—'} / ${typeof b1==='number'? b1.toFixed(1):'—'} / ${typeof b2==='number'? b2.toFixed(1):'—'}`;
                     
-                    const confidence = m.confidence ? `${(m.confidence * 100).toFixed(1)}%` : '—';
+                    const confPct = (typeof m.confidence === 'number') ? `${(m.confidence * 100).toFixed(1)}%` : '—';
                     
                     // Первая строка - видеодиапазон (основная)
                     const mainRow = `
-                        <tr class="new-data" data-peak-id="${m.peak_id || 'unknown'}" style="background-color: rgba(52, 152, 219, 0.1);">
+                        <tr data-peak-id="${m.peak_id || 'unknown'}" style="background-color: rgba(52, 152, 219, 0.1);">
                             <td class="freq-cell"><strong>📺 Видео: ${rangeStr}</strong></td>
-                            <td class="rssi-cell rssi-none" title="${getSlaveTooltip('slave0')}">—</td>
-                            <td class="rssi-cell rssi-none" title="${getSlaveTooltip('slave1')}">—</td>
-                            <td class="rssi-cell rssi-none" title="${getSlaveTooltip('slave2')}">—</td>
+                            <td class="rssi-cell ${getRSSIColorClass(r0,'slave0')}" title="${getSlaveTooltip('slave0')}">${typeof r0==='number'? r0.toFixed(1):'—'}</td>
+                            <td class="rssi-cell ${getRSSIColorClass(r1,'slave1')}" title="${getSlaveTooltip('slave1')}">${typeof r1==='number'? r1.toFixed(1):'—'}</td>
+                            <td class="rssi-cell ${getRSSIColorClass(r2,'slave2')}" title="${getSlaveTooltip('slave2')}">${typeof r2==='number'? r2.toFixed(1):'—'}</td>
                             <td class="baseline-cell" style="font-size: 11px; color: #666;" title="Baseline per slave">${baselineStr}</td>
-                            <td class="${getConfidenceClass(m.confidence)}">${confidence}</td>
+                            <td class="${getConfidenceClass(m.confidence)}">${confPct}</td>
                             <td>
                                 <button class="btn btn-primary" style="padding: 4px 8px; font-size: 10px;" 
                                         onclick="showOnMap('${m.peak_id || 'unknown'}')">Карта</button>
                             </td>
                         </tr>
                     `;
-                    
-                    // Создаем поддиапазоны для каждого slave с динамическим центром 
-                    const subRows = [];
-                    const slavesToShow = ['slave0', 'slave1', 'slave2'];
-                    for (let i = 0; i < slavesToShow.length; i++) {
-                        const slaveId = slavesToShow[i];
-                        const rssiVal = [r0, r1, r2][i];
-                        if (typeof rssiVal === 'number') {
-                            // Показываем поддиапазон только если есть данные от slave
-                            const parts = String(rangeStr).split('-');
-                            const start = parseFloat(parts[0]);
-                            const end = parseFloat(parts[1]);
-                            const centerFallback = (isFinite(start) && isFinite(end)) ? (start + end) / 2 : (parseFloat(rangeStr) || 0);
-                            const centerFreq = m.sub_centers?.[slaveId] ?? centerFallback; // Default center = center of main range
-                            const halfspan = m.sub_halfspan ?? 2.5; // Default halfspan 2.5 MHz
-                            const subRangeStr = `${(centerFreq - halfspan).toFixed(1)}-${(centerFreq + halfspan).toFixed(1)}`;
-                            
-                            subRows.push(`
-                                <tr class="new-data" data-peak-id="${m.peak_id || 'unknown'}_${slaveId}" style="background-color: rgba(46, 204, 113, 0.05); font-size: 12px;">
-                                    <td class="freq-cell" style="padding-left: 20px;">└─ ${slaveId}: ${subRangeStr} MHz</td>
-                                    <td class="rssi-cell ${i===0 ? getRSSIColorClass(rssiVal, slaveId) : ''}">${i===0 && typeof rssiVal==='number'? rssiVal.toFixed(1) : '—'}</td>
-                                    <td class="rssi-cell ${i===1 ? getRSSIColorClass(rssiVal, slaveId) : ''}">${i===1 && typeof rssiVal==='number'? rssiVal.toFixed(1) : '—'}</td>
-                                    <td class="rssi-cell ${i===2 ? getRSSIColorClass(rssiVal, slaveId) : ''}">${i===2 && typeof rssiVal==='number'? rssiVal.toFixed(1) : '—'}</td>
-                                    <td class="baseline-cell" style="font-size: 10px; color: #999;">—</td>
-                                    <td>—</td>
-                                    <td>—</td>
-                                </tr>
-                            `);
-                        }
-                    }
-                    
-                    return [mainRow, ...subRows];
+                    // Больше не рендерим поддиапазоны в основной таблице
+                    return [mainRow];
                 }).join('');
 
             tbody.innerHTML = rows;
 
-            // Remove animation after a short delay
-            setTimeout(() => {
-                document.querySelectorAll('.new-data').forEach(el => {
-                    el.classList.remove('new-data');
-                });
-            }, 2000);
+            // Убрали анимацию, чтобы строки не мигали
         }
 
         // Update statistics
@@ -685,7 +707,9 @@
             updateMeasurementStatus: updateMeasurementStatus,
             addMeasurement: addOrUpdateMeasurement,
             updateRSSI: updateRSSI,
-            clearData: clearData
+            updateRSSIByRange: updateRSSIByRange,
+            clearData: clearData,
+            appendLog: appendLog
         };
 
         // QWebChannel integration
@@ -702,14 +726,15 @@
         // API functions for Python communication
         function updateRSSIData(rssiData) {
             // rssiData: {"f1-f2": {slave0: -50, slave1: -60, ...}}
-            measurementData.clear();
             const now = Date.now();
             for (const [rangeStr, slaveData] of Object.entries(rssiData)) {
-                measurementData.set(rangeStr, {
-                    rssi: slaveData,
-                    timestamp: now,
-                    peak_id: rangeStr
-                });
+                const id = rangeToId.get(rangeStr) || rangeStr;
+                const row = measurementData.get(id) || {};
+                row.rssi = slaveData;
+                row.timestamp = now;
+                row.peak_id = row.peak_id || id;
+                row.displayRange = rangeStr;
+                measurementData.set(id, row);
             }
             renderTable();
             updateStats();
@@ -729,19 +754,55 @@
         }
         
         function updateTargetsInfo(targetsInfo) {
-            // Добавляем уверенность при наличии
+            // targetsInfo: rangeStr -> {peak_id, confidence, ...}
             for (const [rangeStr, info] of Object.entries(targetsInfo||{})) {
-                const row = measurementData.get(rangeStr) || {};
-                row.confidence = info.confidence ?? row.confidence ?? 0;
-                row.peak_id = info.peak_id || row.peak_id || rangeStr;
+                const id = info.peak_id || rangeStr;
+                rangeToId.set(rangeStr, id);
+                // Миграция: если запись лежит под ключом rangeStr — переносим на стабильный ключ id
+                const existingByRange = measurementData.get(rangeStr);
+                if (existingByRange) {
+                    measurementData.delete(rangeStr);
+                    existingByRange.peak_id = id;
+                    existingByRange.displayRange = rangeStr;
+                    measurementData.set(id, existingByRange);
+                }
+                const row = measurementData.get(id) || { peak_id: id, displayRange: rangeStr };
+                // Показываем только confidence из движка трилатерации
+                if (info.has_trilateration && typeof info.confidence === 'number') {
+                    row.confidence = info.confidence;
+                    row.confidence_source = 'engine';
+                }
                 if (info.baseline) row.baseline = info.baseline;
                 if (info.sub_centers) row.sub_centers = info.sub_centers;
                 if (info.sub_halfspan) row.sub_halfspan = info.sub_halfspan;
                 row.timestamp = Date.now();
-                measurementData.set(rangeStr, row);
+                measurementData.set(id, row);
             }
             renderTable();
             updateStats();
+        }
+
+        // --- Лог измерений ---
+        function appendLog(entry) {
+            // entry: {time, peak_id, slave_id, center_mhz, halfspan_mhz, rssi_dbm, noise_dbm, snr_db}
+            const tbody = document.getElementById('log-tbody');
+            if (!tbody) return;
+            const tr = document.createElement('tr');
+            const cells = [
+                entry.time || new Date().toLocaleTimeString(),
+                entry.peak_id || '—',
+                entry.slave_id || '—',
+                (entry.center_mhz ?? '—'),
+                (entry.halfspan_mhz ?? '—'),
+                (typeof entry.rssi_dbm==='number'? entry.rssi_dbm.toFixed(1):'—'),
+                (typeof entry.noise_dbm==='number'? entry.noise_dbm.toFixed(1):'—'),
+                (typeof entry.snr_db==='number'? entry.snr_db.toFixed(1):'—')
+            ];
+            tr.innerHTML = cells.map(v => `<td>${v}</td>`).join('');
+            if (tbody.firstChild && tbody.firstChild.classList && tbody.firstChild.classList.contains('empty-state')) {
+                tbody.innerHTML = '';
+            }
+            tbody.prepend(tr);
         }
         
         function updatePerformanceStats(stats) {

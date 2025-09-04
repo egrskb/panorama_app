@@ -228,6 +228,7 @@ check_conda_env() {
 run_panorama() {
     local webgl_mode="$1"
     local os_type="$2"
+    local debug_mode="$3"
     
     echo "🚀 Запуск Panorama App..."
     
@@ -288,15 +289,53 @@ run_panorama() {
             ;;
     esac
     
-    # Запускаем приложение
-    # Определяем путь к лаунчеру
-    if [ -f "run_rssi_panorama.py" ]; then
-        python run_rssi_panorama.py
-    elif [ -f "panorama/run_rssi_panorama.py" ]; then
-        python panorama/run_rssi_panorama.py
+    # Настраиваем логирование если включен debug режим
+    if [ "$debug_mode" = "true" ]; then
+        # Создаем директорию для логов если её нет
+        mkdir -p logs
+        
+        # Генерируем имя файла с временной меткой
+        local timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
+        local log_file="logs/panorama_${timestamp}.log"
+        
+        echo "🔍 Debug режим включен"
+        echo "📝 Лог файл: $log_file"
+        echo "========================================" | tee "$log_file"
+        echo "Panorama App Debug Log - $timestamp" | tee -a "$log_file"
+        echo "========================================" | tee -a "$log_file"
+        echo "" | tee -a "$log_file"
+        
+        # Запускаем приложение с логированием
+        if [ -f "run_rssi_panorama.py" ]; then
+            python run_rssi_panorama.py 2>&1 | tee -a "$log_file"
+        elif [ -f "panorama/run_rssi_panorama.py" ]; then
+            python panorama/run_rssi_panorama.py 2>&1 | tee -a "$log_file"
+        else
+            echo "❌ Не найден файл запуска run_rssi_panorama.py" | tee -a "$log_file"
+            exit 1
+        fi
+        
+        # Сохраняем код выхода
+        local exit_code=$?
+        
+        echo "" | tee -a "$log_file"
+        echo "========================================" | tee -a "$log_file"
+        echo "Debug сессия завершена" | tee -a "$log_file"
+        echo "Код выхода: $exit_code" | tee -a "$log_file"
+        echo "Лог файл: $log_file" | tee -a "$log_file"
+        echo "========================================" | tee -a "$log_file"
+        
+        exit $exit_code
     else
-        echo "❌ Не найден файл запуска run_rssi_panorama.py"
-        exit 1
+        # Обычный запуск без логирования
+        if [ -f "run_rssi_panorama.py" ]; then
+            python run_rssi_panorama.py
+        elif [ -f "panorama/run_rssi_panorama.py" ]; then
+            python panorama/run_rssi_panorama.py
+        else
+            echo "❌ Не найден файл запуска run_rssi_panorama.py"
+            exit 1
+        fi
     fi
 }
 
@@ -319,6 +358,7 @@ main() {
         echo "  -webgl         Включить WebGL поддержку"
         echo "  -webglforce    Принудительно включить WebGL (обход блокировок)"
         echo "  -nowebgl       Отключить WebGL (режим совместимости, по умолчанию)"
+        echo "  -debug         Сохранить весь вывод в лог файл"
         echo
         echo "Платформы:"
         echo "  -linux         Принудительно использовать Linux режим"
@@ -329,6 +369,7 @@ main() {
         echo "  $0 --run -webglforce -linux    Запустить с принудительным WebGL на Linux"
         echo "  $0 --run -webgl -macos         Запустить с WebGL на macOS"
         echo "  $0 -webglforce                  Полная установка и запуск с принудительным WebGL"
+        echo "  $0 --run -debug -linux         Запустить с логированием на Linux"
         echo
         exit 0
     fi
@@ -337,6 +378,7 @@ main() {
     local webgl_mode="nowebgl"
     local main_action=""
     local forced_os=""
+    local debug_mode="false"
     
     # Обрабатываем аргументы
     for arg in "$@"; do
@@ -349,6 +391,9 @@ main() {
                 ;;
             "-nowebgl")
                 webgl_mode="nowebgl"
+                ;;
+            "-debug")
+                debug_mode="true"
                 ;;
             "-linux")
                 forced_os="linux"
@@ -431,7 +476,7 @@ main() {
                     check_conda_env
                     ;;
             esac
-            run_panorama "$webgl_mode" "$os_type"
+            run_panorama "$webgl_mode" "$os_type" "$debug_mode"
             ;;
         "")
             # Полная установка и запуск
@@ -452,7 +497,7 @@ main() {
                     check_conda_env
                     ;;
             esac
-            run_panorama "$webgl_mode" "$os_type"
+            run_panorama "$webgl_mode" "$os_type" "$debug_mode"
             ;;
     esac
 }

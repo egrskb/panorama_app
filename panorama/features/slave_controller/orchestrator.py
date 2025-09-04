@@ -89,6 +89,9 @@ class Orchestrator(QObject):
         self._cleanup_timer.timeout.connect(self._cleanup_old)
         self._cleanup_timer.start(5000)
 
+        # Live-буфер последних RMS для UI (range_str -> {slave_id: (rssi, ts)})
+        self._live_rssi: Dict[str, Dict[str, tuple]] = {}
+
         # Периодическое обновление измерений watchlist (постоянные замеры)
         self.measure_interval_ms = 1000  # увеличили интервал до 1 секунды для стабильности
         self._last_measure_at: Dict[str, float] = {}
@@ -114,6 +117,11 @@ class Orchestrator(QObject):
         self.slave_manager = sm
         if sm:
             sm.all_measurements_complete.connect(self._on_all_measurements_complete)
+            # Реалтайм-апдейты (каждое измерение)
+            try:
+                sm.measurement_progress.connect(self._on_measurement_progress)
+            except Exception:
+                pass
             sm.measurement_error.connect(self._on_measurement_error)
             self.log.info("Slave manager connected")
             self._emit_status()
@@ -326,8 +334,12 @@ class Orchestrator(QObject):
         try:
             pm = self.trilateration_coordinator.peak_manager
             now = time.time()
-            # Обходим все активные записи watchlist и ставим задачи, если пришло время
+            # Обходим все активные записи watchlist (без дублей) и ставим задачи, если пришло время
+            seen_ids: set = set()
             for entry in list(pm.watchlist.values()):
+                if entry.peak_id in seen_ids:
+                    continue
+                seen_ids.add(entry.peak_id)
                 peak_id = entry.peak_id
                 last_ts = self._last_measure_at.get(peak_id, 0.0)
                 if (now - last_ts) * 1000.0 < self.measure_interval_ms:
@@ -375,6 +387,17 @@ class Orchestrator(QObject):
                 self.completed.append(task)
                 self.log.info(f"Task completed: {tid} with {len(meas_list)} measurements")
 
+                # Консольный вывод RMS от каждого слейва (по завершению задачи)
+                try:
+                    for m in meas_list:
+                        self.log.info(
+                            f"RMS {m.slave_id}: {m.band_rssi_dbm:.1f} dBm (noise {m.band_noise_dbm:.1f} dBm, "
+                            f"SNR {m.snr_db:.1f} dB) @ {m.center_hz/1e6:.1f} MHz"
+                        )
+                    
+                except Exception:
+                    pass
+
                 # Всегда обновляем RMS в watchlist для UI (даже при низком SNR)
                 try:
                     if self.trilateration_coordinator:
@@ -404,12 +427,22 @@ class Orchestrator(QObject):
                     try:
                         # Преобразуем список измерений в словарь RSSI для движка
                         rssi_dict: Dict[str, float] = {m.slave_id: float(m.band_rssi_dbm) for m in valid}
+
+                        # Фильтруем по известным станциям, чтобы не спамить ошибками движка
+                        try:
+                            known_stations = set(getattr(self.trilateration_engine, 'get_station_positions')())
+                        except Exception:
+                            known_stations = set(getattr(self.trilateration_engine, 'stations', {}).keys())
+                        rssi_known = {sid: val for sid, val in rssi_dict.items() if sid in known_stations}
+                        if len(rssi_known) < 3:
+                            # Недостаточно известных станций — пропускаем расчёт, избежав ошибок в логе
+                            raise RuntimeError("skip_trilateration_insufficient_known")
                         # Извлекаем peak_id по частоте (берём из первого валидного измерения)
                         freq_hz = float(valid[0].center_hz)
                         freq_mhz = freq_hz / 1e6
                         peak_id_guess = self._get_peak_id_for_freq(freq_hz) or f"peak_{int(freq_mhz)}MHz"
                         result: Optional[TrilaterationResult] = self.trilateration_engine.calculate_position(
-                            rssi_dict, peak_id=peak_id_guess, freq_mhz=freq_mhz
+                            rssi_known, peak_id=peak_id_guess, freq_mhz=freq_mhz
                         )
                         if result:
                             self.target_update.emit(result)  # alias уйдёт автоматически
@@ -417,7 +450,8 @@ class Orchestrator(QObject):
                                 f"Trilateration: ({result.x:.1f},{result.y:.1f}) conf={result.confidence:.2f}"
                             )
                     except Exception as e:
-                        self._emit_error(f"Trilateration error: {e}")
+                        if str(e) != "skip_trilateration_insufficient_known":
+                            self._emit_error(f"Trilateration error: {e}")
                 
                 # Передаем в координатор трилатерации только валидные измерения (для трекинга)
                 if self.trilateration_coordinator:
@@ -431,12 +465,69 @@ class Orchestrator(QObject):
                                 rssi_rms_dbm=measurement.band_rssi_dbm
                             )
 
+                # Гарантируем непрерывность: если таймер ещё не поставил следующее окно,
+                # а последний запуск по этому peak_id был давно — ставим одно окно сразу
+                try:
+                    any_pid = None
+                    any_center = None
+                    for m in meas_list:
+                        pid = self._get_peak_id_for_freq(m.center_hz)
+                        if pid:
+                            any_pid = pid
+                            any_center = float(m.center_hz)
+                            break
+                    if any_pid and self.trilateration_coordinator:
+                        now = time.time()
+                        last = self._last_measure_at.get(any_pid, 0.0)
+                        if (now - last) * 1000.0 >= max(500.0, self.measure_interval_ms * 0.8):
+                            pm = self.trilateration_coordinator.peak_manager
+                            entry = pm.watchlist.get(any_pid)
+                            if entry:
+                                self._last_measure_at[any_pid] = now
+                                self.enqueue_watchlist_task({
+                                    'peak_id': any_pid,
+                                    'center_freq_hz': float(entry.center_freq_hz),
+                                    'span_hz': float(entry.span_hz)
+                                })
+                except Exception:
+                    pass
+
             # после обработки — запускаем следующую задачу, если есть
             self._process_queue()
             self._emit_status()
 
         except Exception as e:
             self._emit_error(f"Error in _on_all_measurements_complete: {e}")
+
+    def _on_measurement_progress(self, m: RSSIMeasurement):
+        """Онлайновое обновление RSSI и baseline для UI/веб-таблицы."""
+        try:
+            # Пробуем привязать к существующему peak_id по частоте
+            peak_id_any = self._get_peak_id_for_freq(m.center_hz)
+            if self.trilateration_coordinator and peak_id_any:
+                self.trilateration_coordinator.peak_manager.update_rssi_measurement(
+                    peak_id_any, m.slave_id, m.band_rssi_dbm
+                )
+            # Кладём в live-буфер для мгновенного снапшота в таблицу
+            try:
+                rng = f"{(m.center_hz - m.span_hz/2)/1e6:.1f}-{(m.center_hz + m.span_hz/2)/1e6:.1f}"
+                if rng not in self._live_rssi:
+                    self._live_rssi[rng] = {}
+                self._live_rssi[rng][m.slave_id] = (float(m.band_rssi_dbm), float(time.time()))
+            except Exception:
+                pass
+            # Пингуем статус, чтобы веб-таблица получила свежие baseline по каждому слейву
+            self._emit_status()
+            # Реалтайм вывод RMS от слейва в консоль
+            try:
+                self.log.info(
+                    f"RMS {m.slave_id}: {m.band_rssi_dbm:.1f} dBm (noise {m.band_noise_dbm:.1f} dBm, "
+                    f"SNR {m.snr_db:.1f} dB) @ {m.center_hz/1e6:.1f} MHz"
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            self.log.debug(f"measurement_progress handler error: {e}")
 
     def _on_measurement_error(self, msg: str):
         self._emit_error(f"Measurement error: {msg}")
@@ -646,9 +737,18 @@ class Orchestrator(QObject):
         except Exception as e:
             self._emit_error(f"get_ui_snapshot: tasks error: {e}")
 
-        # RSSI измерения из завершённых задач
+        # RSSI измерения из завершённых задач + live-буфер прогресса
         try:
             measurements_ui = []
+            # live: отдаём последние измеренные значения без тайм-окна, чтобы не было «паузы»
+            try:
+                for rng, by_slave in self._live_rssi.items():
+                    for sid, (val, ts) in by_slave.items():
+                        measurements_ui.append({'range': rng, 'slave_id': sid, 'rssi_rms': val})
+            except Exception:
+                pass
+
+            # completed tasks snapshot
             for t in self.tasks.values():
                 if not t.measurements:
                     continue

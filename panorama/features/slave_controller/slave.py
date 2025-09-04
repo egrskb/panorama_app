@@ -448,6 +448,8 @@ class SlaveSDR(QObject):
 class SlaveManager(QObject):
     all_measurements_complete = pyqtSignal(list)  # List[RSSIMeasurement]
     measurement_error = pyqtSignal(str)
+    # Новый сигнал для онлайновых апдейтов по мере готовности измерений
+    measurement_progress = pyqtSignal(object)  # RSSIMeasurement
     slaves_updated = pyqtSignal(dict)  # {slave_id: {"uri": str, "is_initialized": bool}}
 
     def __init__(self, logger: logging.Logger):
@@ -547,6 +549,16 @@ class SlaveManager(QObject):
                     r = sl.measure_band_rssi(w.center, w.span, w.dwell_ms, k_cal_db=k)
                     with results_lock:
                         results.append(r)
+                    # Онлайн-уведомление: измерение готово — шлём в оркестратор/UI
+                    try:
+                        self.measurement_progress.emit(r)
+                    except Exception:
+                        pass
+                    # Апдейтим baseline/статусы слейвов в UI
+                    try:
+                        self._emit_slaves_updated()
+                    except Exception:
+                        pass
                 except Exception as e:
                     self.measurement_error.emit(f"{sl.slave_id}: {e}")
 

@@ -1110,7 +1110,7 @@ class PanoramaAppWindow(QMainWindow):
                         self.map_view.update_stations_from_config({'slaves': [{'nickname': s['id'], 'pos': [s['x'], s['y'], s['z']]} for s in stations]})
                     except Exception:
                         pass
-                    # Проброс статусов слейвов в веб-таблицу измерений
+                    # Проброс статусов слейвов в веб-таблицу измерений (для обновления baseline)
                     try:
                         if hasattr(self, 'slaves_view') and self.slaves_view and hasattr(self.slaves_view, 'web_table_widget') and self.slaves_view.web_table_widget:
                             self.slaves_view.web_table_widget.update_slaves_info(status)

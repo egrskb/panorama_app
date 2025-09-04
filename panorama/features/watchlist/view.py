@@ -449,6 +449,13 @@ class ImprovedSlavesView(QWidget):
                 self.web_table_widget.update_rssi_data(rssi_data)
                 self.web_table_widget.update_targets_info(targets_info)
             
+            # Пушим точечное обновление по range как фоллбек (на случай, если peak_id ещё не сопоставлен)
+            try:
+                if hasattr(self.web_table_widget, 'push_rssi_update_by_range'):
+                    self.web_table_widget.push_rssi_update_by_range(range_str, slave_id, float(rssi_rms))
+            except Exception:
+                pass
+
             # Обновляем статистику
             self._update_combined_stats()
             
@@ -997,24 +1004,51 @@ class ImprovedSlavesView(QWidget):
             if not self.web_table_widget:
                 return
             
-            # Обновляем данные в веб-таблице
-            current_data = self.web_table_widget.get_current_data()
-            rssi_data = current_data.get('rssi_data', {})
-            
-            # Добавляем новое RSSI значение
-            if range_str not in rssi_data:
-                rssi_data[range_str] = {}
-            
-            rssi_data[range_str][slave_id] = rssi_rms
-            
-            # Обновляем веб-таблицу
-            self.web_table_widget.update_rssi_data(rssi_data)
+            # Быстрый push обновления: сначала по peak_id (если известен), иначе по текстовому диапазону
+            try:
+                # Ищем peak_id по текущим данным targets_info
+                current = self.web_table_widget.get_current_data()
+                targets_info = current.get('targets_info', {})
+                peak_id = None
+                for rng, info in list(targets_info.items()):
+                    if rng == range_str:
+                        peak_id = info.get('peak_id')
+                        break
+                if peak_id and hasattr(self.web_table_widget, 'push_rssi_update'):
+                    self.web_table_widget.push_rssi_update(peak_id, slave_id, float(rssi_rms))
+                else:
+                    self.web_table_widget.push_rssi_update_by_range(range_str, slave_id, float(rssi_rms))
+            except Exception:
+                try:
+                    self.web_table_widget.push_rssi_update_by_range(range_str, slave_id, float(rssi_rms))
+                except Exception:
+                    pass
             
             # Обновляем статистику
             self._update_combined_stats()
         
         except Exception as e:
             print(f"[SlavesView] Error updating web table RSSI: {e}")
+
+    def append_measurement_log(self, peak_id: str, slave_id: str,
+                               center_mhz: float, halfspan_mhz: float,
+                               rssi_dbm: float, noise_dbm: float, snr_db: float):
+        """Прокидывает строку в веб-лог измерений."""
+        try:
+            if self.web_table_widget and hasattr(self.web_table_widget, 'append_log_entry'):
+                entry = {
+                    'time': time.strftime('%H:%M:%S'),
+                    'peak_id': peak_id,
+                    'slave_id': slave_id,
+                    'center_mhz': float(center_mhz),
+                    'halfspan_mhz': float(halfspan_mhz),
+                    'rssi_dbm': float(rssi_dbm),
+                    'noise_dbm': float(noise_dbm),
+                    'snr_db': float(snr_db)
+                }
+                self.web_table_widget.append_log_entry(entry)
+        except Exception:
+            pass
 
     def _on_combined_item_double_clicked(self, item: QTableWidgetItem):
         """Двойной клик — отправка записи на карту (без тяжёлых кнопок)."""
