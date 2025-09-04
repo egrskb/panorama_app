@@ -15,6 +15,7 @@ from PyQt5.QtCore import QObject, QUrl, pyqtSignal, pyqtSlot
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
 from PyQt5.QtWebChannel import QWebChannel
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
+from PyQt5.QtGui import QDesktopServices
 
 
 class MapInterface(QObject):
@@ -97,6 +98,11 @@ class MapLibreWidget(QWidget):
         btn_clear = QPushButton("🗑️ Clear Targets")
         btn_clear.clicked.connect(self.clear_targets)
         header_layout.addWidget(btn_clear)
+
+        # Open in external browser (avoid WebGL issues in embedded view)
+        btn_open_browser = QPushButton("🌐 Открыть в браузере")
+        btn_open_browser.clicked.connect(self.open_in_browser)
+        header_layout.addWidget(btn_open_browser)
         
         layout.addLayout(header_layout)
         
@@ -238,6 +244,53 @@ class MapLibreWidget(QWidget):
         self.targets.clear()
         script = "if (window.mapAPI) { window.mapAPI.clearTargets(); }"
         self._execute_js(script)
+
+    def open_in_browser(self):
+        """Open the same map in the system default web browser (WSL-aware)."""
+        try:
+            map_file = Path(__file__).parent / "maplibre_map.html"
+            if map_file.exists():
+                url = QUrl.fromLocalFile(str(map_file))
+                # Try native open first
+                if not QDesktopServices.openUrl(url):
+                    # WSL fallback: try to launch via powershell.exe on Windows
+                    import subprocess
+                    try:
+                        subprocess.Popen(["powershell.exe", "Start-Process", str(url.toString())])
+                        self.status_label.setText("🌐 Открыто в браузере Windows")
+                        return
+                    except Exception:
+                        pass
+                    # Last resort: simple python web server
+                    from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+                    import threading
+                    import socket
+                    host = "127.0.0.1"
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.bind((host, 0))
+                        port = s.getsockname()[1]
+                    base_dir = str((Path(__file__).parent))
+                    class Handler(SimpleHTTPRequestHandler):
+                        def translate_path(self, path):
+                            from urllib.parse import urlparse, unquote
+                            parsed = urlparse(path)
+                            rel = unquote(parsed.path.lstrip('/'))
+                            return str(Path(base_dir) / rel)
+                    server = ThreadingHTTPServer((host, port), Handler)
+                    threading.Thread(target=server.serve_forever, daemon=True).start()
+                    http_url = f"http://{host}:{port}/maplibre_map.html"
+                    # Try Windows browser via powershell first
+                    try:
+                        subprocess.Popen(["powershell.exe", "Start-Process", http_url])
+                        self.status_label.setText(f"🌐 Открыто в браузере Windows: {http_url}")
+                    except Exception:
+                        # Fallback to Qt open
+                        QDesktopServices.openUrl(QUrl(http_url))
+                        self.status_label.setText(f"🌐 Запущен локальный сервер: {http_url}")
+            else:
+                self.status_label.setText("❌ Файл карты не найден для открытия в браузере")
+        except Exception as e:
+            self.status_label.setText(f"❌ Не удалось открыть браузер: {e}")
     
     def set_connection_status(self, connected: bool):
         """Update the connection status indicator."""

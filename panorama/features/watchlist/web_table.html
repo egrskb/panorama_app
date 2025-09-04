@@ -324,10 +324,14 @@
                     <span id="measurement-text">Бездействие</span>
                 </div>
                 <div class="status-item">
+                    <div id="slaves-indicator" class="status-indicator status-disconnected"></div>
+                    <span id="slaves-text">Слейвы: 0/0</span>
+                </div>
+                <div class="status-item">
                     <span id="last-update">Нет обновлений</span>
                 </div>
                 <div class="status-item">
-                    <span id="update-rate">0 Гц</span>
+                    <span id="update-rate">—</span>
                 </div>
             </div>
         </div>
@@ -451,17 +455,32 @@
             }
         }
 
+        function getSlaveTooltip(slaveId) {
+            const info = (window.slavesInfo && (window.slavesInfo[slaveId] || window.slavesInfo[String(slaveId)])) || null;
+            if (!info) return `RMS от ${slaveId}`;
+            const base = (info.noise_baseline_dbm !== undefined) ? `, baseline ${info.noise_baseline_dbm.toFixed ? info.noise_baseline_dbm.toFixed(1) : info.noise_baseline_dbm} dBm` : '';
+            if (info.is_disabled) {
+                const t = Math.max(0, Math.floor(info.time_until_enable || 0));
+                return `RMS от ${slaveId} (отключен, ~${t}s${base})`;
+            }
+            return `RMS от ${slaveId}${base}`;
+        }
+
         // Get RSSI color class
-        function getRSSIColorClass(rssi) {
-            const threshold = -80; // фиксированный порог для раскраски
-            
+        function getRSSIColorClass(rssi, slaveId) {
             if (rssi === null || rssi === undefined || rssi === '—') {
                 return 'rssi-none';
             }
-            
+
             const value = parseFloat(rssi);
-            if (value >= threshold + 20) return 'rssi-good';
-            if (value >= threshold + 10) return 'rssi-medium';
+            // Пер-слейв порог: baseline + 10 дБ, иначе общий
+            const info = (window.slavesInfo && window.slavesInfo[slaveId]) || null;
+            const baseline = info && typeof info.noise_baseline_dbm === 'number' ? info.noise_baseline_dbm : -80;
+            const thrGood = baseline + 20;
+            const thrMed = baseline + 10;
+
+            if (value >= thrGood) return 'rssi-good';
+            if (value >= thrMed) return 'rssi-medium';
             return 'rssi-poor';
         }
 
@@ -498,13 +517,13 @@
                     return `
                         <tr class="new-data" data-peak-id="${m.peak_id || 'unknown'}">
                             <td class="freq-cell">${rangeStr}</td>
-                            <td class="rssi-cell ${getRSSIColorClass(r0)}" title="RMS от Slave 0">${typeof r0==='number'? r0.toFixed(1):'—'}</td>
-                            <td class="rssi-cell ${getRSSIColorClass(r1)}" title="RMS от Slave 1">${typeof r1==='number'? r1.toFixed(1):'—'}</td>
-                            <td class="rssi-cell ${getRSSIColorClass(r2)}" title="RMS от Slave 2">${typeof r2==='number'? r2.toFixed(1):'—'}</td>
+                            <td class="rssi-cell ${getRSSIColorClass(r0,'slave0')}" title="${getSlaveTooltip('slave0')}">${typeof r0==='number'? r0.toFixed(1):'—'}</td>
+                            <td class="rssi-cell ${getRSSIColorClass(r1,'slave1')}" title="${getSlaveTooltip('slave1')}">${typeof r1==='number'? r1.toFixed(1):'—'}</td>
+                            <td class="rssi-cell ${getRSSIColorClass(r2,'slave2')}" title="${getSlaveTooltip('slave2')}">${typeof r2==='number'? r2.toFixed(1):'—'}</td>
                             <td class="${getConfidenceClass(m.confidence)}">${confidence}</td>
                             <td>
                                 <button class="btn btn-primary" style="padding: 4px 8px; font-size: 10px;" 
-                                        onclick="showOnMap('${m.peak_id || 'unknown'}')">Map</button>
+                                        onclick="showOnMap('${m.peak_id || 'unknown'}')">Карта</button>
                             </td>
                         </tr>
                     `;
@@ -539,9 +558,12 @@
                 (allRSSI.reduce((a, b) => a + b, 0) / allRSSI.length).toFixed(1) + ' dBm' : 
                 '— dBm';
 
-            document.getElementById('total-targets').textContent = totalTargets;
-            document.getElementById('active-measurements').textContent = activeTargets;
-            document.getElementById('avg-rssi').textContent = avgRSSI;
+            const totalEl = document.getElementById('total-targets');
+            if (totalEl) totalEl.textContent = totalTargets;
+            const activeEl = document.getElementById('active-measurements');
+            if (activeEl) activeEl.textContent = activeTargets;
+            const avgEl = document.getElementById('avg-rssi');
+            if (avgEl) avgEl.textContent = avgRSSI;
         }
 
         // Update last update time
@@ -646,8 +668,15 @@
         }
         
         function updateSlavesInfo(slavesInfo) {
-            // Store slaves information for display
-            window.slavesInfo = slavesInfo;
+            window.slavesInfo = slavesInfo || {};
+            // Update header indicator
+            const vals = Object.values(window.slavesInfo);
+            const total = vals.length;
+            const disabled = vals.filter(v => v.is_disabled).length;
+            const ind = document.getElementById('slaves-indicator');
+            const txt = document.getElementById('slaves-text');
+            if (ind) ind.className = `status-indicator ${disabled>0 ? 'status-disconnected' : (total>0 ? 'status-connected' : 'status-disconnected')}`;
+            if (txt) txt.textContent = `Слейвы: ${total-disabled}/${total}`;
             renderTable();
         }
         

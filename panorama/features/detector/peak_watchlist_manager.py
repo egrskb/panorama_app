@@ -195,11 +195,28 @@ class PeakWatchlistManager(QObject):
                             print(f"[DEBUG] Peak {peak_id} detections: {existing_peak.consecutive_detections}")
                         except Exception:
                             pass
+                        # ДИНАМИЧЕСКИЙ центр: обновляем центр окна RSSI в записи watchlist
+                        try:
+                            if peak_id in self.watchlist:
+                                if self.center_mode == 'centroid' and existing_peak.centroid_freq_hz > 0.0:
+                                    new_center = existing_peak.centroid_freq_hz
+                                else:
+                                    new_center = existing_peak.center_freq_hz
+                                entry = self.watchlist[peak_id]
+                                if abs(entry.center_freq_hz - new_center) > 1.0:  # >1 Гц, чтобы не дёргать по мелочи
+                                    entry.center_freq_hz = new_center
+                                    entry.freq_start_hz = new_center - entry.span_hz/2
+                                    entry.freq_stop_hz = new_center + entry.span_hz/2
+                                    entry.last_update = current_time
+                        except Exception:
+                            pass
                         # Если достигнуто требуемое число подтверждений — добавляем в watchlist
                         if (existing_peak.consecutive_detections >= max(1, self.min_confirmation_sweeps)
                                 and peak_id not in self.watchlist):
                             proposed_span = float(user_span_hz or self.watchlist_span_hz)
-                            if self._should_add_entry(existing_peak.center_freq_hz, proposed_span):
+                            if self._should_add_entry(existing_peak.center_freq_hz, proposed_span,
+                                                       cluster_start_hz=existing_peak.cluster_start_hz,
+                                                       cluster_end_hz=existing_peak.cluster_end_hz):
                                 if not any(abs(existing_peak.center_freq_hz - c) < 1e6 for c in self._ever_added_centers):
                                     self._add_to_watchlist(existing_peak, proposed_span)
                                     self._ever_added_centers.add(existing_peak.center_freq_hz)
@@ -213,7 +230,9 @@ class PeakWatchlistManager(QObject):
                 # Добавляем в watchlist если подтвержден и ранее не добавляли такой центр
                 if peak.consecutive_detections >= max(1, self.min_confirmation_sweeps):
                     proposed_span = float(user_span_hz or self.watchlist_span_hz)
-                    if self._should_add_entry(peak.center_freq_hz, proposed_span):
+                    if self._should_add_entry(peak.center_freq_hz, proposed_span,
+                                               cluster_start_hz=peak.cluster_start_hz,
+                                               cluster_end_hz=peak.cluster_end_hz):
                         if not any(abs(peak.center_freq_hz - c) < 1e6 for c in self._ever_added_centers):
                             self._add_to_watchlist(peak, proposed_span)
                             self._ever_added_centers.add(peak.center_freq_hz)
@@ -360,12 +379,16 @@ class PeakWatchlistManager(QObject):
         merged.append((current_start, current_end))
         return merged
 
-    def _should_add_entry(self, center_hz: float, span_hz: float) -> bool:
-        """Проверяет, что новая запись не вложена/не дубликат существующей.
-        Условия запрета:
-        - перекрытие окон ≥ 60% меньшего окна
-        - |Δf| < 0.5 × span существующей записи
-        - запись рядом моложе hysteresis
+    def _should_add_entry(self, center_hz: float, span_hz: float,
+                          cluster_start_hz: float = None, cluster_end_hz: float = None) -> bool:
+        """Проверяет, что новая запись не дублирует существующую.
+        Логика:
+        - если есть активная запись и центр нового окна попадает в диапазон существующей — не добавляем
+        - если есть пересечение окон ≥ 60% меньшего окна — не добавляем
+        - если границы кластера известны и пересекаются с существующей записью
+          (центр существующей попадает внутрь кластера ИЛИ пересечение ≥ 30%) — не добавляем
+        - запрет по близости центров: |Δf| < 0.6 × span существующей
+        - гистерезис по времени
         """
         if not self.watchlist:
             return True
@@ -375,16 +398,25 @@ class PeakWatchlistManager(QObject):
         for entry in self.watchlist.values():
             exist_start = entry.freq_start_hz
             exist_end = entry.freq_stop_hz
-            # Перекрытие
+            # 1) Попадание центра
+            if exist_start <= center_hz <= exist_end:
+                return False
+            # 2) Перекрытие окон
             inter = max(0.0, min(new_end, exist_end) - max(new_start, exist_start))
             if inter > 0:
                 ref_span = min(span_hz, entry.span_hz)
                 if ref_span > 0 and (inter / ref_span) >= 0.60:
                     return False
-            # Близость центров
-            if abs(center_hz - entry.center_freq_hz) < 0.5 * entry.span_hz:
+            # 3) Кластерная проверка (если доступны границы кластера)
+            if cluster_start_hz is not None and cluster_end_hz is not None and cluster_end_hz > cluster_start_hz:
+                cluster_inter = max(0.0, min(cluster_end_hz, exist_end) - max(cluster_start_hz, exist_start))
+                cluster_span = max(1.0, cluster_end_hz - cluster_start_hz)
+                if (exist_start <= (cluster_start_hz + cluster_end_hz) / 2.0 <= exist_end) or (cluster_inter / min(cluster_span, (exist_end - exist_start))) >= 0.30:
+                    return False
+            # 4) Близость центров (усилена до 0.6×span)
+            if abs(center_hz - entry.center_freq_hz) < 0.6 * entry.span_hz:
                 return False
-            # Хистерезис (время)
+            # 5) Хистерезис (время)
             if (now - entry.created_at) < self._add_hysteresis_sec and abs(center_hz - entry.center_freq_hz) < entry.span_hz:
                 return False
         return True
@@ -523,6 +555,27 @@ class PeakWatchlistManager(QObject):
         if peak_id in self.watchlist:
             self.watchlist[peak_id].rssi_measurements[slave_id] = rssi_dbm
             self.watchlist[peak_id].last_update = time.time()
+            # Консольный лог для дебага
+            try:
+                print(f"[Watchlist] RSSI update: {peak_id} {slave_id} = {rssi_dbm:.1f} dBm")
+            except Exception:
+                pass
+            # Автоудаление, если сигнал сравнялся с шумом (все RSSI ниже baseline+δ)
+            try:
+                baseline_med = float(np.median(list(self.baseline_history))) if len(self.baseline_history) > 0 else -90.0
+                threshold = baseline_med + max(3.0, self.min_snr_db)  # немного выше порога SNR
+                vals = list(self.watchlist[peak_id].rssi_measurements.values())
+                strong = [v for v in vals if v is not None and v > threshold]
+                # Если ни один slave не показывает сигнал выше порога в течение 10с — удаляем
+                if not strong and (time.time() - self.watchlist[peak_id].last_update) > 10.0:
+                    try:
+                        del self.watchlist[peak_id]
+                        self.watchlist_updated.emit(list(self.watchlist.values()))
+                        print(f"[Watchlist] Removed inactive peak {peak_id} (RSSI near noise)")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     def get_rssi_for_trilateration(self, peak_id: str) -> Optional[Dict[str, float]]:
         """

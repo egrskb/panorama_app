@@ -143,9 +143,13 @@ class ComponentsManager:
             self.trilateration_engine.stations.clear()
             
             # Добавляем slaves в трилатерацию (Master исключен - только спектр)
+            # ВАЖНО: нормализуем идентификаторы к 'slave0/1/2' чтобы совпадать с теми,
+            # которые используются в измерениях и оркестраторе
             slave_positions = self.config_manager.get_slave_positions()
-            for slave_id, (x, y, z) in slave_positions.items():
-                self.trilateration_engine.add_station(slave_id, float(x), float(y), float(z), 0.0)
+            for idx, (_orig_id, pos) in enumerate(list(slave_positions.items())[:3]):
+                x, y, z = pos
+                norm_id = f"slave{idx}"
+                self.trilateration_engine.add_station(norm_id, float(x), float(y), float(z), 0.0)
             
             stations_count = len(self.trilateration_engine.get_station_positions())
             self.log.info(f"Trilateration engine configured with {stations_count} stations (Master excluded - spectrum only)")

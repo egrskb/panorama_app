@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Any
 from collections import deque, defaultdict
 
 from PyQt5.QtCore import QObject, pyqtSignal, QMutex, QTimer
+import numpy as np
 
 from panorama.features.spectrum.model import DetectedPeak
 from panorama.features.slave_controller.slave import (
@@ -333,6 +334,11 @@ class Orchestrator(QObject):
                     continue
                 self._last_measure_at[peak_id] = now
                 try:
+                    # ДИНАМИЧЕСКИЙ per-slave центр: для каждого слейва хотим окно ±halfspan вокруг
+                    # текущего центра, который поддерживается менеджером пиков (обновляется от мастера)
+                    # Здесь ставим задачу как обычно: центр = entry.center_freq_hz, span = entry.span_hz
+                    # А вычисление F_max/F_centroid происходит на стороне PeakWatchlistManager и обновит entry центр
+                    # перед следующей итерацией. Этого достаточно, чтобы окна «ехали» за сигналом.
                     self.enqueue_watchlist_task({
                         'peak_id': peak_id,
                         'center_freq_hz': float(entry.center_freq_hz),
@@ -347,6 +353,17 @@ class Orchestrator(QObject):
 
     def _on_all_measurements_complete(self, results: List[RSSIMeasurement]):
         try:
+            # Live-обновление RSSI в watchlist для UI сразу по каждому измерению
+            try:
+                if self.trilateration_coordinator and hasattr(self.trilateration_coordinator, 'peak_manager'):
+                    for r in results:
+                        peak_id_any = self._get_peak_id_for_freq(r.center_hz)
+                        if peak_id_any:
+                            self.trilateration_coordinator.peak_manager.update_rssi_measurement(
+                                peak_id_any, r.slave_id, r.band_rssi_dbm
+                            )
+            except Exception:
+                pass
             grouped: Dict[str, List[RSSIMeasurement]] = defaultdict(list)
             for r in results:
                 # сопоставляем с задачей по (center, span) в пределах 1 кГц
@@ -466,7 +483,7 @@ class Orchestrator(QObject):
         Статус, который периодически опрашивает UI.
         Важно: ключ 'is_running' должен присутствовать.
         """
-        return {
+        status = {
             "is_running": self.is_running,
             "auto_mode": self.auto_mode,
             "manual_mode": self.manual_mode,
@@ -478,6 +495,16 @@ class Orchestrator(QObject):
             "queue_len": len(self.queue),
             "tasks_total": len(self.tasks),
         }
+        # Добавим пер-слейв baseline в статус
+        try:
+            if self.slave_manager:
+                baselines: Dict[str, float] = {}
+                for sid, sl in self.slave_manager.slaves.items():
+                    baselines[sid] = float(getattr(sl, 'noise_baseline_dbm', -90.0))
+                status["noise_baseline_dbm"] = baselines
+        except Exception:
+            pass
+        return status
     
     def get_active_tasks(self) -> List[MeasurementTask]:
         """
@@ -553,6 +580,24 @@ class Orchestrator(QObject):
                     # Предполагаем разрешение ~10 кГц на бин
                     total_bins = max(1, int(entry.span_hz / 10e3))
                     
+                    # Оценка уверенности на основе SNR относительно текущего baseline
+                    try:
+                        baseline_med = float(np.median(list(pm.baseline_history))) if len(pm.baseline_history) > 0 else -90.0
+                    except Exception:
+                        baseline_med = -90.0
+                    max_rssi = None
+                    for v in rssi_vals_norm.values():
+                        try:
+                            fv = float(v)
+                            max_rssi = fv if max_rssi is None else max(max_rssi, fv)
+                        except Exception:
+                            pass
+                    est_conf = 0.0
+                    if max_rssi is not None:
+                        snr_est = max_rssi - baseline_med
+                        # нормируем к [0..1] относительно порога и 20 дБ запаса
+                        est_conf = max(0.0, min(1.0, (snr_est - self.min_snr_threshold) / 20.0))
+
                     wl_ui.append({
                         'id': entry.peak_id,
                         'freq': entry.center_freq_hz / 1e6,
@@ -561,6 +606,7 @@ class Orchestrator(QObject):
                         'rms_1': vals[0],
                         'rms_2': vals[1], 
                         'rms_3': vals[2],
+                        'confidence': est_conf,
                         'total_bins': total_bins,
                         'bins_used_1': total_bins if vals[0] is not None else 0,
                         'bins_used_2': total_bins if vals[1] is not None else 0,

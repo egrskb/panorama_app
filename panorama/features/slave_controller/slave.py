@@ -85,6 +85,10 @@ class SlaveSDR(QObject):
         # RMS calculator for trilateration
         self.rms_calculator = RMSCalculator()
 
+        # Per-slave baseline estimation (noise tracking around measurement band)
+        self.noise_baseline_dbm: float = -90.0
+        self._noise_alpha: float = 0.1  # EMA for noise baseline
+
         # Отслеживание ошибок и автоматическое отключение
         self.error_count = 0
         self.max_errors = 20  # Увеличили порог до 20 ошибок
@@ -150,7 +154,8 @@ class SlaveSDR(QObject):
             'error_count': self.error_count,
             'disabled_until': self.disabled_until,
             'time_until_enable': max(0, self.disabled_until - current_time),
-            'last_error_time': self.last_error_time
+            'last_error_time': self.last_error_time,
+            'noise_baseline_dbm': self.noise_baseline_dbm
         }
 
     # --- Device init/close ---
@@ -331,6 +336,15 @@ class SlaveSDR(QObject):
                 ts=result.timestamp,
                 flags={"direct_device": True},
             )
+
+            # Update per-slave noise baseline using EMA of measured noise floor
+            try:
+                nf = float(result.noise_floor_dbm)
+                self.noise_baseline_dbm = (
+                    (1.0 - self._noise_alpha) * self.noise_baseline_dbm + self._noise_alpha * nf
+                )
+            except Exception:
+                pass
             
             # Записываем успех
             self._record_success()
@@ -592,7 +606,8 @@ class SlaveManager(QObject):
                 "is_initialized": bool(sl.is_initialized),
                 "is_disabled": status_info['is_disabled'],
                 "error_count": status_info['error_count'],
-                "time_until_enable": status_info['time_until_enable']
+                "time_until_enable": status_info['time_until_enable'],
+                "noise_baseline_dbm": status_info.get('noise_baseline_dbm', -90.0)
             }
         return out
 

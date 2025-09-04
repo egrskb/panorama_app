@@ -10,6 +10,7 @@ import time
 from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QTableWidgetItem, QMessageBox, QFileDialog
 import numpy as np
 
+
 # Импортируем наши модули
 from panorama.core.status_manager import SystemStatusManager
 from panorama.core.config_manager import ConfigurationManager
@@ -107,6 +108,8 @@ class PanoramaAppWindow(QMainWindow):
         # Устанавливаем фиксированный заголовок окна
         self.setWindowTitle("PANORAMA")
         
+
+
         self.log.info("ПАНОРАМА RSSI initialized")
     
     def _setup_logging(self):
@@ -1105,6 +1108,12 @@ class PanoramaAppWindow(QMainWindow):
                     # Обновляем карту
                     try:
                         self.map_view.update_stations_from_config({'slaves': [{'nickname': s['id'], 'pos': [s['x'], s['y'], s['z']]} for s in stations]})
+                    except Exception:
+                        pass
+                    # Проброс статусов слейвов в веб-таблицу измерений
+                    try:
+                        if hasattr(self, 'slaves_view') and self.slaves_view and hasattr(self.slaves_view, 'web_table_widget') and self.slaves_view.web_table_widget:
+                            self.slaves_view.web_table_widget.update_slaves_info(status)
                     except Exception:
                         pass
                 self.slave_manager.slaves_updated.connect(_on_slaves_updated)

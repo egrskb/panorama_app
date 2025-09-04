@@ -2,7 +2,7 @@
 <html>
 <head>
     <meta charset="utf-8">
-    <title>PANORAMA MapLibre GL JS Map</title>
+    <title>ПАНОРАМА Карта</title>
     <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no">
     <script src="https://unpkg.com/maplibre-gl@3.3.1/dist/maplibre-gl.js"></script>
     <link href="https://unpkg.com/maplibre-gl@3.3.1/dist/maplibre-gl.css" rel="stylesheet">
@@ -126,55 +126,55 @@
     
     <div class="control-panel">
         <div class="control-group">
-            <h3>🎯 PANORAMA Control</h3>
+            <h3>🎯 ПАНОРАМА Контроль</h3>
             <div>
                 <span id="connection-status" class="status-indicator status-disconnected"></span>
-                <span id="status-text">Disconnected</span>
+                <span id="status-text">Отключено</span>
             </div>
         </div>
         
         <div class="control-group">
-            <h3>📡 SDR Stations</h3>
-            <button onclick="centerOnSDRs()">Center on SDRs</button>
-            <button onclick="toggleSDRLabels()">Toggle Labels</button>
-            <div id="coordinates">No coordinates</div>
+            <h3>📡 SDR станции</h3>
+            <button onclick="centerOnSDRs()">Центрировать на SDR</button>
+            <button onclick="toggleSDRLabels()">Показать/Скрыть подписи</button>
+            <div id="coordinates">Нет координат</div>
         </div>
         
         <div class="control-group">
-            <h3>🎯 Targets</h3>
-            <button onclick="clearTargets()">Clear All</button>
-            <button onclick="exportData()">Export Data</button>
+            <h3>🎯 Цели</h3>
+            <button onclick="clearTargets()">Очистить</button>
+            <button onclick="exportData()">Экспорт</button>
         </div>
         
         <div class="control-group">
-            <h3>🗺️ Map</h3>
-            <button onclick="toggleStyle()">Switch Style</button>
-            <button onclick="resetView()">Reset View</button>
+            <h3>🗺️ Карта</h3>
+            <button onclick="toggleStyle()">Сменить стиль</button>
+            <button onclick="resetView()">Сбросить вид</button>
         </div>
     </div>
     
     <div class="legend">
-        <h4 style="margin: 0 0 10px 0; color: #2c3e50;">Legend</h4>
+        <h4 style="margin: 0 0 10px 0; color: #2c3e50;">Легенда</h4>
         <div class="legend-item">
             <div class="legend-color" style="background: #e74c3c;"></div>
-            <span>Reference SDR</span>
+            <span>Опорный SDR</span>
         </div>
         <div class="legend-item">
             <div class="legend-color" style="background: #3498db;"></div>
-            <span>Measurement SDR</span>
+            <span>Измерительный SDR</span>
         </div>
         <div class="legend-item">
             <div class="legend-color" style="background: #f39c12;"></div>
-            <span>Detected Target</span>
+            <span>Обнаруженная цель</span>
         </div>
         <div class="legend-item">
             <div class="legend-color" style="background: #9b59b6;"></div>
-            <span>Tracked Target</span>
+            <span>Отслеживаемая цель</span>
         </div>
     </div>
     
     <div class="drag-info" id="drag-info">
-        Drag SDR stations to reposition them
+        Перетащите станции SDR для изменения позиции
     </div>
 
     <script>
@@ -285,7 +285,7 @@
                     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                 ">
                     <div style="text-align: center; padding: 40px;">
-                        <h2 style="margin: 0 0 20px 0;">🗺️ PANORAMA Map</h2>
+                        <h2 style="margin: 0 0 20px 0;">🗺️ ПАНОРАМА Карта</h2>
                         <p style="margin: 0 0 20px 0; opacity: 0.9;">
                             WebGL не поддерживается в данном окружении.<br>
                             Отображение карты недоступно, но система продолжает работать.

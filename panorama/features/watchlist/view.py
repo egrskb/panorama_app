@@ -530,8 +530,18 @@ class ImprovedSlavesView(QWidget):
             y = getattr(result, 'y', 0.0)
             confidence = getattr(result, 'confidence', 0.0)
             
-            # Формируем диапазон
-            range_str = f"{freq-1.0:.1f}-{freq+1.0:.1f}"
+            # Пытаемся найти существующий диапазон по peak_id из текущих данных,
+            # чтобы совпасть с ключом строк в веб-таблице
+            current_data = self.web_table_widget.get_current_data()
+            targets_info = current_data.get('targets_info', {})
+            range_str = None
+            for rng, info in list(targets_info.items()):
+                if info.get('peak_id') == peak_id:
+                    range_str = rng
+                    break
+            # Если не найдено — используем ±1 МГц как fallback
+            if not range_str:
+                range_str = f"{freq-1.0:.1f}-{freq+1.0:.1f}"
             
             # Обновляем информацию о цели с результатами трилатерации
             current_data = self.web_table_widget.get_current_data()
