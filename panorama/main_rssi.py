@@ -52,6 +52,9 @@ class PanoramaAppWindow(QMainWindow):
         
         # Менеджер компонентов
         self.components_manager = ComponentsManager(self.config_manager, self.log)
+
+        # Кэш последних значений уверенности по peak_id для тест_таблицы
+        self._last_confidence_by_peak = {}
         
         # Инициализация компонентов
         success = self.components_manager.initialize_all_components()
@@ -219,6 +222,11 @@ class PanoramaAppWindow(QMainWindow):
             # Сигналы slave
             if self.slave_manager:
                 self.slave_manager.measurement_error.connect(self._on_measurement_error)
+                # Live-лог в тестовую таблицу
+                try:
+                    self.slave_manager.measurement_progress.connect(self._on_measurement_progress_for_test_table)
+                except Exception:
+                    pass
                 
             # Сигналы WatchlistView
             if hasattr(self, 'watchlist_view') and self.watchlist_view:
@@ -234,6 +242,38 @@ class PanoramaAppWindow(QMainWindow):
             self.log.info("All signals connected successfully")
         except Exception as e:
             self.log.error(f"Error connecting signals: {e}")
+
+    def _on_measurement_progress_for_test_table(self, m):
+        """Прокидывает live-измерения в тестовую таблицу (QTableView+pandas)."""
+        try:
+            if not hasattr(self.ui_manager, 'test_table') or self.ui_manager.test_table is None:
+                return
+            # Определяем peak_id по частоте исходного окна
+            try:
+                peak_id = self.orchestrator._get_peak_id_for_freq(float(m.center_hz)) if self.orchestrator else ''
+            except Exception:
+                peak_id = ''
+            # Локальный центр, если присутствует
+            try:
+                local_center_hz = float(getattr(m, 'flags', {}).get('local_center_hz')) if hasattr(m, 'flags') else None
+            except Exception:
+                local_center_hz = None
+            center_mhz = (local_center_hz if local_center_hz is not None else float(m.center_hz)) / 1e6
+            halfspan_mhz = float(m.span_hz) / 2e6
+            entry = {
+                'time': time.strftime('%H:%M:%S', time.localtime(getattr(m, 'ts', time.time()))),
+                'peak_id': str(peak_id),
+                'slave': str(m.slave_id),
+                'center_mhz': center_mhz,
+                'halfspan_mhz': halfspan_mhz,
+                'rms_dbm': float(m.band_rssi_dbm),
+                'noise_dbm': float(getattr(m, 'band_noise_dbm', 0.0)),
+                'snr_db': float(getattr(m, 'snr_db', 0.0)),
+                'confidence': float(self._last_confidence_by_peak.get(peak_id, 0.0)) if hasattr(self, '_last_confidence_by_peak') else ''
+            }
+            self.ui_manager.test_table.add_log_entry(entry)
+        except Exception:
+            pass
     
     def _connect_ui_signals(self):
         """Подключает сигналы UI менеджера к методам главного окна."""
@@ -566,6 +606,20 @@ class PanoramaAppWindow(QMainWindow):
     def _on_target_update(self, target):
         """Обрабатывает обновление цели."""
         try:
+            # Кэшируем уверенность для тест_таблицы
+            try:
+                peak_id = getattr(target, 'peak_id', '')
+                conf = float(getattr(target, 'confidence', 0.0))
+                if peak_id:
+                    self._last_confidence_by_peak[peak_id] = conf
+                    # Онлайн-апдейт для всех строк этого peak в тест_таблице
+                    if hasattr(self.ui_manager, 'test_table') and self.ui_manager.test_table is not None:
+                        try:
+                            self.ui_manager.test_table.update_confidence_for_peak(peak_id, conf)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             # Обновляем карту
             if hasattr(self.map_view, 'update_target'):
                 self.map_view.update_target(target.x, target.y, target.confidence)
@@ -780,6 +834,11 @@ class PanoramaAppWindow(QMainWindow):
                     if self.orchestrator:
                         self.orchestrator.set_global_parameters(span_hz=s.rms_halfspan_mhz * 2e6,  # Полная ширина = 2 × halfspan
                                                                 dwell_ms=int(s.watchlist_dwell_ms))
+                        # Применяем интервал обновления RMS (сек)
+                        try:
+                            self.orchestrator.set_measure_interval_sec(float(getattr(s, 'measurement_interval_sec', 1.0)))
+                        except Exception:
+                            pass
                 except Exception:
                     pass
             dlg.settingsChanged.connect(_on_changed)

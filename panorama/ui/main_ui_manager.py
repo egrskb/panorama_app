@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                             QFrame, QMessageBox, QFileDialog, QFormLayout)
 
 from panorama.ui import SpectrumView, ImprovedSlavesView, MapLibreWidget
+from panorama.features.watchlist.test_table_widget import TestTableWidget
 from panorama.features.spectrum.master_adapter import MasterSourceAdapter
 
 
@@ -137,6 +138,13 @@ class PanoramaUI(QObject):
         self.slaves_view = ImprovedSlavesView(orchestrator=self.orchestrator)
         tab_widget.addTab(self.slaves_view, "🎯 Слейвы")
         
+        # Вкладка тестовой таблицы (QTableView + pandas)
+        try:
+            self.test_table = TestTableWidget()
+            tab_widget.addTab(self.test_table, "🧪 Тест_таблица")
+        except Exception:
+            self.test_table = None
+
         layout.addWidget(tab_widget)
         
         return main_widget

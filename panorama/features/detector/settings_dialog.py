@@ -393,6 +393,20 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         lbl_max.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
         watchlist_layout.addRow("", lbl_max)
 
+        # Интервал обновления RMS (секунды)
+        self.spin_rms_interval_sec = QtWidgets.QDoubleSpinBox()
+        self.spin_rms_interval_sec.setRange(0.1, 10.0)
+        self.spin_rms_interval_sec.setSingleStep(0.1)
+        self.spin_rms_interval_sec.setValue(float(getattr(self.settings, 'measurement_interval_sec', 1.0)))
+        self.spin_rms_interval_sec.setSuffix(" c")
+        self.spin_rms_interval_sec.setToolTip("Как часто слейвы переизмеряют RMS для каждой цели (сек)")
+        self.spin_rms_interval_sec.setMaximumWidth(180)
+        watchlist_layout.addRow("Интервал обновления RMS:", self.spin_rms_interval_sec)
+        lbl_int = QtWidgets.QLabel("<i>Период постановки задач измерения RMS. Меньше — чаще обновления и выше нагрузка.</i>")
+        lbl_int.setWordWrap(True)
+        lbl_int.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
+        watchlist_layout.addRow("", lbl_int)
+
         layout.addWidget(watchlist_group)
 
         # Визуализация
@@ -675,6 +689,7 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         self.spin_watchlist_dwell.setValue(self.settings.watchlist_dwell_ms)
         self.spin_max_watchlist.setValue(self.settings.max_watchlist_size)
         self.spin_rms_halfspan.setValue(self.settings.rms_halfspan_mhz)
+        self.spin_rms_interval_sec.setValue(self.settings.measurement_interval_sec)
 
         # Временные параметры (таймаут/интервал убраны из UI — сохраняем только подтверждение)
         self.spin_confirmation_sweeps.setValue(self.settings.min_confirmation_sweeps)
@@ -710,9 +725,9 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
             max_watchlist_size=int(self.spin_max_watchlist.value()),
             rms_halfspan_mhz=self.spin_rms_halfspan.value(),
             center_mode=('fmax' if self.combo_center_mode.currentIndex() == 0 else 'centroid'),
-            # Таймаут и интервал остаются прежними (не редактируются в UI)
+            # Таймаут остаётся прежним, интервал RMS берём из UI
             peak_timeout_sec=self.settings.peak_timeout_sec,
-            measurement_interval_sec=self.settings.measurement_interval_sec,
+            measurement_interval_sec=float(self.spin_rms_interval_sec.value()),
             min_confirmation_sweeps=int(self.spin_confirmation_sweeps.value()),
             frequency_ranges=freq_ranges,
             exclude_ranges=excl_ranges,

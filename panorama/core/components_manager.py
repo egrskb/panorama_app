@@ -105,6 +105,11 @@ class ComponentsManager:
                         span_hz=det_settings.rms_halfspan_mhz * 2e6,  # Полная ширина = 2 × halfspan
                         dwell_ms=int(det_settings.watchlist_dwell_ms)
                     )
+                    # Применяем интервал обновления RMS в оркестраторе при старте
+                    try:
+                        self.orchestrator.set_measure_interval_sec(float(getattr(det_settings, 'measurement_interval_sec', 1.0)))
+                    except Exception:
+                        pass
                 self.trilateration_coordinator.set_user_span(float(det_settings.rms_halfspan_mhz))
         except Exception as e:
             self.log.warning(f"Failed to load detector settings: {e}")

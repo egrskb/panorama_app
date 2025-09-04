@@ -91,6 +91,8 @@ class Orchestrator(QObject):
 
         # Live-буфер последних RMS для UI (range_str -> {slave_id: (rssi, ts)})
         self._live_rssi: Dict[str, Dict[str, tuple]] = {}
+        # Пер-слейв локальные центры (по peak_id): {peak_id: {slave_id: center_mhz}}
+        self._local_centers_mhz: Dict[str, Dict[str, float]] = {}
 
         # Периодическое обновление измерений watchlist (постоянные замеры)
         self.measure_interval_ms = 1000  # увеличили интервал до 1 секунды для стабильности
@@ -219,6 +221,21 @@ class Orchestrator(QObject):
         self.global_dwell_ms = int(dwell_ms)
         self.log.info(f"Global parameters: span={span_hz/1e6:.2f} MHz, dwell={dwell_ms} ms")
         self._emit_status()
+
+    def set_measure_interval_sec(self, seconds: float):
+        """Устанавливает интервал обновления RMS (частота постановки задач для слейвов)."""
+        try:
+            seconds = max(0.1, float(seconds))
+        except Exception:
+            seconds = 1.0
+        self.measure_interval_ms = int(seconds * 1000.0)
+        try:
+            if self._measure_timer.isActive():
+                self._measure_timer.stop()
+            self._measure_timer.start(self.measure_interval_ms)
+        except Exception:
+            pass
+        self.log.info(f"Measure interval set to {seconds:.2f} s")
 
     def create_manual_measurement(self, center_hz: float,
                                   span_hz: Optional[float] = None,
@@ -489,6 +506,32 @@ class Orchestrator(QObject):
                                     'center_freq_hz': float(entry.center_freq_hz),
                                     'span_hz': float(entry.span_hz)
                                 })
+                        # Дополнительно: немедленный перезапуск окна для всех peak_id из этого батча,
+                        # чтобы исключить зависания при проблемах с таймером
+                        try:
+                            pm2 = self.trilateration_coordinator.peak_manager
+                            rescheduled: set = set()
+                            now2 = time.time()
+                            min_gap_sec = max(0.1, self.measure_interval_ms / 1000.0)
+                            for m in meas_list:
+                                pid2 = self._get_peak_id_for_freq(m.center_hz)
+                                if not pid2 or pid2 in rescheduled:
+                                    continue
+                                last2 = self._last_measure_at.get(pid2, 0.0)
+                                if (now2 - last2) < min_gap_sec:
+                                    continue  # соблюдаем интервал; не мгновенно
+                                entry2 = pm2.watchlist.get(pid2)
+                                if entry2:
+                                    self._last_measure_at[pid2] = now2
+                                    self.enqueue_watchlist_task({
+                                        'peak_id': pid2,
+                                        'center_freq_hz': float(entry2.center_freq_hz),
+                                        'span_hz': float(entry2.span_hz)
+                                    })
+                                    rescheduled.add(pid2)
+                                    self.log.debug(f"Requeue after completion for {pid2} (interval respected: {min_gap_sec:.2f}s)")
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -508,6 +551,15 @@ class Orchestrator(QObject):
                 self.trilateration_coordinator.peak_manager.update_rssi_measurement(
                     peak_id_any, m.slave_id, m.band_rssi_dbm
                 )
+            # Сохраним локальный центр для этого peak_id/слейва, если пришёл
+            try:
+                lc_hz = m.flags.get('local_center_hz') if hasattr(m, 'flags') and isinstance(m.flags, dict) else None
+                if lc_hz is not None and peak_id_any:
+                    if peak_id_any not in self._local_centers_mhz:
+                        self._local_centers_mhz[peak_id_any] = {}
+                    self._local_centers_mhz[peak_id_any][m.slave_id] = float(lc_hz) / 1e6
+            except Exception:
+                pass
             # Кладём в live-буфер для мгновенного снапшота в таблицу
             try:
                 rng = f"{(m.center_hz - m.span_hz/2)/1e6:.1f}-{(m.center_hz + m.span_hz/2)/1e6:.1f}"
@@ -685,12 +737,22 @@ class Orchestrator(QObject):
                         for sid, slave in self.slave_manager.slaves.items():
                             baseline_data[sid] = getattr(slave, 'noise_baseline_dbm', -90.0)
                     
-                    # Динамические центры поддиапазонов для каждого slave (F_max или F_centroid + halfspan)
-                    sub_centers = {}
+                    # Динамические центры поддиапазонов для каждого slave (локальные центры, если есть)
+                    sub_centers: Dict[str, float] = {}
                     user_halfspan = 2.5  # MHz - из настроек детектора
+                    try:
+                        # Подтягиваем сохранённые локальные центры по этому пику
+                        if entry.peak_id in self._local_centers_mhz:
+                            for sid, mhz in self._local_centers_mhz[entry.peak_id].items():
+                                try:
+                                    sub_centers[str(sid)] = float(mhz)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    # Фоллбек: если по какому-то слейву нет локального центра, но есть измерение — даём центр мастера
                     for i, slave_id in enumerate(['slave0', 'slave1', 'slave2']):
-                        if vals[i] is not None:
-                            # Используем текущий центр entry как базу (он уже обновляется в PeakWatchlistManager)
+                        if vals[i] is not None and slave_id not in sub_centers:
                             sub_centers[slave_id] = entry.center_freq_hz / 1e6  # MHz
                     
                     wl_ui.append({
@@ -754,6 +816,16 @@ class Orchestrator(QObject):
                     continue
                 rng = f"{(t.window.center - t.window.span/2)/1e6:.1f}-{(t.window.center + t.window.span/2)/1e6:.1f}"
                 for m in t.measurements:
+                    # Сохраняем локальные центры (если есть) — на случай, если прогресс-сигнал не отработал
+                    try:
+                        pid = self._get_peak_id_for_freq(m.center_hz)
+                        lc_hz = m.flags.get('local_center_hz') if hasattr(m, 'flags') and isinstance(m.flags, dict) else None
+                        if pid and lc_hz is not None:
+                            if pid not in self._local_centers_mhz:
+                                self._local_centers_mhz[pid] = {}
+                            self._local_centers_mhz[pid][m.slave_id] = float(lc_hz) / 1e6
+                    except Exception:
+                        pass
                     measurements_ui.append({
                         'range': rng,
                         'slave_id': m.slave_id,

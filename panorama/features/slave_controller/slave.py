@@ -272,6 +272,13 @@ class SlaveSDR(QObject):
     # --- band measurement ---
     def measure_band_rssi(self, center_hz: float, span_hz: float, dwell_ms: int,
                           k_cal_db: Optional[float] = None) -> RSSIMeasurement:
+        """Измеряет RMS в заданном окне. Здесь же закладываем крючок для локального
+        центрирования окна под каждого слейва (Fmax/Fcentroid).
+
+        Сейчас fallback – измеряем вокруг переданного center_hz. Когда появится
+        лёгкий IQ/PSD-скан в wrapper'е, центр можно сдвинуть на локальный максимум
+        без изменения интерфейса функции.
+        """
         # Проверяем, не отключено ли устройство
         if self.is_disabled():
             current_time = time.time()
@@ -316,10 +323,38 @@ class SlaveSDR(QObject):
             bw = max(200000, min(int(span_hz), int(self.sample_rate * 0.8)))
             self._reconfigure_device(bw)
 
-            # Прямой доступ к устройству (только реальный SDR)
+            # Реалтайм локальный центр: быстрый мини‑скан по нескольким смещениям
+            f_local = float(center_hz)
+            try:
+                halfspan = float(span_hz) * 0.5
+                # 5 точек от -halfspan до +halfspan
+                offsets = np.linspace(-halfspan, halfspan, 5)
+                per_point_sec = max(0.003, min(0.008, (dwell_ms / 1000.0) * 0.05))
+                rssi_samples: List[float] = []
+                freq_samples: List[float] = []
+                for off in offsets:
+                    try:
+                        r_scan = self.device.measure_rssi(
+                            center_hz=float(center_hz + off),
+                            span_hz=float(max(200000, span_hz * 0.5)),
+                            duration_sec=per_point_sec
+                        )
+                        if r_scan is not None:
+                            rssi_samples.append(float(r_scan.rssi_dbm))
+                            freq_samples.append(float(center_hz + off))
+                    except Exception:
+                        continue
+                if rssi_samples:
+                    # Fmax по измеренным точкам
+                    idx_max = int(np.argmax(np.array(rssi_samples)))
+                    f_local = freq_samples[idx_max]
+            except Exception:
+                f_local = float(center_hz)
+
+            # Измерение RMS вокруг локального центра
             duration_sec = dwell_ms / 1000.0
             result = self.device.measure_rssi(
-                center_hz=center_hz,
+                center_hz=f_local,
                 span_hz=span_hz,
                 duration_sec=duration_sec
             )
@@ -327,6 +362,8 @@ class SlaveSDR(QObject):
                 raise RuntimeError("RSSI measurement returned None")
             measurement = RSSIMeasurement(
                 slave_id=self.slave_id,
+                # Важно: для согласования с идентификацией задачи оставляем исходный центр окна,
+                # а локальный центр прокидываем в flags['local_center_hz']
                 center_hz=float(center_hz),
                 span_hz=float(span_hz),
                 band_rssi_dbm=result.rssi_dbm,
@@ -334,7 +371,7 @@ class SlaveSDR(QObject):
                 snr_db=result.snr_db,
                 n_samples=result.sample_count,
                 ts=result.timestamp,
-                flags={"direct_device": True},
+                flags={"direct_device": True, "local_center_hz": float(f_local)},
             )
 
             # Update per-slave noise baseline using EMA of measured noise floor
@@ -542,9 +579,24 @@ class SlaveManager(QObject):
             threads: List[threading.Thread] = []
             results: List[RSSIMeasurement] = []
             results_lock = threading.Lock()
+            # Барьер синхронного старта, чтобы все слейвы начали измерение одновременно
+            # Число участников = количество активных слейвов × число окон (обычно 1)
+            active_slaves = sum(1 for sl in self.slaves.values() if sl.is_initialized and not sl.is_disabled())
+            n_windows = max(1, len(windows))
+            total_participants = max(1, active_slaves * n_windows)
+            try:
+                start_barrier = threading.Barrier(total_participants)
+            except Exception:
+                start_barrier = None
 
             def worker(sl: SlaveSDR, w: MeasurementWindow):
                 try:
+                    # Дождаться синхронного старта
+                    if start_barrier is not None:
+                        try:
+                            start_barrier.wait(timeout=1.0)
+                        except Exception:
+                            pass
                     k = k_cal_db.get(sl.slave_id, 0.0)
                     r = sl.measure_band_rssi(w.center, w.span, w.dwell_ms, k_cal_db=k)
                     with results_lock:
