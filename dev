@@ -1,0 +1,461 @@
+#!/bin/bash
+
+# Универсальный скрипт запуска Panorama App для Linux и macOS
+# Объединяет функциональность run_linux.sh и run_macos.sh с поддержкой WebGL
+
+set -e  # Остановка при ошибке
+
+echo "=== Panorama App - Универсальный запуск ==="
+echo
+
+# Пути к окружениям
+VENV_DIR="$(pwd)/mvenv"
+CONDA_PATH="$HOME/miniconda3"
+
+# Функция для определения операционной системы
+detect_os() {
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        echo "linux"
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        echo "macos"
+    else
+        echo "unknown"
+    fi
+}
+
+# Функция для определения дистрибутива Linux
+detect_distro() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo "$ID"
+    elif [ -f /etc/debian_version ]; then
+        echo "debian"
+    elif [ -f /etc/redhat-release ]; then
+        echo "redhat"
+    else
+        echo "unknown"
+    fi
+}
+
+# Функция для установки системных зависимостей Linux
+install_system_deps_linux() {
+    echo "📦 Установка системных зависимостей Linux..."
+    
+    DISTRO=$(detect_distro)
+    
+    case "$DISTRO" in
+        "ubuntu"|"debian"|"linuxmint")
+            echo "Обнаружен дистрибутив: $DISTRO"
+            sudo apt-get update
+            sudo apt-get install -y libhackrf-dev libfftw3-dev build-essential pkg-config \
+                libusb-1.0-0-dev cmake swig python3-dev python3-pip
+            ;;
+        "fedora"|"rhel"|"centos"|"rocky"|"alma")
+            echo "Обнаружен дистрибутив: $DISTRO"
+            if command -v dnf >/dev/null 2>&1; then
+                sudo dnf install -y hackrf-devel fftw3-devel gcc make pkgconfig \
+                    libusb1-devel cmake swig python3-devel python3-pip
+            else
+                sudo yum install -y hackrf-devel fftw3-devel gcc make pkgconfig \
+                    libusb1-devel cmake swig python3-devel python3-pip
+            fi
+            ;;
+        "arch"|"manjaro")
+            echo "Обнаружен дистрибутив: $DISTRO"
+            sudo pacman -S --noconfirm hackrf fftw gcc make pkg-config \
+                libusb cmake swig python python-pip
+            ;;
+        *)
+            echo "⚠️  Неизвестный дистрибутив: $DISTRO"
+            echo "Установите вручную: libhackrf-dev, libfftw3-dev, build-essential, pkg-config"
+            ;;
+    esac
+    echo
+}
+
+# Функция для установки системных зависимостей macOS
+install_system_deps_macos() {
+    echo "📦 Установка системных зависимостей macOS..."
+    
+    # Проверяем наличие Homebrew
+    if ! command -v brew >/dev/null 2>&1; then
+        echo "❌ Homebrew не найден. Установите его:"
+        echo "   /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+        exit 1
+    fi
+    
+    # Устанавливаем зависимости через Homebrew
+    brew install hackrf fftw cmake swig pkg-config libusb
+    echo
+}
+
+# Функция для установки emoji шрифтов
+install_emoji_fonts() {
+    echo "🎨 Установка emoji шрифтов..."
+    
+    OS=$(detect_os)
+    
+    case "$OS" in
+        "linux")
+            DISTRO=$(detect_distro)
+            case "$DISTRO" in
+                "ubuntu"|"debian"|"linuxmint")
+                    sudo apt-get update
+                    sudo apt-get install -y fonts-noto-color-emoji fonts-joypixels fonts-twemoji
+                    ;;
+                "fedora"|"rhel"|"centos"|"rocky"|"alma")
+                    if command -v dnf >/dev/null 2>&1; then
+                        sudo dnf install -y google-noto-emoji-fonts joypixels-fonts
+                    else
+                        sudo yum install -y google-noto-emoji-fonts joypixels-fonts
+                    fi
+                    ;;
+                "arch"|"manjaro")
+                    sudo pacman -S --noconfirm noto-fonts-emoji joypixels-fonts
+                    ;;
+                *)
+                    echo "⚠️  Неизвестный дистрибутив: $DISTRO"
+                    echo "Установите вручную: fonts-noto-color-emoji, fonts-joypixels"
+                    ;;
+            esac
+            ;;
+        "macos")
+            # macOS обычно уже имеет emoji шрифты
+            echo "✓ Emoji шрифты уже доступны в macOS"
+            ;;
+    esac
+    echo
+}
+
+# Функция для сборки библиотеки hackrf_master
+build_hackrf_master() {
+    echo "🔨 Сборка библиотеки hackrf_master..."
+    
+    if [ ! -f "panorama/drivers/hackrf/hrf_backend.py" ]; then
+        echo "❌ Файл hrf_backend.py не найден"
+        exit 1
+    fi
+    
+    cd panorama/drivers/hackrf
+    python3 hrf_backend.py build
+    cd ../../..
+    
+    if [ -f "panorama/drivers/hackrf/hrf_backend.py" ]; then
+        echo "✓ Библиотека hackrf_master собрана"
+    else
+        echo "❌ Ошибка сборки библиотеки hackrf_master"
+        exit 1
+    fi
+    echo
+}
+
+# Функция для сборки библиотеки hackrf_slave
+build_hackrf_slave() {
+    echo "🔨 Сборка библиотеки hackrf_slave..."
+    
+    if [ ! -f "panorama/drivers/hackrf/hrf_slave_backend.py" ]; then
+        echo "❌ Файл hrf_slave_backend.py не найден"
+        exit 1
+    fi
+    
+    cd panorama/drivers/hackrf
+    python3 hrf_slave_backend.py build
+    cd ../../..
+    
+    if [ -f "panorama/drivers/hackrf/hrf_slave_backend.py" ]; then
+        echo "✓ Библиотека hackrf_slave собрана"
+    else
+        echo "❌ Ошибка сборки библиотеки hackrf_slave"
+        exit 1
+    fi
+    echo
+}
+
+# Функция для настройки прав доступа к USB (Linux)
+setup_usb_permissions() {
+    echo "🔐 Настройка прав доступа к USB..."
+    
+    # Создаем правило для udev
+    if [ ! -f "/etc/udev/rules.d/99-hackrf.rules" ]; then
+        echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="6089", MODE="0666"' | sudo tee /etc/udev/rules.d/99-hackrf.rules > /dev/null
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger
+        echo "✓ Правила udev созданы"
+    else
+        echo "✓ Правила udev уже существуют"
+    fi
+    echo
+}
+
+# Функция для проверки виртуального окружения (Linux)
+check_venv() {
+    if [ ! -d "$VENV_DIR" ]; then
+        echo "❌ Виртуальное окружение не найдено"
+        echo "Создайте его: python3 -m venv mvenv"
+        echo "Или запустите полную установку: ./dev --install"
+        exit 1
+    fi
+    
+    if [ ! -f "$VENV_DIR/bin/activate" ]; then
+        echo "❌ Файл активации venv не найден"
+        exit 1
+    fi
+    
+    echo "✓ Виртуальное окружение найдено"
+}
+
+# Функция для проверки conda окружения (macOS)
+check_conda_env() {
+    if ! command -v conda >/dev/null 2>&1; then
+        echo "❌ Conda не найден"
+        echo "Установите Miniconda: https://docs.conda.io/en/latest/miniconda.html"
+        exit 1
+    fi
+    
+    # Проверяем существование окружения
+    if ! conda env list | grep -q "panorama_env"; then
+        echo "❌ Окружение panorama_env не найдено"
+        echo "Создайте его: conda create -n panorama_env python=3.9"
+        echo "Или запустите полную установку: ./dev --install"
+        exit 1
+    fi
+    
+    echo "✓ Conda окружение готово"
+    echo
+}
+
+# Функция для запуска приложения
+run_panorama() {
+    local webgl_mode="$1"
+    local os_type="$2"
+    
+    echo "🚀 Запуск Panorama App..."
+    
+    # Активируем соответствующее окружение
+    case "$os_type" in
+        "linux")
+            # Активируем venv
+            # shellcheck disable=SC1090
+            source "$VENV_DIR/bin/activate"
+            
+            # Очищаем переменные окружения, чтобы не мешали системные плагины
+            unset LD_LIBRARY_PATH || true
+            unset SOAPY_SDR_PLUGIN_PATH || true
+            ;;
+        "macos")
+            # Активируем conda окружение
+            if command -v conda >/dev/null 2>&1; then
+                [ -f "$CONDA_PATH/etc/profile.d/conda.sh" ] && . "$CONDA_PATH/etc/profile.d/conda.sh"
+                conda activate panorama_env || {
+                    echo "❌ Не удалось активировать окружение panorama_env через conda"
+                    exit 1
+                }
+            else
+                if [ -f "$CONDA_PATH/bin/activate" ]; then
+                    # shellcheck disable=SC1090
+                    . "$CONDA_PATH/bin/activate" panorama_env || {
+                        echo "❌ Не удалось активировать окружение panorama_env через $CONDA_PATH/bin/activate"
+                        exit 1
+                    }
+                else
+                    echo "❌ Не найден conda и отсутствует $CONDA_PATH/bin/activate"
+                    exit 1
+                fi
+            fi
+            
+            # Очищаем переменные окружения
+            unset DYLD_LIBRARY_PATH
+            unset SOAPY_SDR_PLUGIN_PATH
+            ;;
+    esac
+    
+    # Настраиваем WebGL режим
+    case "$webgl_mode" in
+        "webgl")
+            export PANORAMA_WEBGL=1
+            echo "🌐 WebGL поддержка включена"
+            ;;
+        "webglforce")
+            export PANORAMA_WEBGL=1
+            export PANORAMA_WEBGL_FORCE=1
+            echo "🌐 WebGL поддержка включена (принудительно)"
+            ;;
+        "nowebgl"|"")
+            # По умолчанию WebGL отключен для совместимости
+            unset PANORAMA_WEBGL || true
+            unset PANORAMA_WEBGL_FORCE || true
+            echo "🔧 WebGL отключен (режим совместимости)"
+            ;;
+    esac
+    
+    # Запускаем приложение
+    # Определяем путь к лаунчеру
+    if [ -f "run_rssi_panorama.py" ]; then
+        python run_rssi_panorama.py
+    elif [ -f "panorama/run_rssi_panorama.py" ]; then
+        python panorama/run_rssi_panorama.py
+    else
+        echo "❌ Не найден файл запуска run_rssi_panorama.py"
+        exit 1
+    fi
+}
+
+# Основная логика
+main() {
+    # Проверяем аргументы
+    if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+        echo "Использование: $0 [опции] [webgl-режим] [платформа]"
+        echo
+        echo "Опции:"
+        echo "  --help, -h     Показать эту справку"
+        echo "  --install      Установить зависимости и собрать библиотеку"
+        echo "  --fonts        Только установить emoji шрифты"
+        echo "  --build        Только собрать библиотеки hackrf_master и hackrf_slave"
+        echo "  --usb          Только настроить права доступа к USB (Linux)"
+        echo "  --run          Только запустить приложение"
+        echo "  (без опций)    Полная установка и запуск"
+        echo
+        echo "WebGL режимы:"
+        echo "  -webgl         Включить WebGL поддержку"
+        echo "  -webglforce    Принудительно включить WebGL (обход блокировок)"
+        echo "  -nowebgl       Отключить WebGL (режим совместимости, по умолчанию)"
+        echo
+        echo "Платформы:"
+        echo "  -linux         Принудительно использовать Linux режим"
+        echo "  -macos         Принудительно использовать macOS режим"
+        echo "  (без указания) Автоопределение платформы"
+        echo
+        echo "Примеры:"
+        echo "  $0 --run -webglforce -linux    Запустить с принудительным WebGL на Linux"
+        echo "  $0 --run -webgl -macos         Запустить с WebGL на macOS"
+        echo "  $0 -webglforce                  Полная установка и запуск с принудительным WebGL"
+        echo
+        exit 0
+    fi
+    
+    # Определяем параметры из аргументов
+    local webgl_mode="nowebgl"
+    local main_action=""
+    local forced_os=""
+    
+    # Обрабатываем аргументы
+    for arg in "$@"; do
+        case "$arg" in
+            "-webgl")
+                webgl_mode="webgl"
+                ;;
+            "-webglforce")
+                webgl_mode="webglforce"
+                ;;
+            "-nowebgl")
+                webgl_mode="nowebgl"
+                ;;
+            "-linux")
+                forced_os="linux"
+                ;;
+            "-macos")
+                forced_os="macos"
+                ;;
+            "--install"|"--fonts"|"--build"|"--usb"|"--run")
+                main_action="$arg"
+                ;;
+            "")
+                # Пустой аргумент - полная установка и запуск
+                ;;
+            *)
+                echo "❌ Неизвестная опция: $arg"
+                echo "Используйте --help для справки"
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Определяем операционную систему
+    local os_type
+    if [ -n "$forced_os" ]; then
+        os_type="$forced_os"
+        echo "🔧 Принудительно используется платформа: $os_type"
+    else
+        os_type=$(detect_os)
+        echo "🔍 Обнаружена платформа: $os_type"
+    fi
+    
+    # Проверяем совместимость
+    if [ "$os_type" = "unknown" ]; then
+        echo "❌ Неподдерживаемая операционная система"
+        exit 1
+    fi
+    
+    case "$main_action" in
+        "--install")
+            case "$os_type" in
+                "linux")
+                    install_system_deps_linux
+                    install_emoji_fonts
+                    build_hackrf_master
+                    build_hackrf_slave
+                    setup_usb_permissions
+                    check_venv
+                    ;;
+                "macos")
+                    install_system_deps_macos
+                    install_emoji_fonts
+                    build_hackrf_master
+                    build_hackrf_slave
+                    check_conda_env
+                    ;;
+            esac
+            echo "✅ Установка завершена!"
+            ;;
+        "--fonts")
+            install_emoji_fonts
+            ;;
+        "--build")
+            build_hackrf_master
+            build_hackrf_slave
+            ;;
+        "--usb")
+            if [ "$os_type" = "linux" ]; then
+                setup_usb_permissions
+            else
+                echo "❌ Опция --usb доступна только для Linux"
+                exit 1
+            fi
+            ;;
+        "--run")
+            case "$os_type" in
+                "linux")
+                    check_venv
+                    ;;
+                "macos")
+                    check_conda_env
+                    ;;
+            esac
+            run_panorama "$webgl_mode" "$os_type"
+            ;;
+        "")
+            # Полная установка и запуск
+            case "$os_type" in
+                "linux")
+                    install_system_deps_linux
+                    install_emoji_fonts
+                    build_hackrf_master
+                    build_hackrf_slave
+                    setup_usb_permissions
+                    check_venv
+                    ;;
+                "macos")
+                    install_system_deps_macos
+                    install_emoji_fonts
+                    build_hackrf_master
+                    build_hackrf_slave
+                    check_conda_env
+                    ;;
+            esac
+            run_panorama "$webgl_mode" "$os_type"
+            ;;
+    esac
+}
+
+# Запускаем основную функцию
+main "$@"

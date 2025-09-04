@@ -1,4 +1,4 @@
-@echo off
+autoattach_win.bat@echo off
 setlocal enabledelayedexpansion
 
 echo Finding HackRF...

@@ -19,12 +19,31 @@ def main():
     """Application main."""
     try:
         import os
-        os.environ.setdefault("QT_OPENGL", "software")
-        os.environ.setdefault("QTWEBENGINE_DISABLE_GPU", "1")
-        os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-software-rasterizer --in-process-gpu")
-        os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
-        from PyQt5 import QtCore
-        QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_UseSoftwareOpenGL)
+        # Проверяем, нужно ли включить WebGL
+        if os.environ.get("PANORAMA_WEBGL", "0") == "1":
+            # ВКЛЮЧАЕМ поддержку WebGL и OpenGL
+            os.environ.setdefault("QT_OPENGL", "desktop")
+            os.environ.setdefault("QTWEBENGINE_DISABLE_GPU", "0")
+            
+            # Проверяем, есть ли дополнительные флаги
+            if os.environ.get("PANORAMA_WEBGL_FORCE", "0") == "1":
+                # Принудительное включение WebGL с дополнительными флагами
+                os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--enable-gpu --enable-software-rasterizer --disable-web-security --disable-features=VizDisplayCompositor --disable-gpu-sandbox --disable-gpu-driver-bug-workarounds --ignore-gpu-blocklist --enable-unsafe-webgpu")
+                print("🌐 WebGL поддержка включена (принудительно)")
+            else:
+                # Обычное включение WebGL
+                os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--enable-gpu --enable-software-rasterizer --ignore-gpu-blocklist")
+                print("🌐 WebGL поддержка включена")
+            
+            os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+        else:
+            # ОТКЛЮЧАЕМ для совместимости (по умолчанию)
+            os.environ.setdefault("QT_OPENGL", "software")
+            os.environ.setdefault("QTWEBENGINE_DISABLE_GPU", "1")
+            os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-software-rasterizer --in-process-gpu")
+            os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+            from PyQt5 import QtCore
+            QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_UseSoftwareOpenGL)
     except Exception:
         pass
 
