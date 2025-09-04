@@ -1,17 +1,26 @@
 # Makefile для сборки hackrf_slave библиотеки на macOS
+# Поддерживает Intel и ARM архитектуры
 
 CC = clang
 CFLAGS = -Wall -Wextra -O2 -fPIC -std=c99
-INCLUDES = -I/usr/include -I/usr/local/include -I/opt/homebrew/include
+
+# Определяем архитектуру
+ARCH := $(shell uname -m)
+ifeq ($(ARCH),arm64)
+    # ARM64 (Apple Silicon)
+    INCLUDES = -I/usr/include -I/opt/homebrew/include
+    HOMEBREW_LIB_PATHS = -L/opt/homebrew/lib
+else
+    # Intel x86_64
+    INCLUDES = -I/usr/include -I/usr/local/include
+    HOMEBREW_LIB_PATHS = -L/usr/local/lib
+endif
 
 # Пробуем pkg-config сначала для более точных флагов
 HACKRF_CFLAGS := $(shell pkg-config --cflags libhackrf 2>/dev/null || echo "")
 HACKRF_LIBS := $(shell pkg-config --libs libhackrf 2>/dev/null || echo "-lhackrf")
 FFTW_CFLAGS := $(shell pkg-config --cflags fftw3f 2>/dev/null || echo "")  
 FFTW_LIBS := $(shell pkg-config --libs fftw3f 2>/dev/null || echo "-lfftw3f")
-
-# Добавляем библиотеки из Homebrew
-HOMEBREW_LIB_PATHS = -L/opt/homebrew/lib -L/usr/local/lib
 
 INCLUDES += $(HACKRF_CFLAGS) $(FFTW_CFLAGS)
 LIBS = $(HOMEBREW_LIB_PATHS) $(HACKRF_LIBS) $(FFTW_LIBS) -lm -lpthread

@@ -1,17 +1,26 @@
 # Makefile для hackrf_master driver на macOS
 # Компилирует C-библиотеку с исправлениями спектра
+# Поддерживает Intel и ARM архитектуры
 
 CC = gcc
 CFLAGS = -shared -fPIC -O3 -Wall -Wextra
 LIBS = -lhackrf -lfftw3f -lm -pthread
 
-# Пути к заголовочным файлам (macOS Homebrew)
-HACKRF_CFLAGS = $(shell pkg-config --cflags libhackrf 2>/dev/null || echo "-I/opt/homebrew/include/libhackrf")
-FFTW_CFLAGS = $(shell pkg-config --cflags fftw3f 2>/dev/null || echo "-I/opt/homebrew/include")
-
-# Пути к библиотекам (macOS Homebrew)
-HACKRF_LIBS = $(shell pkg-config --libs libhackrf 2>/dev/null || echo "-L/opt/homebrew/lib -lhackrf")
-FFTW_LIBS = $(shell pkg-config --libs fftw3f 2>/dev/null || echo "-L/opt/homebrew/lib -lfftw3f")
+# Определяем архитектуру
+ARCH := $(shell uname -m)
+ifeq ($(ARCH),arm64)
+    # ARM64 (Apple Silicon)
+    HACKRF_CFLAGS = $(shell pkg-config --cflags libhackrf 2>/dev/null || echo "-I/opt/homebrew/include/libhackrf")
+    FFTW_CFLAGS = $(shell pkg-config --cflags fftw3f 2>/dev/null || echo "-I/opt/homebrew/include")
+    HACKRF_LIBS = $(shell pkg-config --libs libhackrf 2>/dev/null || echo "-L/opt/homebrew/lib -lhackrf")
+    FFTW_LIBS = $(shell pkg-config --libs fftw3f 2>/dev/null || echo "-L/opt/homebrew/lib -lfftw3f")
+else
+    # Intel x86_64
+    HACKRF_CFLAGS = $(shell pkg-config --cflags libhackrf 2>/dev/null || echo "-I/usr/local/include/libhackrf")
+    FFTW_CFLAGS = $(shell pkg-config --cflags fftw3f 2>/dev/null || echo "-I/usr/local/include")
+    HACKRF_LIBS = $(shell pkg-config --libs libhackrf 2>/dev/null || echo "-L/usr/local/lib -lhackrf")
+    FFTW_LIBS = $(shell pkg-config --libs fftw3f 2>/dev/null || echo "-L/usr/local/lib -lfftw3f")
+endif
 
 # Целевые файлы
 TARGET = libhackrf_master.so
