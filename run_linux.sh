@@ -65,12 +65,47 @@ install_system_deps() {
 install_emoji_fonts() {
     echo "🎨 Установка emoji шрифтов..."
     
-    if [ -f "install_emoji_fonts_universal.sh" ]; then
-        chmod +x install_emoji_fonts_universal.sh
-        ./install_emoji_fonts_universal.sh
+    # Определяем дистрибутив
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        DISTRO="$ID"
     else
-        echo "⚠️  Скрипт install_emoji_fonts_universal.sh не найден"
+        DISTRO="unknown"
     fi
+    
+    echo "📦 Установка emoji шрифтов для $DISTRO..."
+    
+    case "$DISTRO" in
+        "ubuntu"|"debian"|"linuxmint")
+            # Ubuntu/Debian
+            sudo apt-get update
+            sudo apt-get install -y fonts-noto-color-emoji fonts-joypixels fonts-twemoji
+            ;;
+        "fedora"|"rhel"|"centos"|"rocky"|"alma")
+            # Fedora/RHEL
+            if command -v dnf >/dev/null 2>&1; then
+                sudo dnf install -y google-noto-emoji-fonts joypixels-fonts
+            else
+                sudo yum install -y google-noto-emoji-fonts joypixels-fonts
+            fi
+            ;;
+        "arch"|"manjaro")
+            # Arch Linux
+            sudo pacman -S --noconfirm noto-fonts-emoji joypixels-fonts
+            ;;
+        *)
+            echo "⚠️  Неизвестный дистрибутив: $DISTRO"
+            echo "Установите вручную: fonts-noto-color-emoji, fonts-joypixels"
+            ;;
+    esac
+    
+    # Обновляем кэш шрифтов
+    if command -v fc-cache >/dev/null 2>&1; then
+        echo "🔄 Обновление кэша шрифтов..."
+        sudo fc-cache -fv
+    fi
+    
+    echo "✅ Emoji шрифты установлены для Linux"
     echo
 }
 

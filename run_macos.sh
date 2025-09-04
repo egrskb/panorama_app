@@ -38,12 +38,37 @@ install_homebrew_deps() {
 install_emoji_fonts() {
     echo "🎨 Установка emoji шрифтов..."
     
-    if [ -f "install_emoji_fonts_universal.sh" ]; then
-        chmod +x install_emoji_fonts_universal.sh
-        ./install_emoji_fonts_universal.sh
-    else
-        echo "⚠️  Скрипт install_emoji_fonts_universal.sh не найден"
+    # Проверяем наличие Homebrew
+    if ! command -v brew >/dev/null 2>&1; then
+        echo "❌ Homebrew не установлен. Установите его с https://brew.sh"
+        return 1
     fi
+    
+    # Устанавливаем шрифты через Homebrew
+    echo "📦 Установка emoji шрифтов через Homebrew..."
+    
+    # Проверяем наличие системных emoji шрифтов
+    if [ -f "/System/Library/Fonts/Apple Color Emoji.ttc" ]; then
+        echo "✓ Apple Color Emoji найден"
+    fi
+    
+    # Устанавливаем шрифты с emoji поддержкой (новый способ)
+    brew install --cask font-noto-emoji 2>/dev/null || {
+        echo "⚠️  Font Noto Emoji уже установлен или недоступен"
+    }
+    
+    # Устанавливаем дополнительные шрифты если нужно
+    brew install --cask font-joypixels 2>/dev/null || {
+        echo "⚠️  Font JoyPixels уже установлен или недоступен"
+    }
+    
+    # Проверяем наличие других emoji шрифтов
+    if [ -f "/System/Library/Fonts/Supplemental/Apple Color Emoji.ttc" ]; then
+        echo "✓ Supplemental Apple Color Emoji найден"
+    fi
+    
+    echo "✅ Emoji шрифты установлены для macOS"
+    echo "💡 macOS имеет встроенную поддержку emoji шрифтов"
     echo
 }
 
@@ -54,7 +79,11 @@ build_hackrf_master() {
     local original_dir=$(pwd)
     cd panorama/drivers/hackrf/hackrf_master
     
-    # Используем macOS Makefile
+    # Определяем архитектуру
+    ARCH=$(uname -m)
+    echo "🏗️  Архитектура: $ARCH"
+    
+    # Используем macOS Makefile с поддержкой ARM
     if [ -f "Makefile.macos" ]; then
         make -f Makefile.macos clean
         make -f Makefile.macos all
@@ -77,7 +106,11 @@ build_hackrf_slave() {
     local original_dir=$(pwd)
     cd panorama/drivers/hackrf/hackrf_slaves
     
-    # Используем macOS Makefile
+    # Определяем архитектуру
+    ARCH=$(uname -m)
+    echo "🏗️  Архитектура: $ARCH"
+    
+    # Используем macOS Makefile с поддержкой ARM
     if [ -f "Makefile.macos" ]; then
         make -f Makefile.macos clean
         make -f Makefile.macos all

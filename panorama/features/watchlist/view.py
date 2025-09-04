@@ -432,7 +432,13 @@ class ImprovedSlavesView(QWidget):
                             'updated': data.get('updated', time.strftime('%H:%M:%S')),
                             'status': 'ИЗМЕРЕНИЕ' if range_rssi else 'ОЖИДАНИЕ',
                             'bins_used': {f'slave{i}': data.get(f'bins_used_{i+1}', 'N/A') for i in range(3)},
-                            'timestamps': {f'slave{i}': data.get(f'timestamp_{i+1}', '') for i in range(3)}
+                            'timestamps': {f'slave{i}': data.get(f'timestamp_{i+1}', '') for i in range(3)},
+                            # Новые поля, необходимые веб-таблице для корректного рендера
+                            'peak_id': data.get('id'),
+                            'confidence': data.get('confidence'),
+                            'baseline': data.get('baseline'),
+                            'sub_centers': data.get('sub_centers'),
+                            'sub_halfspan': data.get('sub_halfspan')
                         }
                 
                 except Exception as e:

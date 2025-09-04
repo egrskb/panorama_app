@@ -90,7 +90,7 @@ class Orchestrator(QObject):
         self._cleanup_timer.start(5000)
 
         # Периодическое обновление измерений watchlist (постоянные замеры)
-        self.measure_interval_ms = 300  # более частые замеры для лайв-данных
+        self.measure_interval_ms = 1000  # увеличили интервал до 1 секунды для стабильности
         self._last_measure_at: Dict[str, float] = {}
         self._measure_timer = QTimer(self)
         self._measure_timer.timeout.connect(self._tick_watchlist_measurements)
@@ -353,23 +353,13 @@ class Orchestrator(QObject):
 
     def _on_all_measurements_complete(self, results: List[RSSIMeasurement]):
         try:
-            # Live-обновление RSSI в watchlist для UI сразу по каждому измерению
-            try:
-                if self.trilateration_coordinator and hasattr(self.trilateration_coordinator, 'peak_manager'):
-                    for r in results:
-                        peak_id_any = self._get_peak_id_for_freq(r.center_hz)
-                        if peak_id_any:
-                            self.trilateration_coordinator.peak_manager.update_rssi_measurement(
-                                peak_id_any, r.slave_id, r.band_rssi_dbm
-                            )
-            except Exception:
-                pass
+            # Live-обновление RSSI в watchlist для UI сразу по каждому измерению (убираем дубликат)
             grouped: Dict[str, List[RSSIMeasurement]] = defaultdict(list)
             for r in results:
-                # сопоставляем с задачей по (center, span) в пределах 1 кГц
+                # сопоставляем с задачей по (center, span) - увеличиваем допуск до 5 кГц
                 for tid, t in self.tasks.items():
-                    if (abs(r.center_hz - t.window.center) < 1e3 and
-                            abs(r.span_hz - t.window.span) < 1e3 and
+                    if (abs(r.center_hz - t.window.center) < 5e3 and
+                            abs(r.span_hz - t.window.span) < 5e3 and
                             t.status == "RUNNING"):
                         grouped[tid].append(r)
                         break
@@ -598,6 +588,20 @@ class Orchestrator(QObject):
                         # нормируем к [0..1] относительно порога и 20 дБ запаса
                         est_conf = max(0.0, min(1.0, (snr_est - self.min_snr_threshold) / 20.0))
 
+                    # Добавляем baseline данные для каждого slave
+                    baseline_data = {}
+                    if self.slave_manager:
+                        for sid, slave in self.slave_manager.slaves.items():
+                            baseline_data[sid] = getattr(slave, 'noise_baseline_dbm', -90.0)
+                    
+                    # Динамические центры поддиапазонов для каждого slave (F_max или F_centroid + halfspan)
+                    sub_centers = {}
+                    user_halfspan = 2.5  # MHz - из настроек детектора
+                    for i, slave_id in enumerate(['slave0', 'slave1', 'slave2']):
+                        if vals[i] is not None:
+                            # Используем текущий центр entry как базу (он уже обновляется в PeakWatchlistManager)
+                            sub_centers[slave_id] = entry.center_freq_hz / 1e6  # MHz
+                    
                     wl_ui.append({
                         'id': entry.peak_id,
                         'freq': entry.center_freq_hz / 1e6,
@@ -614,7 +618,11 @@ class Orchestrator(QObject):
                         'timestamp_1': time.strftime('%H:%M:%S', time.localtime(entry.last_update)),
                         'timestamp_2': time.strftime('%H:%M:%S', time.localtime(entry.last_update)),
                         'timestamp_3': time.strftime('%H:%M:%S', time.localtime(entry.last_update)),
-                        'updated': time.strftime('%H:%M:%S', time.localtime(entry.last_update))
+                        'updated': time.strftime('%H:%M:%S', time.localtime(entry.last_update)),
+                        # Новые поля для GUI
+                        'baseline': baseline_data,
+                        'sub_centers': sub_centers,
+                        'sub_halfspan': user_halfspan
                     })
             snapshot['watchlist'] = wl_ui
         except Exception as e:

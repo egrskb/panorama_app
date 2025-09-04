@@ -560,18 +560,20 @@ class PeakWatchlistManager(QObject):
                 print(f"[Watchlist] RSSI update: {peak_id} {slave_id} = {rssi_dbm:.1f} dBm")
             except Exception:
                 pass
-            # Автоудаление, если сигнал сравнялся с шумом (все RSSI ниже baseline+δ)
+            # Автоудаление, если сигнал сравнялся с шумом на всех 3+ SDR
             try:
                 baseline_med = float(np.median(list(self.baseline_history))) if len(self.baseline_history) > 0 else -90.0
                 threshold = baseline_med + max(3.0, self.min_snr_db)  # немного выше порога SNR
-                vals = list(self.watchlist[peak_id].rssi_measurements.values())
+                entry = self.watchlist[peak_id]
+                vals = list(entry.rssi_measurements.values())
                 strong = [v for v in vals if v is not None and v > threshold]
-                # Если ни один slave не показывает сигнал выше порога в течение 10с — удаляем
-                if not strong and (time.time() - self.watchlist[peak_id].last_update) > 10.0:
+                
+                # Новая логика: удаляем только если есть данные минимум от 3 слейвов И все показывают шум
+                if len(vals) >= 3 and not strong and (time.time() - entry.last_update) > 30.0:
                     try:
                         del self.watchlist[peak_id]
                         self.watchlist_updated.emit(list(self.watchlist.values()))
-                        print(f"[Watchlist] Removed inactive peak {peak_id} (RSSI near noise)")
+                        print(f"[Watchlist] Removed inactive peak {peak_id} - all {len(vals)} slaves show noise level (< {threshold:.1f} dBm)")
                     except Exception:
                         pass
             except Exception:
