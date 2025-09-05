@@ -173,3 +173,32 @@ class MasterSourceAdapter(QtCore.QObject):
                 self._relay_status(f"EMA alpha set to {a:.2f}")
         except Exception as e:
             self._relay_error(f"Failed to set EMA alpha: {e}")
+
+    def set_video_detector_params(self, settings):
+        """Пробрасывает расширенные параметры видео‑детектора в C-бэкенд."""
+        try:
+            if not self.backend:
+                return
+            hi = float(getattr(settings, 'hysteresis_high_db', 10.0))
+            lo = float(getattr(settings, 'hysteresis_low_db', 5.0))
+            bridge = int(getattr(settings, 'bridge_gap_bins', 4))
+            end_delta = float(getattr(settings, 'boundary_end_delta_db', 1.2))
+            edge_run = int(getattr(settings, 'edge_min_run_bins', 3))
+            med = int(getattr(settings, 'prefilter_median_bins', 5))
+            occ = float(getattr(settings, 'min_region_occupancy', 0.4))
+            area = float(getattr(settings, 'min_region_area', 3.0))
+            min_width = int(getattr(settings, 'min_peak_width_bins', 3))
+            merge_gap_hz = float(getattr(settings, 'rms_halfspan_mhz', 2.5)) * 1e6 * 0.25
+            self.backend.set_video_params(hi, lo, bridge, end_delta, edge_run, med, occ, area, min_width, merge_gap_hz)
+            self._relay_status("Video detector params updated (C)")
+        except Exception as e:
+            self._relay_error(f"Failed to set video detector params: {e}")
+
+    def detect_video_bands(self, max_bands: int = 16):
+        try:
+            if not self.backend:
+                return []
+            return self.backend.detect_video_bands(max_bands=max_bands)
+        except Exception as e:
+            self._relay_error(f"detect_video_bands failed: {e}")
+            return []

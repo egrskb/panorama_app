@@ -54,6 +54,9 @@ class WatchlistEntry:
     last_update: float
     rssi_measurements: Dict[str, float] = field(default_factory=dict)  # slave_id -> RSSI_RMS
     is_active: bool = True
+    # Полные границы кластера видеосигнала (для отображения и логики пропуска диапазонов на мастере)
+    cluster_start_hz: float = 0.0
+    cluster_end_hz: float = 0.0
 
     def __post_init__(self):
         # Вычисляем границы окна
@@ -82,12 +85,12 @@ class PeakWatchlistManager(QObject):
         self.video_bandwidth_min_mhz = 2.0   # Минимум 2 МГц для видеосигналов
         self.video_bandwidth_max_mhz = 30.0  # Разрешаем широкие сигналы
         self.threshold_mode = "adaptive"      # "adaptive" или "fixed"
-        self.baseline_offset_db = 15.0       # Увеличен порог над baseline для меньших ложных срабатываний
+        self.baseline_offset_db = 15.0       # Порог над baseline для устойчивости
         self.threshold_dbm = -65.0           # Фиксированный порог (повышен)
-        self.min_snr_db = 8.0                # Увеличен минимальный SNR для фильтрации шума
+        self.min_snr_db = 8.0                # Минимальный SNR для фильтрации шума
         self.min_peak_width_bins = 10        # Увеличена минимальная ширина в бинах
         self.min_peak_distance_bins = 20     # Увеличено минимальное расстояние между пиками
-        self.merge_if_gap_hz = detector_settings.get("cluster", {}).get("merge_if_gap_hz", 2e6)  # Объединять кластеры при разрыве
+        self.merge_if_gap_hz = detector_settings.get("cluster", {}).get("merge_if_gap_hz", 3e6)  # По умолчанию чуть шире
 
         # Параметры watchlist
         self.watchlist_span_hz = 10e6        # Окно ±5 МГц вокруг пика по умолчанию
@@ -95,6 +98,17 @@ class PeakWatchlistManager(QObject):
         self.peak_timeout_sec = 120.0        # Увеличенный таймаут, чтобы записи не исчезали быстро
         self.min_confirmation_sweeps = 3     # Требуем 3 подтверждения для добавления в watchlist
         self.center_mode: str = 'fmax'       # 'fmax' | 'centroid'
+        # Гистерезис для устойчивого выделения полос видеосигнала (менее чувствительный)
+        self.hysteresis_high_db = 10.0  # seed-порог SNR для начала региона
+        self.hysteresis_low_db = 5.0    # порог SNR для расширения региона
+        self.bridge_gap_bins_default = 4  # допускаемый короткий разрыв в бинах
+        # Границы по возврату к baseline
+        self.boundary_end_delta_db = 1.2   # насколько выше baseline, чтобы считать конец
+        self.edge_min_run_bins = 3         # минимум подряд для фиксации конца
+        # Анти‑выбросные фильтры
+        self.prefilter_median_bins = 5     # скользящая медиана по частоте перед SNR
+        self.min_region_occupancy = 0.40   # доля бинов в [a,b], где snr>=low, чтобы считать регион валидным
+        self.min_region_area = 3.0         # интеграл SNR (дБ*бин) минимальный для региона
 
         # Состояние
         self.detected_peaks: Dict[str, VideoSignalPeak] = {}
@@ -115,133 +129,174 @@ class PeakWatchlistManager(QObject):
 
     def process_spectrum(self, freqs_hz: np.ndarray, power_dbm: np.ndarray,
                          user_span_hz: Optional[float] = None) -> List[VideoSignalPeak]:
+        # Python‑детектор удалён: используем C‑детектор через координатор.
+        return []
+
+    # --- NEW: ingestion from C-side detector ---
+    def ingest_detected_bands(self, bands: List[tuple], user_span_hz: Optional[float] = None) -> None:
+        """Принимает список диапазонов от C-детектора и обновляет watchlist без дублей.
+        bands: List of tuples (start_hz, stop_hz, center_hz, peak_dbm)
+        Логика сопоставления идентична python-детектору:
+        - если новый диапазон перекрывается с существующим окном/кластером или центр рядом — обновляем запись
+        - иначе, добавляем новую запись только если _should_add_entry(...) возвращает True
         """
-        Обрабатывает спектр и ищет пики видеосигналов.
+        if not bands:
+            return
+        now = time.time()
+        span_default = float(user_span_hz or self.watchlist_span_hz)
+        updated = False
 
-        Args:
-            freqs_hz: Частоты в Гц
-            power_dbm: Мощности в дБм
-            user_span_hz: Пользовательская ширина окна для watchlist
-
-        Returns:
-            Список обнаруженных пиков
-        """
-        if freqs_hz is None or power_dbm is None or freqs_hz.size < 10:
-            return []
-
-        # Сохраняем для анализа
-        self.last_spectrum = (freqs_hz.copy(), power_dbm.copy())
-
-        # Отладка
+        # Упорядочим по убыванию предполагаемой мощности (если есть)
         try:
-            print(f"[DEBUG] Processing spectrum: {freqs_hz.size} points, power range: {power_dbm.min():.1f} to {power_dbm.max():.1f} dBm")
+            bands_sorted = sorted(bands, key=lambda b: float(b[3]) if len(b) > 3 else 0.0, reverse=True)
+        except Exception:
+            bands_sorted = list(bands)
+
+        # 1) Сначала слияние пересекающихся/вложенных диапазонов от мастера: «нет вложенных диапазонов»
+        #    Отсортируем по началу и объединим все пересечения/малые разрывы (<= merge_if_gap_hz).
+        try:
+            bands_sorted = sorted(bands_sorted, key=lambda b: float(b[0]))
         except Exception:
             pass
-
-        # Вычисляем baseline
-        baseline = self._compute_baseline(power_dbm)
-        try:
-            print(f"[DEBUG] Baseline: {baseline:.1f} dBm")
-        except Exception:
-            pass
-
-        # Определяем порог
-        if self.threshold_mode == "adaptive":
-            threshold = baseline + self.baseline_offset_db
-        else:
-            threshold = self.threshold_dbm
-        try:
-            print(f"[DEBUG] Threshold: {threshold:.1f} dBm (mode={self.threshold_mode})")
-        except Exception:
-            pass
-
-        # Находим пики
-        peaks = self._find_video_peaks(freqs_hz, power_dbm, threshold, baseline)
-        try:
-            print(f"[DEBUG] Found {len(peaks)} peaks")
-        except Exception:
-            pass
-
-        # Обновляем состояние и watchlist
-        new_peaks = []
-        current_time = time.time()
-
-        for peak in peaks:
-            # Проверяем, не дубликат ли это (в пределах 1 МГц)
-            is_duplicate = False
-            for existing_freq in self._previous_peaks:
-                if abs(peak.center_freq_hz - existing_freq) < 1e6:
-                    is_duplicate = True
-                    break
-
-            if is_duplicate:
-                # Обновляем существующий пик и при достижении подтверждения добавляем в watchlist
-                for peak_id, existing_peak in self.detected_peaks.items():
-                    if abs(existing_peak.center_freq_hz - peak.center_freq_hz) < 1e6:
-                        existing_peak.last_seen = current_time
-                        existing_peak.consecutive_detections += 1
-                        existing_peak.peak_power_dbm = max(existing_peak.peak_power_dbm,
-                                                          peak.peak_power_dbm)
-                        # Обновляем новые метрики кластера
-                        if peak.centroid_freq_hz > 0.0:
-                            existing_peak.centroid_freq_hz = peak.centroid_freq_hz
-                        if peak.bandwidth_3db_hz > 0.0:
-                            existing_peak.bandwidth_3db_hz = peak.bandwidth_3db_hz
-                        if peak.cluster_start_hz > 0.0:
-                            existing_peak.cluster_start_hz = peak.cluster_start_hz
-                        if peak.cluster_end_hz > 0.0:
-                            existing_peak.cluster_end_hz = peak.cluster_end_hz
-                        try:
-                            print(f"[DEBUG] Peak {peak_id} detections: {existing_peak.consecutive_detections}")
-                        except Exception:
-                            pass
-                        # ДИНАМИЧЕСКИЙ центр: обновляем центр окна RSSI в записи watchlist
-                        try:
-                            if peak_id in self.watchlist:
-                                if self.center_mode == 'centroid' and existing_peak.centroid_freq_hz > 0.0:
-                                    new_center = existing_peak.centroid_freq_hz
-                                else:
-                                    new_center = existing_peak.center_freq_hz
-                                entry = self.watchlist[peak_id]
-                                if abs(entry.center_freq_hz - new_center) > 1.0:  # >1 Гц, чтобы не дёргать по мелочи
-                                    entry.center_freq_hz = new_center
-                                    entry.freq_start_hz = new_center - entry.span_hz/2
-                                    entry.freq_stop_hz = new_center + entry.span_hz/2
-                                    entry.last_update = current_time
-                        except Exception:
-                            pass
-                        # Если достигнуто требуемое число подтверждений — добавляем в watchlist
-                        if (existing_peak.consecutive_detections >= max(1, self.min_confirmation_sweeps)
-                                and peak_id not in self.watchlist):
-                            proposed_span = float(user_span_hz or self.watchlist_span_hz)
-                            if self._should_add_entry(existing_peak.center_freq_hz, proposed_span,
-                                                       cluster_start_hz=existing_peak.cluster_start_hz,
-                                                       cluster_end_hz=existing_peak.cluster_end_hz):
-                                if not any(abs(existing_peak.center_freq_hz - c) < 1e6 for c in self._ever_added_centers):
-                                    self._add_to_watchlist(existing_peak, proposed_span)
-                                    self._ever_added_centers.add(existing_peak.center_freq_hz)
-                        break
+        merged_master: List[Tuple[float, float, float, float]] = []
+        for b in bands_sorted:
+            try:
+                f0, f1, fc = float(b[0]), float(b[1]), float(b[2])
+                pk = float(b[3]) if len(b) > 3 else 0.0
+            except Exception:
+                continue
+            if f1 <= f0:
+                continue
+            if not merged_master:
+                merged_master.append((f0, f1, fc, pk))
+                continue
+            mf0, mf1, mfc, mpk = merged_master[-1]
+            # Если пересекаются или разрыв мал (<= merge_if_gap_hz) — объединяем
+            if f0 <= mf1 + float(self.merge_if_gap_hz):
+                nf0 = min(mf0, f0)
+                nf1 = max(mf1, f1)
+                # Центр и пик — берём по максимуму pk
+                if pk >= mpk:
+                    nfc, npk = fc, pk
+                else:
+                    nfc, npk = mfc, mpk
+                merged_master[-1] = (nf0, nf1, nfc, npk)
             else:
-                # Новый пик
-                self.detected_peaks[peak.id] = peak
-                new_peaks.append(peak)
-                self._previous_peaks.add(peak.center_freq_hz)
+                merged_master.append((f0, f1, fc, pk))
 
-                # Добавляем в watchlist если подтвержден и ранее не добавляли такой центр
-                if peak.consecutive_detections >= max(1, self.min_confirmation_sweeps):
-                    proposed_span = float(user_span_hz or self.watchlist_span_hz)
-                    if self._should_add_entry(peak.center_freq_hz, proposed_span,
-                                               cluster_start_hz=peak.cluster_start_hz,
-                                               cluster_end_hz=peak.cluster_end_hz):
-                        if not any(abs(peak.center_freq_hz - c) < 1e6 for c in self._ever_added_centers):
-                            self._add_to_watchlist(peak, proposed_span)
-                            self._ever_added_centers.add(peak.center_freq_hz)
+        matched_ids: Set[str] = set()
+        for band in merged_master:
+            try:
+                f0, f1, fc = float(band[0]), float(band[1]), float(band[2])
+            except Exception:
+                continue
+            if not np.isfinite(f0) or not np.isfinite(f1) or not np.isfinite(fc):
+                continue
+            if f1 <= f0:
+                continue
 
-        # Эмитим сигналы для новых пиков
-        for peak in new_peaks:
-            self.peak_detected.emit(peak)
+            # Пытаемся найти существующую запись, соответствующую этому диапазону
+            match_id = self._find_existing_entry_for_band(center_hz=fc,
+                                                          span_hz=span_default,
+                                                          cluster_start_hz=f0,
+                                                          cluster_end_hz=f1)
+            if match_id:
+                # Обновляем существующую запись (центр/границы/время)
+                entry = self.watchlist.get(match_id)
+                if entry:
+                    # Центр мастера = середина полного диапазона, НЕ Fmax
+                    double_center = 0.5 * (float(f0) + float(f1))
+                    entry.center_freq_hz = float(double_center)
+                    entry.cluster_start_hz = float(f0)
+                    entry.cluster_end_hz = float(f1)
+                    entry.freq_start_hz = entry.center_freq_hz - entry.span_hz / 2.0
+                    entry.freq_stop_hz = entry.center_freq_hz + entry.span_hz / 2.0
+                    entry.last_update = now
+                    matched_ids.add(match_id)
+                    updated = True
+                continue
 
-        return peaks
+            # Если не нашли совпадение — проверим, что добавление не создаст дубль
+            if not self._should_add_entry(center_hz=fc, span_hz=span_default,
+                                          cluster_start_hz=f0, cluster_end_hz=f1):
+                continue
+
+            # Учитываем лимит размера списка — удаляем самый старый при необходимости
+            if len(self.watchlist) >= self.max_watchlist_size:
+                try:
+                    oldest_id = min(self.watchlist.keys(), key=lambda k: self.watchlist[k].created_at)
+                    del self.watchlist[oldest_id]
+                except Exception:
+                    pass
+
+            peak_id = f"peak_{int(((f0+f1)/2)/1e6)}MHz_{int(now*1000)}"
+            entry = WatchlistEntry(
+                peak_id=peak_id,
+                # Центр мастера = середина полного диапазона, НЕ Fmax
+                center_freq_hz=float(0.5*(f0+f1)),
+                span_hz=span_default,
+                freq_start_hz=float(0.5*(f0+f1)) - span_default/2.0,
+                freq_stop_hz=float(0.5*(f0+f1)) + span_default/2.0,
+                created_at=now,
+                last_update=now,
+                cluster_start_hz=float(f0),
+                cluster_end_hz=float(f1),
+            )
+            self.watchlist[peak_id] = entry
+            matched_ids.add(peak_id)
+            updated = True
+
+        # Удаляем записи, которые не пришли в текущем кадре (синхронизация с мастером)
+        if matched_ids:
+            to_drop = [pid for pid in self.watchlist.keys() if pid not in matched_ids]
+            for pid in to_drop:
+                try:
+                    del self.watchlist[pid]
+                except Exception:
+                    pass
+            if to_drop:
+                updated = True
+
+        if updated:
+            self.watchlist_updated.emit(list(self.watchlist.values()))
+
+    def _find_existing_entry_for_band(self, center_hz: float, span_hz: float,
+                                       cluster_start_hz: float, cluster_end_hz: float) -> Optional[str]:
+        """Находит существующую запись watchlist, соответствующую диапазону из C-детектора.
+        Критерии совпадения (любой):
+          - центр попадает в окно существующей записи
+          - пересечение окон ≥ 60% меньшего окна
+          - центр существующей записи попадает внутрь нового кластера
+          - пересечение [cluster] с окном записи ≥ 30%
+          - |Δf центров| < 0.6×span существующей записи
+        Возвращает peak_id или None.
+        """
+        if not self.watchlist:
+            return None
+        new_start = center_hz - span_hz / 2.0
+        new_end = center_hz + span_hz / 2.0
+        for pid, entry in self.watchlist.items():
+            exist_start = entry.freq_start_hz
+            exist_end = entry.freq_stop_hz
+            # 1) центр внутри
+            if exist_start <= center_hz <= exist_end:
+                return pid
+            # 2) Перекрытие окон ≥ 60%
+            inter = max(0.0, min(new_end, exist_end) - max(new_start, exist_start))
+            ref_span = min(span_hz, entry.span_hz)
+            if ref_span > 0 and (inter / ref_span) >= 0.60:
+                return pid
+            # 3) Центр записи в новом кластере или перекрытие ≥ 30%
+            cluster_span = max(1.0, cluster_end_hz - cluster_start_hz)
+            if cluster_start_hz <= entry.center_freq_hz <= cluster_end_hz:
+                return pid
+            cluster_inter = max(0.0, min(cluster_end_hz, exist_end) - max(cluster_start_hz, exist_start))
+            if (cluster_inter / min(cluster_span, (exist_end - exist_start))) >= 0.30:
+                return pid
+            # 4) Близость центров
+            if abs(center_hz - entry.center_freq_hz) < 0.6 * entry.span_hz:
+                return pid
+        return None
 
     def _compute_baseline(self, power_dbm: np.ndarray) -> float:
         """
@@ -263,22 +318,85 @@ class PeakWatchlistManager(QObject):
                          threshold: float, baseline: float) -> List[VideoSignalPeak]:
         """
         Ищет широкополосные пики характерные для видеосигналов с улучшенной кластеризацией.
-        Кластеризация: contiguous бины над порогом + объединение при разрыве < merge_if_gap_hz
-        Метрики: ширина по −3 дБ, центроид (взвешенный по мощности), пик (F_max)
+        Подход:
+        1) Вычисляем SNR по отношению к baseline и сглаживаем по частоте
+        2) Гистерезис-маска: seed по high-порогу, расширение по low-порогу, мостим короткие дыры
+        3) Для региона считаем метрики и уточняем края по возврату к baseline (±delta)
         """
-        peaks = []
+        peaks: List[VideoSignalPeak] = []
 
-        # Маска точек выше порога
-        above_threshold = power_dbm > threshold
-        if not np.any(above_threshold):
+        # Оценка ширины бина
+        try:
+            bin_hz = float(np.median(np.diff(freqs_hz)))
+            if not np.isfinite(bin_hz) or bin_hz <= 0:
+                bin_hz = float(freqs_hz[1] - freqs_hz[0])
+        except Exception:
+            bin_hz = max(1e3, float(freqs_hz[1] - freqs_hz[0])) if freqs_hz.size > 1 else 100e3
+
+        # Сглаженный SNR: предварительно медианный фильтр, затем усреднение
+        snr = (power_dbm - baseline).astype(np.float32, copy=False)
+        try:
+            if self.prefilter_median_bins and self.prefilter_median_bins >= 3:
+                w = int(self.prefilter_median_bins | 1)
+                pad = w // 2
+                padded = np.pad(snr, (pad, pad), mode='edge')
+                strd = np.lib.stride_tricks.as_strided(
+                    padded,
+                    shape=(snr.size, w),
+                    strides=(padded.strides[0], padded.strides[0])
+                )
+                snr = np.median(strd, axis=1).astype(np.float32, copy=False)
+        except Exception:
+            pass
+        win_bins = int(max(5, min(401, round(200e3 / max(1.0, bin_hz)))))
+        if (win_bins % 2) == 0:
+            win_bins += 1
+        try:
+            kernel = np.ones(win_bins, dtype=np.float32) / float(win_bins)
+            snr_s = np.convolve(snr, kernel, mode='same')
+        except Exception:
+            snr_s = snr
+
+        hi = float(self.hysteresis_high_db)
+        lo = float(self.hysteresis_low_db)
+        lo = min(lo, hi)
+        mask_low = snr_s >= lo
+        mask_high = snr_s >= hi
+
+        # Мостим короткие дыры
+        bridge = int(max(0, self.bridge_gap_bins_default))
+        if bridge > 0 and mask_low.any():
+            holes = []
+            start = None
+            for i, v in enumerate(mask_low):
+                if not v and start is None:
+                    start = i
+                elif v and start is not None:
+                    holes.append((start, i - 1))
+                    start = None
+            if start is not None:
+                holes.append((start, len(mask_low) - 1))
+            for a, b in holes:
+                if (b - a + 1) <= bridge:
+                    mask_low[a:b+1] = True
+
+        # Регионы по низкому порогу, но требуем seed по высокому
+        regions_low = self._find_connected_regions(mask_low)
+        merged_regions: List[Tuple[int, int]] = []
+        for a, b in regions_low:
+            if not np.any(mask_high[a:b+1]):
+                continue
+            # Фильтр занятости: какой процент бинов внутри региона >= low
+            occ = float(np.mean(mask_low[a:b+1])) if (b > a) else 0.0
+            if occ < float(self.min_region_occupancy):
+                continue
+            # Фильтр площади SNR (в дБ*бин), чтобы отсечь одиночные узкие иглы
+            area = float(np.sum(np.maximum(0.0, snr_s[a:b+1])))
+            if area < float(self.min_region_area):
+                continue
+            merged_regions.append((a, b))
+        if not merged_regions:
             return peaks
-
-        # 1. Находим связные области
-        regions = self._find_connected_regions(above_threshold)
-
-        # 2. Объединяем близко расположенные регионы (динамический порог = 0.25×span)
-        current_span_hz = float(self.watchlist_span_hz)
-        merged_regions = self._merge_nearby_regions(regions, freqs_hz, merge_gap_hz=max(0.0, 0.25 * current_span_hz))
 
         for start_idx, end_idx in merged_regions:
             region_freqs = freqs_hz[start_idx:end_idx+1]
@@ -289,29 +407,31 @@ class PeakWatchlistManager(QObject):
 
             # 3. Рассчитываем метрики кластера
             peak_freq, peak_power, centroid_freq, bandwidth_3db, cluster_start, cluster_end = \
-                self._calculate_cluster_metrics(freqs_hz, power_dbm, start_idx, end_idx)
+                self._calculate_cluster_metrics(freqs_hz, power_dbm, start_idx, end_idx, baseline)
 
             # Полная ширина кластера
             cluster_bandwidth_hz = cluster_end - cluster_start
             cluster_bandwidth_mhz = cluster_bandwidth_hz / 1e6
 
             # Проверяем, подходит ли под видеосигнал
-            # Используем единую минимальную ширину для всех диапазонов
-            min_width_mhz = self.video_bandwidth_min_mhz
-
+            # Используем минимальную ширину, но допускаем узкие кластеры, если SNR сильно выше порога
+            min_width_mhz = float(self.video_bandwidth_min_mhz)
             if cluster_bandwidth_mhz < min_width_mhz:
-                continue  # Слишком узкий
+                # допустим узкую полосу, если пик значительно (>= 10 дБ) выше baseline
+                pass  # проверим после вычисления SNR
             if cluster_bandwidth_mhz > self.video_bandwidth_max_mhz:
                 continue  # Слишком широкий
 
             # Вычисляем SNR
             snr = peak_power - baseline
-            if snr < self.min_snr_db:
+            if cluster_bandwidth_mhz < min_width_mhz and snr >= max(self.min_snr_db + 4.0, 10.0):
+                pass  # разрешаем узкий кластер при очень большом SNR
+            elif snr < self.min_snr_db:
                 continue
                 
             # Дополнительная проверка на стабильность: пик должен быть значительно выше соседей
             region_median = np.median(region_power)
-            if peak_power - region_median < 5.0:  # Пик должен быть минимум на 5 дБ выше медианы региона
+            if peak_power - region_median < 4.0:  # Чуть мягче: 4 дБ над медианой региона
                 continue
 
             # 4. Создаем объект пика с новыми метриками
@@ -422,7 +542,7 @@ class PeakWatchlistManager(QObject):
         return True
 
     def _calculate_cluster_metrics(self, freqs_hz: np.ndarray, power_dbm: np.ndarray,
-                                 start_idx: int, end_idx: int) -> Tuple[float, float, float, float, float, float]:
+                                 start_idx: int, end_idx: int, baseline: float) -> Tuple[float, float, float, float, float, float]:
         """
         Рассчитывает метрики кластера:
         - peak_freq: частота максимума (F_max)
@@ -460,22 +580,60 @@ class PeakWatchlistManager(QObject):
             else:
                 centroid_freq = peak_freq
 
-            # 3. Ширина по уровню -3 дБ от пика
+            # 3. Границы кластера и ширина по уровню -3 дБ
             threshold_3db = peak_power - 3.0
             above_3db = region_power >= threshold_3db
-
             if np.any(above_3db):
                 indices_above_3db = np.where(above_3db)[0]
-                start_3db_idx = indices_above_3db[0]
-                end_3db_idx = indices_above_3db[-1]
+                start_3db_idx = int(indices_above_3db[0])
+                end_3db_idx = int(indices_above_3db[-1])
                 bandwidth_3db = float(region_freqs[end_3db_idx] - region_freqs[start_3db_idx])
             else:
-                # Если нет точек выше -3 дБ, используем весь регион
+                start_3db_idx = 0
+                end_3db_idx = len(region_freqs) - 1
                 bandwidth_3db = float(region_freqs[-1] - region_freqs[0])
 
-            # 4. Границы кластера
-            cluster_start = float(region_freqs[0])
-            cluster_end = float(region_freqs[-1])
+            # Границы: когда сглаженная мощность возвращается к baseline (±delta) стабильно несколько бинов
+            # Сглаживание небольшим окном по частоте, чтобы убрать мелкие колебания
+            try:
+                k = np.ones(5, dtype=np.float32) / 5.0
+                smooth_power = np.convolve(region_power, k, mode='same')
+            except Exception:
+                smooth_power = region_power
+
+            end_level = float(baseline + float(self.boundary_end_delta_db))
+            min_run = int(max(1, self.edge_min_run_bins))
+
+            # Левая граница
+            left = int(peak_idx)
+            run = 0
+            for i in range(int(peak_idx), -1, -1):
+                if smooth_power[i] <= end_level:
+                    run += 1
+                    if run >= min_run:
+                        left = i
+                        break
+                else:
+                    run = 0
+
+            # Правая граница
+            right = int(peak_idx)
+            run = 0
+            for i in range(int(peak_idx), len(smooth_power)):
+                if smooth_power[i] <= end_level:
+                    run += 1
+                    if run >= min_run:
+                        right = i
+                        break
+                else:
+                    run = 0
+
+            # Защита индексов
+            left = max(0, min(left, len(region_freqs) - 1))
+            right = max(left, min(right, len(region_freqs) - 1))
+
+            cluster_start = float(region_freqs[left])
+            cluster_end = float(region_freqs[right])
 
             return peak_freq, peak_power, centroid_freq, bandwidth_3db, cluster_start, cluster_end
 
@@ -516,7 +674,9 @@ class PeakWatchlistManager(QObject):
             freq_start_hz=rssi_center_hz - span_hz/2,
             freq_stop_hz=rssi_center_hz + span_hz/2,
             created_at=time.time(),
-            last_update=time.time()
+            last_update=time.time(),
+            cluster_start_hz=float(peak.cluster_start_hz or (rssi_center_hz - span_hz/2)),
+            cluster_end_hz=float(peak.cluster_end_hz or (rssi_center_hz + span_hz/2))
         )
 
         self.watchlist[peak.id] = entry

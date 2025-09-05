@@ -7,7 +7,7 @@
 import sys
 import logging
 import time
-from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QTableWidgetItem, QMessageBox, QFileDialog
+from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QTableWidgetItem, QMessageBox, QFileDialog, QStatusBar
 import numpy as np
 
 
@@ -22,6 +22,8 @@ from panorama.ui.main_ui_manager import MainUIManager
 # Импортируем модули для диалогов
 from panorama.features.settings.manager_improved import ImprovedDeviceManagerDialog
 from panorama.ui import DetectorSettingsDialog, DetectorSettings
+from panorama.drivers.hackrf.hackrf_slaves.hackrf_slave_wrapper import HackRFSlaveDevice
+from panorama.features.calibration.settings_dialog import CalibrationSettingsDialog, CalibrationDialogResult
 
 
 class PanoramaAppWindow(QMainWindow):
@@ -70,6 +72,11 @@ class PanoramaAppWindow(QMainWindow):
         
         # Настройка UI
         self.ui_manager.setup_main_ui()
+        try:
+            if not self.statusBar():
+                self.setStatusBar(QStatusBar())
+        except Exception:
+            pass
         
         # Получаем ссылки на основные виджеты через UI менеджер
         self.map_view = self.ui_manager.get_map_view()
@@ -288,6 +295,10 @@ class PanoramaAppWindow(QMainWindow):
             self.ui_manager.clear_slaves_requested.connect(self._clear_slaves_data)
             self.ui_manager.about_requested.connect(self._show_about)
             self.ui_manager.device_manager_requested.connect(self._open_device_manager)
+            # Прогресс калибровки
+            if self.slave_manager:
+                self.slave_manager.calibration_progress.connect(self._on_calibration_progress)
+                self.slave_manager.calibration_finished.connect(self._on_calibration_finished)
             
             self.log.info("UI signals connected successfully")
         except Exception as e:
@@ -820,9 +831,105 @@ class PanoramaAppWindow(QMainWindow):
             self.log.error(f"Error in save calibration dialog: {e}")
     
     def _show_calibration_settings(self):
-        """Показывает настройки калибровки."""
-        # TODO: Реализовать диалог настроек калибровки
-        QMessageBox.information(self, "Информация", "Настройки калибровки будут добавлены в следующей версии")
+        """Показывает настройки калибровки и запускает процесс по запросу."""
+        try:
+            dlg = CalibrationSettingsDialog(self)
+            params_holder = {'ok': False, 'params': None}
+            def _on_apply(res: CalibrationDialogResult):
+                params_holder['ok'] = True
+                params_holder['params'] = res
+            dlg.settingsApplied.connect(_on_apply)
+            dlg.exec_()
+            if not params_holder['ok']:
+                return
+            self.statusBar().showMessage("Калибровка: старт...")
+            # Готовим master устройство для калибровки (через Slave wrapper API)
+            master_device = None
+            master_serial = None
+            try:
+                master_cfg = self.config_manager.get_master_config()
+                master_serial = master_cfg.get('serial') if master_cfg else None
+            except Exception:
+                master_serial = None
+            try:
+                # Останавливаем Master sweep, если он запущен, чтобы освободить устройство
+                if self.spectrum_view and getattr(self.spectrum_view, '_source', None):
+                    adapter = self.spectrum_view._source
+                    if getattr(adapter, 'running', False):
+                        adapter.stop()
+            except Exception:
+                pass
+            try:
+                master_device = HackRFSlaveDevice(serial=master_serial or "", logger=self.log)
+                if master_device.open():
+                    # Configure master device before any spectrum/measurement calls
+                    try:
+                        from panorama.drivers.hackrf.hackrf_slaves.hackrf_slave_wrapper import SlaveConfig
+                        # базовые значения; частота не критична, т.к. выставляется в измерениях
+                        cfg = SlaveConfig(
+                            center_freq_hz=int(100e6),
+                            sample_rate_hz=8_000_000,
+                            lna_gain=16,
+                            vga_gain=20,
+                            amp_enable=False,
+                            window_type=1,
+                            dc_offset_correction=True,
+                            iq_balance_correction=True,
+                            freq_offset_hz=0.0,
+                            calibration_db=0.0,
+                        )
+                        master_device.configure(cfg)
+                    except Exception as e:
+                        self.log.warning(f"Master device configure failed (will try anyway): {e}")
+                else:
+                    master_device = None
+            except Exception as e:
+                self.log.error(f"Master device open error: {e}")
+                master_device = None
+            ok = False
+            if self.slave_manager and hasattr(self.slave_manager, 'calibrate_all_slaves'):
+                # Применяем настройки калибратора
+                try:
+                    if getattr(self.slave_manager, 'calibrator', None):
+                        cal = self.slave_manager.calibrator
+                        cal.set_targets(params_holder['params'].targets_mhz,
+                                        params_holder['params'].dwell_ms,
+                                        params_holder['params'].search_span_khz,
+                                        params_holder['params'].amplitude_tolerance_db,
+                                        params_holder['params'].sync_timeout_sec)
+                except Exception:
+                    pass
+                ok = self.slave_manager.calibrate_all_slaves(master_device)
+            # Закрываем временно открытое master устройство
+            try:
+                if master_device:
+                    master_device.close()
+            except Exception:
+                pass
+            self.statusBar().showMessage("Калибровка завершена" if ok else "Калибровка завершена с ошибками", 5000)
+        except Exception as e:
+            self.statusBar().showMessage(f"Ошибка калибровки: {e}", 5000)
+            self.log.error(f"Error showing calibration settings: {e}")
+
+    def _on_calibration_progress(self, info: dict):
+        try:
+            stage = info.get('stage', '')
+            cur = info.get('current', 0)
+            total = info.get('total', 0)
+            serial = info.get('serial', '')
+            if stage == 'start_device':
+                self.statusBar().showMessage(f"Калибровка {cur}/{total}: {serial}...")
+            elif stage == 'device_done':
+                ok = info.get('ok', False)
+                self.statusBar().showMessage(f"Готово {cur}/{total}: {serial} ({'OK' if ok else 'ERR'})")
+        except Exception:
+            pass
+
+    def _on_calibration_finished(self, ok: bool):
+        try:
+            self.statusBar().showMessage("Калибровка: успех" if ok else "Калибровка: ошибки", 5000)
+        except Exception:
+            pass
 
     def _show_detector_settings(self):
         """Показывает диалог настроек детектора."""
@@ -839,6 +946,14 @@ class PanoramaAppWindow(QMainWindow):
                             self.orchestrator.set_measure_interval_sec(float(getattr(s, 'measurement_interval_sec', 1.0)))
                         except Exception:
                             pass
+                    # Обновляем параметры видео‑детектора (С) для мастера
+                    try:
+                        if hasattr(self.ui_manager, 'spectrum_view') and self.ui_manager.spectrum_view:
+                            adapter = getattr(self.ui_manager.spectrum_view, '_source', None)
+                            if adapter and hasattr(adapter, 'set_video_detector_params'):
+                                adapter.set_video_detector_params(s)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 # Прокидываем режим центра в SlaveManager на лету
@@ -1017,6 +1132,30 @@ class PanoramaAppWindow(QMainWindow):
             
             # Вызываем основную логику автоуправления
             self._on_slave_watchlist_updated(watchlist_data)
+
+            # Подсветка диапазонов на спектре/водопаде: строим список (start_mhz, stop_mhz)
+            try:
+                if hasattr(self.ui_manager, 'spectrum_view') and self.ui_manager.spectrum_view:
+                    ranges = []
+                    for entry in watchlist_entries:
+                        try:
+                            # Предпочитаем границы кластера
+                            f0c = float(getattr(entry, 'cluster_start_hz', 0.0)) * 1e-6
+                            f1c = float(getattr(entry, 'cluster_end_hz', 0.0)) * 1e-6
+                            if f1c > f0c and f1c > 0 and f0c > 0:
+                                f0, f1 = f0c, f1c
+                            else:
+                                f0 = float(entry.freq_start_hz) * 1e-6
+                                f1 = float(entry.freq_stop_hz) * 1e-6
+                        except Exception:
+                            # fallback на центр+span
+                            c = float(entry.center_freq_hz) * 1e-6
+                            w = float(entry.span_hz) * 1e-6 * 0.5
+                            f0, f1 = c - w, c + w
+                        ranges.append((f0, f1))
+                    self.ui_manager.spectrum_view.set_highlight_ranges(ranges)
+            except Exception as _e:
+                self.log.debug(f"Highlight update error: {_e}")
             
         except Exception as e:
             self.log.error(f"Ошибка обработки watchlist от peak_manager: {e}")
@@ -1108,6 +1247,14 @@ class PanoramaAppWindow(QMainWindow):
             self.trilateration_coordinator.process_master_spectrum
         )
         
+        # Сохраняем адаптер мастера, чтобы координатор мог вызывать C‑детектор
+        try:
+            adapter = getattr(self.spectrum_view, '_source', None)
+            if adapter is not None:
+                self.trilateration_coordinator.master_adapter = adapter
+        except Exception:
+            pass
+
         # Virtual-slave режим отключён: не подключаем спектр Master к слейвам
         # Пересылка задач watchlist в оркестратор для измерений слейвами
         try:

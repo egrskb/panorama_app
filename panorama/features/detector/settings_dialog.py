@@ -31,6 +31,16 @@ class DetectorSettings:
     min_peak_width_bins: int = 3  # Минимальная ширина пика
     min_peak_distance_bins: int = 5  # Минимальное расстояние между пиками
 
+    # Расширенные параметры детекции (гистерезис и границы)
+    hysteresis_high_db: float = 10.0
+    hysteresis_low_db: float = 5.0
+    bridge_gap_bins: int = 4
+    boundary_end_delta_db: float = 1.2
+    edge_min_run_bins: int = 3
+    prefilter_median_bins: int = 5
+    min_region_occupancy: float = 0.40
+    min_region_area: float = 3.0
+
     # Параметры для Slave watchlist и RMS трилатерации
     watchlist_dwell_ms: int = 150  # Время измерения
     max_watchlist_size: int = 20  # Максимальный размер списка
@@ -64,6 +74,14 @@ class DetectorSettings:
             'min_snr_db': self.min_snr_db,
             'min_peak_width_bins': self.min_peak_width_bins,
             'min_peak_distance_bins': self.min_peak_distance_bins,
+            'hysteresis_high_db': self.hysteresis_high_db,
+            'hysteresis_low_db': self.hysteresis_low_db,
+            'bridge_gap_bins': self.bridge_gap_bins,
+            'boundary_end_delta_db': self.boundary_end_delta_db,
+            'edge_min_run_bins': self.edge_min_run_bins,
+            'prefilter_median_bins': self.prefilter_median_bins,
+            'min_region_occupancy': self.min_region_occupancy,
+            'min_region_area': self.min_region_area,
             'watchlist_dwell_ms': self.watchlist_dwell_ms,
             'max_watchlist_size': self.max_watchlist_size,
             'rms_halfspan_mhz': self.rms_halfspan_mhz,
@@ -298,6 +316,67 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         lbl_dist = QtWidgets.QLabel("<i>Минимальный зазор между пиками (в бинах), чтобы они не сливались в один.</i>")
         lbl_dist.setWordWrap(True)
         detection_layout.addRow("", lbl_dist)
+
+        # Гистерезис (упрощённые настройки)
+        self.spin_hyst_high = QtWidgets.QDoubleSpinBox()
+        self.spin_hyst_high.setRange(5.0, 30.0)
+        self.spin_hyst_high.setValue(self.settings.hysteresis_high_db)
+        self.spin_hyst_high.setSuffix(" дБ")
+        self.spin_hyst_high.setMaximumWidth(180)
+        detection_layout.addRow("Гистерезис — высокий порог:", self.spin_hyst_high)
+
+        self.spin_hyst_low = QtWidgets.QDoubleSpinBox()
+        self.spin_hyst_low.setRange(1.0, 25.0)
+        self.spin_hyst_low.setValue(self.settings.hysteresis_low_db)
+        self.spin_hyst_low.setSuffix(" дБ")
+        self.spin_hyst_low.setMaximumWidth(180)
+        detection_layout.addRow("Гистерезис — низкий порог:", self.spin_hyst_low)
+
+        self.spin_bridge = QtWidgets.QSpinBox()
+        self.spin_bridge.setRange(0, 20)
+        self.spin_bridge.setValue(self.settings.bridge_gap_bins)
+        self.spin_bridge.setSuffix(" бинов")
+        self.spin_bridge.setMaximumWidth(180)
+        detection_layout.addRow("Допустимый разрыв внутри полосы:", self.spin_bridge)
+
+        self.spin_boundary_delta = QtWidgets.QDoubleSpinBox()
+        self.spin_boundary_delta.setRange(0.1, 5.0)
+        self.spin_boundary_delta.setSingleStep(0.1)
+        self.spin_boundary_delta.setValue(self.settings.boundary_end_delta_db)
+        self.spin_boundary_delta.setSuffix(" дБ")
+        self.spin_boundary_delta.setMaximumWidth(180)
+        detection_layout.addRow("Завершение при возврате к baseline ±:", self.spin_boundary_delta)
+
+        self.spin_edge_run = QtWidgets.QSpinBox()
+        self.spin_edge_run.setRange(1, 20)
+        self.spin_edge_run.setValue(self.settings.edge_min_run_bins)
+        self.spin_edge_run.setSuffix(" бинов")
+        self.spin_edge_run.setMaximumWidth(180)
+        detection_layout.addRow("Подряд бинов для фиксации края:", self.spin_edge_run)
+
+        # Анти‑выбросы
+        self.spin_pref_median = QtWidgets.QSpinBox()
+        self.spin_pref_median.setRange(0, 99)
+        self.spin_pref_median.setValue(self.settings.prefilter_median_bins)
+        self.spin_pref_median.setSuffix(" бинов")
+        self.spin_pref_median.setMaximumWidth(180)
+        detection_layout.addRow("Скользящая медиана (предфильтр):", self.spin_pref_median)
+
+        self.spin_occupancy = QtWidgets.QDoubleSpinBox()
+        self.spin_occupancy.setRange(0.0, 1.0)
+        self.spin_occupancy.setSingleStep(0.05)
+        self.spin_occupancy.setValue(self.settings.min_region_occupancy)
+        self.spin_occupancy.setSuffix(" доля")
+        self.spin_occupancy.setMaximumWidth(180)
+        detection_layout.addRow("Мин. занятость региона (0..1):", self.spin_occupancy)
+
+        self.spin_area = QtWidgets.QDoubleSpinBox()
+        self.spin_area.setRange(0.0, 1000.0)
+        self.spin_area.setSingleStep(0.5)
+        self.spin_area.setValue(self.settings.min_region_area)
+        self.spin_area.setSuffix(" дБ·бин")
+        self.spin_area.setMaximumWidth(180)
+        detection_layout.addRow("Мин. площадь SNR:", self.spin_area)
 
         # Подтверждение детекции (перенесено сюда из Основных)
         confirm_group = QtWidgets.QGroupBox("Подтверждение")
@@ -684,6 +763,14 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
         self.spin_min_snr.setValue(self.settings.min_snr_db)
         self.spin_min_width.setValue(self.settings.min_peak_width_bins)
         self.spin_min_distance.setValue(self.settings.min_peak_distance_bins)
+        self.spin_hyst_high.setValue(self.settings.hysteresis_high_db)
+        self.spin_hyst_low.setValue(self.settings.hysteresis_low_db)
+        self.spin_bridge.setValue(self.settings.bridge_gap_bins)
+        self.spin_boundary_delta.setValue(self.settings.boundary_end_delta_db)
+        self.spin_edge_run.setValue(self.settings.edge_min_run_bins)
+        self.spin_pref_median.setValue(self.settings.prefilter_median_bins)
+        self.spin_occupancy.setValue(self.settings.min_region_occupancy)
+        self.spin_area.setValue(self.settings.min_region_area)
 
         # Watchlist
         self.spin_watchlist_dwell.setValue(self.settings.watchlist_dwell_ms)
@@ -721,6 +808,14 @@ class DetectorSettingsDialog(QtWidgets.QDialog):
             min_snr_db=self.spin_min_snr.value(),
             min_peak_width_bins=int(self.spin_min_width.value()),
             min_peak_distance_bins=int(self.spin_min_distance.value()),
+            hysteresis_high_db=self.spin_hyst_high.value(),
+            hysteresis_low_db=self.spin_hyst_low.value(),
+            bridge_gap_bins=int(self.spin_bridge.value()),
+            boundary_end_delta_db=self.spin_boundary_delta.value(),
+            edge_min_run_bins=int(self.spin_edge_run.value()),
+            prefilter_median_bins=int(self.spin_pref_median.value()),
+            min_region_occupancy=self.spin_occupancy.value(),
+            min_region_area=self.spin_area.value(),
             watchlist_dwell_ms=int(self.spin_watchlist_dwell.value()),
             max_watchlist_size=int(self.spin_max_watchlist.value()),
             rms_halfspan_mhz=self.spin_rms_halfspan.value(),
@@ -792,6 +887,23 @@ def apply_settings_to_watchlist_manager(settings: DetectorSettings, manager):
     manager.min_snr_db = settings.min_snr_db
     manager.min_peak_width_bins = settings.min_peak_width_bins
     manager.min_peak_distance_bins = settings.min_peak_distance_bins
+    # Расширенные параметры детекции (синхронизация с менеджером)
+    if hasattr(manager, 'hysteresis_high_db'):
+        manager.hysteresis_high_db = settings.hysteresis_high_db
+    if hasattr(manager, 'hysteresis_low_db'):
+        manager.hysteresis_low_db = settings.hysteresis_low_db
+    if hasattr(manager, 'bridge_gap_bins_default'):
+        manager.bridge_gap_bins_default = int(settings.bridge_gap_bins)
+    if hasattr(manager, 'boundary_end_delta_db'):
+        manager.boundary_end_delta_db = settings.boundary_end_delta_db
+    if hasattr(manager, 'edge_min_run_bins'):
+        manager.edge_min_run_bins = int(settings.edge_min_run_bins)
+    if hasattr(manager, 'prefilter_median_bins'):
+        manager.prefilter_median_bins = int(settings.prefilter_median_bins)
+    if hasattr(manager, 'min_region_occupancy'):
+        manager.min_region_occupancy = float(settings.min_region_occupancy)
+    if hasattr(manager, 'min_region_area'):
+        manager.min_region_area = float(settings.min_region_area)
 
     # Параметры watchlist (используем RMS halfspan для определения полосы)
     manager.rms_halfspan_hz = settings.rms_halfspan_mhz * 1e6

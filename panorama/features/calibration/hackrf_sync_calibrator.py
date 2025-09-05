@@ -60,16 +60,16 @@ class HackRFSyncCalibrator:
         
         # Опорные цели для калибровки
         self.reference_targets = [
-            CalibrationTarget("FM_Radio", 100e6, -30.0, 200e3),  # FM радиостанция
-            CalibrationTarget("GSM900", 935e6, -45.0, 200e3),   # GSM 900
-            CalibrationTarget("GSM1800", 1850e6, -50.0, 200e3), # GSM 1800
-            CalibrationTarget("WiFi_2G4", 2450e6, -40.0, 20e6), # WiFi 2.4 ГГц
+            CalibrationTarget("FM_Radio", 100e6, -30.0, 200e3),
+            CalibrationTarget("GSM900", 935e6, -45.0, 200e3),
+            CalibrationTarget("GSM1800", 1850e6, -50.0, 200e3),
+            CalibrationTarget("WiFi_2G4", 2450e6, -40.0, 20e6),
         ]
         
         # Параметры калибровки
         self.sync_timeout_sec = 30.0
-        self.frequency_search_span_hz = 50e3  # Диапазон поиска частотного смещения
-        self.amplitude_tolerance_db = 3.0     # Допуск амплитудной калибровки
+        self.frequency_search_span_hz = 50e3
+        self.amplitude_tolerance_db = 3.0
         
         # Синхронизация
         self._sync_barrier: Optional[threading.Barrier] = None
@@ -126,7 +126,7 @@ class HackRFSyncCalibrator:
         3. Вычисляется разность частот максимумов
         """
         try:
-            # Master получает опорный спектр
+            # Master получает опорный спектр (требуется от C-слоя — без заглушек)
             master_freqs, master_powers = master_device.get_spectrum(
                 center_hz=target.frequency_hz,
                 span_hz=self.frequency_search_span_hz * 2,
@@ -174,18 +174,23 @@ class HackRFSyncCalibrator:
         Определяет амплитудное смещение slave относительно master.
         """
         try:
-            # Синхронные измерения RSSI на той же частоте
-            master_measurement = master_device.measure_rssi(
-                center_hz=target.frequency_hz,
-                span_hz=target.bandwidth_hz,
-                duration_sec=target.duration_sec
-            )
-            
-            slave_measurement = slave_device.measure_rssi(
-                center_hz=target.frequency_hz,
-                span_hz=target.bandwidth_hz,
-                duration_sec=target.duration_sec
-            )
+            # Измерения RSSI на той же частоте с fallback
+            try:
+                master_measurement = master_device.measure_rssi(
+                    center_hz=target.frequency_hz,
+                    span_hz=target.bandwidth_hz,
+                    duration_sec=target.duration_sec
+                )
+            except Exception:
+                master_measurement = None
+            try:
+                slave_measurement = slave_device.measure_rssi(
+                    center_hz=target.frequency_hz,
+                    span_hz=target.bandwidth_hz,
+                    duration_sec=target.duration_sec
+                )
+            except Exception:
+                slave_measurement = None
             
             if not master_measurement or not slave_measurement:
                 raise RuntimeError("Не удалось получить измерения RSSI")
@@ -255,6 +260,23 @@ class HackRFSyncCalibrator:
                         f"amp_offset={avg_amp_offset:.1f}dB")
         
         return True
+
+    # Runtime update from dialog
+    def set_targets(self, targets_mhz: List[float], dwell_ms: int, search_span_khz: int,
+                    amplitude_tolerance_db: float, sync_timeout_sec: float):
+        try:
+            self.reference_targets = [
+                CalibrationTarget(f"F{int(f)}", float(f) * 1e6, None, 200e3) for f in targets_mhz
+            ]
+            self.frequency_search_span_hz = float(search_span_khz) * 1e3
+            # duration in sec
+            for t in self.reference_targets:
+                t.duration_sec = max(0.05, float(dwell_ms) / 1000.0)
+            self.amplitude_tolerance_db = float(amplitude_tolerance_db)
+            self.sync_timeout_sec = float(sync_timeout_sec)
+            return True
+        except Exception:
+            return False
     
     def calibrate_all_slaves(self, master_device, slave_devices: Dict[str, object]) -> bool:
         """

@@ -60,6 +60,7 @@ class SlaveConfig:
     dc_offset_correction: bool = True
     iq_balance_correction: bool = True
     freq_offset_hz: float = 0.0
+    calibration_db: float = 0.0
 
 
 @dataclass 
@@ -89,6 +90,9 @@ class HackRFSlaveDevice:
         self._running = False
         self._thread = None
         self._lock = threading.Lock()
+        # Текущая конфигурация и калибровка (для применения поправок)
+        self._current_config: Optional[SlaveConfig] = None
+        self._calibration_offset_db: float = 0.0
         
         self._load_library()
     
@@ -254,7 +258,7 @@ class HackRFSlaveDevice:
                 c_config.vga_gain = config.vga_gain
                 c_config.amp_enable = config.amp_enable
                 c_config.bandwidth_hz = 2500000  # Default 2.5 MHz
-                c_config.calibration_db = 0.0
+                c_config.calibration_db = float(getattr(config, 'calibration_db', 0.0))
                 c_config.dc_offset_correction = config.dc_offset_correction
                 c_config.frequency_offset_hz = config.freq_offset_hz
                 c_config.iq_balance_correction = config.iq_balance_correction
@@ -269,6 +273,8 @@ class HackRFSlaveDevice:
                     raise HackRFSlaveConfigError(f"Configuration failed: {error_msg} ({ret})")
                 
                 self.logger.info(f"Configured HackRF slave: sr={config.sample_rate_hz/1e6:.1f}MS/s, lna={config.lna_gain}dB, vga={config.vga_gain}dB")
+                # Сохраняем конфигурацию для последующего обновления калибратором
+                self._current_config = config
                 return True
                 
         except Exception as e:
@@ -325,8 +331,8 @@ class HackRFSlaveDevice:
                 measurement = RSSIMeasurement(
                     center_freq_hz=result.center_hz,
                     span_hz=result.span_hz,
-                    rssi_dbm=result.band_rssi_dbm,
-                    noise_floor_dbm=result.band_noise_dbm,
+                    rssi_dbm=(result.band_rssi_dbm + float(getattr(self, '_calibration_offset_db', 0.0))),
+                    noise_floor_dbm=(result.band_noise_dbm + float(getattr(self, '_calibration_offset_db', 0.0))),
                     snr_db=result.snr_db,
                     timestamp=result.timestamp,
                     sample_count=result.n_samples
@@ -375,7 +381,8 @@ class HackRFSlaveDevice:
 
                 num_points = int(ret)
                 freqs = [float(freqs_array[i]) for i in range(num_points)]
-                powers = [float(powers_array[i]) for i in range(num_points)]
+                amp_offset = float(getattr(self, '_calibration_offset_db', 0.0))
+                powers = [float(powers_array[i]) + amp_offset for i in range(num_points)]
                 return freqs, powers
         except Exception as e:
             self.logger.error(f"Spectrum acquisition failed: {e}")

@@ -182,6 +182,10 @@ class SpectrumView(QtWidgets.QWidget):
         self._marker_colors = ["#FF5252", "#40C4FF", "#FFD740", "#69F0AE", "#B388FF",
                               "#FFAB40", "#18FFFF", "#FF6E40", "#64FFDA", "#EEFF41"]
         self._roi_regions = []
+        # Подсветка диапазонов мастера
+        self._highlight_regions_spec: List[pg.LinearRegionItem] = []
+        self._highlight_regions_water: List[pg.GraphicsObject] = []
+        self._highlight_ranges_mhz: List[Tuple[float, float]] = []
 
     def _create_top_panel(self):
         """Создает верхнюю панель с параметрами."""
@@ -457,6 +461,78 @@ class SpectrumView(QtWidgets.QWidget):
         layout.addWidget(self.lbl_sweep)
         
         return panel
+
+    # === Подсветка диапазонов мастера ===
+    def set_highlight_ranges(self, ranges_mhz: List[Tuple[float, float]]):
+        """Устанавливает подсветку диапазонов на графике спектра и водопаде.
+        ranges_mhz: список (start_mhz, stop_mhz)
+        """
+        try:
+            # Сохраним и приведём к валидному формату
+            cleaned: List[Tuple[float, float]] = []
+            for a, b in ranges_mhz or []:
+                a = float(a); b = float(b)
+                if b < a:
+                    a, b = b, a
+                if b <= a:
+                    continue
+                # Клип в глобальные границы
+                a = max(50.0, min(6000.0, a))
+                b = max(50.0, min(6000.0, b))
+                if b > a:
+                    cleaned.append((a, b))
+            self._highlight_ranges_mhz = cleaned
+            self._refresh_highlight_regions()
+        except Exception:
+            pass
+
+    def _clear_highlight_regions(self):
+        """Удаляет старые объекты подсветки."""
+        try:
+            for item in self._highlight_regions_spec:
+                try:
+                    self.plot.removeItem(item)
+                except Exception:
+                    pass
+            self._highlight_regions_spec.clear()
+        except Exception:
+            pass
+        try:
+            for item in self._highlight_regions_water:
+                try:
+                    self.water_plot.removeItem(item)
+                except Exception:
+                    pass
+            self._highlight_regions_water.clear()
+        except Exception:
+            pass
+
+    def _refresh_highlight_regions(self):
+        """Перерисовывает подсветку диапазонов на обоих графиках."""
+        self._clear_highlight_regions()
+        if not self._highlight_ranges_mhz:
+            return
+        # Спектр: LinearRegionItem полупрозрачным красным
+        for (f0, f1) in self._highlight_ranges_mhz:
+            try:
+                region = pg.LinearRegionItem(values=(f0, f1), orientation=pg.LinearRegionItem.Vertical,
+                                             brush=pg.mkBrush(255, 0, 0, 60), pen=pg.mkPen(255, 60, 60, 150))
+                region.setMovable(False)
+                self.plot.addItem(region)
+                self._highlight_regions_spec.append(region)
+            except Exception:
+                pass
+        # Водопад: такие же вертикальные полосы через LinearRegionItem поверх PlotItem
+        for (f0, f1) in self._highlight_ranges_mhz:
+            try:
+                region_w = pg.LinearRegionItem(values=(f0, f1), orientation=pg.LinearRegionItem.Vertical,
+                                               brush=pg.mkBrush(255, 0, 0, 50), pen=pg.mkPen(255, 60, 60, 160))
+                region_w.setMovable(False)
+                region_w.setZValue(10)
+                self.water_plot.addItem(region_w)
+                self._highlight_regions_water.append(region_w)
+            except Exception:
+                pass
 
     def _connect_signals(self):
         """Подключает сигналы."""

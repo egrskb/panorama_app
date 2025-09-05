@@ -146,6 +146,117 @@ static struct {
     int   enabled;
 } g_calibration = {0};
 
+// ================== Параметры видео‑детектора (C) ==================
+static struct {
+    double hi_db;
+    double lo_db;
+    int    bridge_bins;
+    double end_delta_db;
+    int    edge_run_bins;
+    int    median_bins;
+    double min_occupancy;
+    double min_area;
+    int    min_width_bins;
+    double merge_gap_hz;
+} g_video = {
+    12.0, 6.0, 3, 1.5, 4, 7, 0.55, 6.0, 5, 300000.0
+};
+
+static inline int clamp_int(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static inline double clamp_double(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// Компаратор для сортировки float по возрастанию
+static int cmp_float_asc(const void* a, const void* b) {
+    float fa = *(const float*)a, fb = *(const float*)b;
+    return (fa > fb) - (fa < fb);
+}
+
+// Быстрая оценка квантиля (например, q=0.25) по выборке
+static float estimate_percentile(const float* arr, size_t N, double q) {
+    if (!arr || N == 0) return -90.0f;
+    if (q < 0.0) q = 0.0; if (q > 1.0) q = 1.0;
+    // Сэмплируем до 5000 точек равномерно по сетке
+    size_t cap = N < 5000 ? N : 5000;
+    float* tmp = (float*)malloc(sizeof(float) * cap);
+    if (!tmp) return -90.0f;
+    size_t step = N / cap; if (step == 0) step = 1;
+    size_t idx = 0;
+    for (size_t i = 0; i < N && idx < cap; i += step) {
+        float v = arr[i];
+        if (!isfinite(v) || v < -200.0f || v > 50.0f) v = -120.0f;
+        tmp[idx++] = v;
+    }
+    cap = idx > 0 ? idx : 1;
+    qsort(tmp, cap, sizeof(float), cmp_float_asc);
+    size_t pos = (size_t)floor(q * (cap - 1));
+    float out = tmp[pos];
+    free(tmp);
+    return out;
+}
+
+// Простой медианный фильтр по окну W (нечётное, <= 31)
+static void median_filter_float(const float* in, float* out, int N, int W) {
+    if (W <= 1 || N <= 0) {
+        if (out != in) memcpy(out, in, sizeof(float)*(size_t)N);
+        return;
+    }
+    if ((W & 1) == 0) W += 1;
+    if (W > 31) W = 31;
+    int r = W/2;
+    float window[32];
+    for (int i = 0; i < N; ++i) {
+        int L = i - r; if (L < 0) L = 0;
+        int R = i + r; if (R >= N) R = N - 1;
+        int m = 0;
+        for (int k = L; k <= R; ++k) window[m++] = in[k];
+        // сортировка вставкой
+        for (int a = 1; a < m; ++a) {
+            float key = window[a]; int b = a - 1;
+            while (b >= 0 && window[b] > key) { window[b+1] = window[b]; --b; }
+            window[b+1] = key;
+        }
+        out[i] = window[m/2];
+    }
+}
+
+// Заполняем короткие дырки длиной <= bridge_false в булевой маске (0/1)
+static void bridge_false_runs(uint8_t* mask, int N, int bridge_false) {
+    if (bridge_false <= 0 || !mask) return;
+    int i = 0;
+    while (i < N) {
+        // пропускаем True
+        while (i < N && mask[i]) ++i;
+        int start = i;
+        while (i < N && !mask[i]) ++i;
+        int end = i - 1; // последний false
+        if (start > 0 && end >= start && end < N-1) {
+            int len = end - start + 1;
+            if (len <= bridge_false) {
+                for (int k = start; k <= end; ++k) mask[k] = 1;
+            }
+        }
+    }
+}
+
+// Объединение близких регионов по разрыву в Гц
+static int merge_regions(const int* rs, const int* re, int count, double bin_hz, double merge_gap_hz,
+                         int* out_rs, int* out_re, int max_out) {
+    if (count <= 0) return 0;
+    int n = 0; int cs = rs[0], ce = re[0];
+    for (int i = 1; i < count; ++i) {
+        double gap_hz = (double)(rs[i] - ce) * bin_hz;
+        if (gap_hz <= merge_gap_hz) {
+            if (re[i] > ce) ce = re[i];
+        } else {
+            if (n < max_out) { out_rs[n] = cs; out_re[n] = ce; }
+            n++; cs = rs[i]; ce = re[i];
+        }
+    }
+    if (n < max_out) { out_rs[n] = cs; out_re[n] = ce; }
+    n++;
+    return n;
+}
+
 // ================== Утилиты/ошибки ==================
 static void set_error(const char* fmt, ...) {
     va_list args;
@@ -1102,4 +1213,160 @@ int hq_get_device_serial(int idx, char* out, int cap) {
     hackrf_device_list_free(list);
     hackrf_exit();
     return 0;
+}
+
+// ================== Видео‑детектор (реализация API) ==================
+void hq_set_video_params(double hi_db, double lo_db, int bridge_bins,
+                         double end_delta_db, int edge_run_bins,
+                         int median_bins, double min_occupancy,
+                         double min_area, int min_width_bins,
+                         double merge_gap_hz) {
+    g_video.hi_db = hi_db;
+    g_video.lo_db = lo_db;
+    g_video.bridge_bins = bridge_bins;
+    g_video.end_delta_db = end_delta_db;
+    g_video.edge_run_bins = edge_run_bins;
+    g_video.median_bins = median_bins;
+    g_video.min_occupancy = clamp_double(min_occupancy, 0.0, 1.0);
+    g_video.min_area = min_area;
+    g_video.min_width_bins = min_width_bins;
+    g_video.merge_gap_hz = merge_gap_hz;
+}
+
+int  hq_detect_video_bands(double* starts_hz, double* stops_hz,
+                           double* centers_hz, float* peaks_dbm,
+                           int max_bands) {
+    if (!g_master || !g_master->spectrum_freqs || !g_master->spectrum_powers) return 0;
+    if (!starts_hz || !stops_hz || !centers_hz || !peaks_dbm || max_bands <= 0) return 0;
+
+    // Читаем копию текущей EMA‑сетки под мьютексом
+    pthread_mutex_lock(&g_master->spectrum_mutex);
+    size_t N = g_master->spectrum_points;
+    double bin_hz = g_master->freq_step_hz;
+    float* p = (float*)malloc(sizeof(float)*N);
+    if (!p) { pthread_mutex_unlock(&g_master->spectrum_mutex); return 0; }
+    memcpy(p, g_master->spectrum_powers, sizeof(float)*N);
+    pthread_mutex_unlock(&g_master->spectrum_mutex);
+
+    // baseline — робастная оценка по глобальной сетке: медиана (25..75 квартиль)
+    float base = estimate_percentile(p, N, 0.5);
+
+    // SNR = p - base
+    float* snr = (float*)malloc(sizeof(float)*N);
+    if (!snr) { free(p); return 0; }
+    for (size_t i = 0; i < N; ++i) snr[i] = p[i] - base;
+
+    // Предфильтр медианой
+    int med = clamp_int(g_video.median_bins, 0, 31);
+    if (med >= 3) {
+        float* tmp = (float*)malloc(sizeof(float)*N);
+        if (tmp) {
+            median_filter_float(snr, tmp, (int)N, med);
+            memcpy(snr, tmp, sizeof(float)*N);
+            free(tmp);
+        }
+    }
+
+    // Сглаживание бокс‑каром (окно ≈ 150–250 кГц)
+    int win = (int)floor(200000.0 / bin_hz);
+    if (win < 3) win = 3; if ((win & 1) == 0) win += 1; if (win > 401) win = 401;
+    float* snr_s = (float*)malloc(sizeof(float)*N);
+    if (!snr_s) { free(snr); free(p); return 0; }
+    smooth_boxcar_float(snr, snr_s, (int)N, win);
+
+    // Быстрый выход: если максимум SNR ниже высокого порога — ничего не детектим
+    float max_sn = -1e9f;
+    for (size_t i = 0; i < N; ++i) if (snr_s[i] > max_sn) max_sn = snr_s[i];
+    if (max_sn < (float)g_video.hi_db) {
+        free(snr_s); free(snr); free(p);
+        return 0;
+    }
+
+    // Маски гистерезиса
+    double hi = g_video.hi_db, lo = g_video.lo_db; if (lo > hi) lo = hi;
+    uint8_t* mask_low = (uint8_t*)malloc(N);
+    uint8_t* mask_hi  = (uint8_t*)malloc(N);
+    if (!mask_low || !mask_hi) { free(mask_low); free(mask_hi); free(snr_s); free(snr); free(p); return 0; }
+    for (size_t i = 0; i < N; ++i) {
+        float v = snr_s[i]; mask_low[i] = (v >= (float)lo); mask_hi[i]  = (v >= (float)hi);
+    }
+    // Мостим короткие дыры
+    bridge_false_runs(mask_low, (int)N, g_video.bridge_bins);
+
+    // Регионы по низкому порогу, требуем seed по высокому
+    int* rs = (int*)malloc(sizeof(int)*N);
+    int* re = (int*)malloc(sizeof(int)*N);
+    int rc = 0;
+    int inreg = 0, s = 0;
+    for (int i = 0; i < (int)N; ++i) {
+        if (mask_low[i] && !inreg) { inreg = 1; s = i; }
+        if ((!mask_low[i] || i == (int)N-1) && inreg) {
+            int e = (mask_low[i] ? i : i-1);
+            rs[rc] = s; re[rc] = e; rc++; inreg = 0;
+        }
+    }
+    // Оставляем регионы с seed и достаточной занятостью/площадью
+    int* frs = (int*)malloc(sizeof(int)*rc);
+    int* fre = (int*)malloc(sizeof(int)*rc);
+    int fn = 0;
+    for (int i = 0; i < rc; ++i) {
+        int a = rs[i], b = re[i]; if (b <= a) continue;
+        // seed
+        int has_seed = 0; for (int k = a; k <= b; ++k) if (mask_hi[k]) { has_seed = 1; break; }
+        if (!has_seed) continue;
+        // занятость
+        int cnt = 0; for (int k = a; k <= b; ++k) if (mask_low[k]) cnt++;
+        double occ = (double)cnt / (double)(b - a + 1);
+        if (occ < g_video.min_occupancy) continue;
+        // площадь
+        double area = 0.0; for (int k = a; k <= b; ++k) { if (snr_s[k] > 0) area += snr_s[k]; }
+        if (area < g_video.min_area) continue;
+        frs[fn] = a; fre[fn] = b; fn++;
+    }
+
+    // Объединение по разрыву
+    int* mrs = (int*)malloc(sizeof(int)*fn);
+    int* mre = (int*)malloc(sizeof(int)*fn);
+    int mn = merge_regions(frs, fre, fn, bin_hz, g_video.merge_gap_hz, mrs, mre, fn);
+
+    // Уточняем края по baseline ± end_delta и требуемой серии
+    int out_n = 0; int run_need = clamp_int(g_video.edge_run_bins, 1, 50);
+    for (int i = 0; i < mn && out_n < max_bands; ++i) {
+        int a = mrs[i], b = mre[i]; if (b <= a) continue;
+        // контроль min_width_bins
+        if ((b - a + 1) < g_video.min_width_bins) continue;
+        // центр и пик
+        int pidx = a; float pk = snr_s[a];
+        for (int k = a+1; k <= b; ++k) if (snr_s[k] > pk) { pk = snr_s[k]; pidx = k; }
+        // левый край — разрешаем выходить за пределы исходного региона до глобального baseline
+        int L = pidx, run = 0; float end_level = (float)(g_video.end_delta_db);
+        for (int k = pidx; k >= 0; --k) {
+            if (snr_s[k] <= end_level) { run++; if (run >= run_need) { L = k; break; } }
+            else run = 0;
+        }
+        // правый край
+        int R = pidx; run = 0;
+        for (int k = pidx; k < (int)N; ++k) {
+            if (snr_s[k] <= end_level) { run++; if (run >= run_need) { R = k; break; } }
+            else run = 0;
+        }
+        // Не сужаем относительно исходного региона [a,b]: только расширяем к базовой линии
+        if (L > a) L = a;
+        if (R < b) R = b;
+        if (R <= L) { L = a; R = b; }
+        // Расширяем до пересечения с уровнем baseline по мощности (не только по SNR)
+        // небольшой пост‑пасс для надёжной визуальной ширины
+        while (L > 1 && (p[L] - base) > end_level) { --L; }
+        while (R < (int)N-2 && (p[R] - base) > end_level) { ++R; }
+        double f0 = g_master->spectrum_freqs[L];
+        double f1 = g_master->spectrum_freqs[R];
+        double fc = g_master->spectrum_freqs[pidx];
+        starts_hz[out_n] = f0; stops_hz[out_n] = f1; centers_hz[out_n] = fc; peaks_dbm[out_n] = p[pidx];
+        out_n++;
+    }
+
+    free(mrs); free(mre); free(frs); free(fre);
+    free(mask_low); free(mask_hi);
+    free(snr_s); free(snr); free(p);
+    return out_n;
 }

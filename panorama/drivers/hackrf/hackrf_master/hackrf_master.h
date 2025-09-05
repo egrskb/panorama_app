@@ -85,6 +85,20 @@ int  hq_load_calibration(const char* csv_path);
 int  hq_enable_calibration(int enable);
 int  hq_get_calibration_status(void);
 
+// --- Детектор видео‑диапазонов (C‑сторона) ---
+// Настройка параметров детектора видео
+void hq_set_video_params(double hi_db, double lo_db, int bridge_bins,
+                         double end_delta_db, int edge_run_bins,
+                         int median_bins, double min_occupancy,
+                         double min_area, int min_width_bins,
+                         double merge_gap_hz);
+
+// Детектирование видео‑диапазонов в текущем спектре EMA
+// Возвращает количество найденных диапазонов (<= max_bands)
+int  hq_detect_video_bands(double* starts_hz, double* stops_hz,
+                           double* centers_hz, float* peaks_dbm,
+                           int max_bands);
+
 #ifdef __cplusplus
 }
 #endif

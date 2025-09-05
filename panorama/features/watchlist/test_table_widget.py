@@ -238,19 +238,35 @@ class TestTableWidget(QtWidgets.QWidget):
 
     def _setup_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
+        # Фильтр
+        filter_layout = QtWidgets.QHBoxLayout()
+        self.filter_edit = QtWidgets.QLineEdit()
+        self.filter_edit.setPlaceholderText("Фильтр (подстрока по всем столбцам)")
+        filter_layout.addWidget(QtWidgets.QLabel("Фильтр:"))
+        filter_layout.addWidget(self.filter_edit, 1)
+
         self.table = QtWidgets.QTableView(self)
         self.table.setSortingEnabled(True)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
 
         self.model = PandasTableModel()
-        self.table.setModel(self.model)
+        # Оборачиваем в прокси для фильтрации/сортировки
+        self.proxy = QtCore.QSortFilterProxyModel(self)
+        self.proxy.setSourceModel(self.model)
+        self.proxy.setFilterCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        self.proxy.setFilterKeyColumn(-1)  # по всем столбцам
+        self.table.setModel(self.proxy)
 
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
         header.setStretchLastSection(True)
 
+        layout.addLayout(filter_layout)
         layout.addWidget(self.table)
+
+        # Сигналы
+        self.filter_edit.textChanged.connect(self._on_filter_changed)
 
     @QtCore.pyqtSlot(dict)
     def add_log_entry(self, entry: Dict[str, Any]):
@@ -276,6 +292,12 @@ class TestTableWidget(QtWidgets.QWidget):
         finally:
             if sorting:
                 self.table.setSortingEnabled(True)
+
+    def _on_filter_changed(self, text: str):
+        try:
+            self.proxy.setFilterFixedString(text)
+        except Exception:
+            pass
 
     def set_dataframe(self, df: pd.DataFrame):
         self.model.set_dataframe(df)

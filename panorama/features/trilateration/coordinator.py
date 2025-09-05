@@ -122,6 +122,9 @@ class TrilaterationCoordinator(QObject):
         self.user_span_mhz = 5.0  # Пользовательский span для watchlist
         self.path_loss_exponent = 2.5  # Коэффициент затухания
         self.target_timeout_sec = 10.0  # Таймаут потери цели
+        # Тёплый старт детектора: игнорируем первые N строк спектра
+        self._frames_seen = 0
+        self._min_frames_for_detection = 3
         
         # Таймер обновления
         self.update_timer = QTimer(self)
@@ -229,12 +232,22 @@ class TrilaterationCoordinator(QObject):
         """
         if not self.is_running:
             return
+        # Warm-up: пропускаем первые кадры, пока baseline/EMA не устоится
+        self._frames_seen += 1
+        if self._frames_seen < self._min_frames_for_detection:
+            return
         
-        # Обрабатываем спектр через менеджер пиков
-        peaks = self.peak_manager.process_spectrum(
-            freqs_hz, power_dbm, 
-            user_span_hz=self.user_span_mhz * 1e6
-        )
+        # Используем C-детектор (если доступен через адаптер мастера)
+        try:
+            from panorama.features.spectrum.master_adapter import MasterSourceAdapter
+            if isinstance(getattr(self, 'master_adapter', None), MasterSourceAdapter):
+                bands = self.master_adapter.detect_video_bands(max_bands=16)
+                if bands and len(bands) > 0:
+                    # Прямо наполняем watchlist
+                    self.peak_manager.ingest_detected_bands(bands, user_span_hz=self.user_span_mhz * 1e6)
+                return
+        except Exception:
+            pass
         
         if peaks:
             print(f"[Coordinator] Detected {len(peaks)} peaks from Master")

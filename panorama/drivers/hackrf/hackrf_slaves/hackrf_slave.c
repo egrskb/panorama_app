@@ -921,25 +921,75 @@ int hackrf_slave_get_spectrum(hackrf_slave_device_t* device,
                              double* freqs_out,
                              float* powers_out,
                              int max_points) {
-    // Эта функция использует тот же механизм что и measure_rssi
-    // но возвращает весь спектр вместо агрегированных значений
-    
-    hackrf_slave_rssi_measurement_t dummy_measurement;
-    int result = hackrf_slave_measure_rssi(device, center_hz, span_hz, 
-                                          dwell_ms, &dummy_measurement);
-    if (result != HACKRF_SLAVE_SUCCESS) {
+    if (!device || !device->is_configured || !freqs_out || !powers_out || max_points <= 0) {
+        set_error("Invalid parameters for get_spectrum");
         return -1;
     }
-    
-    // Возвращаем количество точек (упрощенная реализация)
-    int points_to_return = (max_points < (int)device->fft_size) ? max_points : device->fft_size;
-    
-    for (int i = 0; i < points_to_return; i++) {
+    // Установим частоту и используем ту же обработку, что и в measure_rssi, но вернём PSD
+    int result = hackrf_set_freq(device->dev, (uint64_t)center_hz);
+    if (result != HACKRF_SUCCESS) {
+        set_error("Failed to set frequency: %s", hackrf_error_name(result));
+        return -1;
+    }
+    uint32_t samples_needed = (uint32_t)((double)device->config.sample_rate * dwell_ms / 1000.0);
+    if (samples_needed > HACKRF_SLAVE_MAX_SAMPLES) samples_needed = HACKRF_SLAVE_MAX_SAMPLES;
+    pthread_mutex_lock(&device->capture_ctx.mutex);
+    device->capture_ctx.samples_captured = 0;
+    device->capture_ctx.samples_needed = samples_needed;
+    device->capture_ctx.capture_complete = false;
+    pthread_mutex_unlock(&device->capture_ctx.mutex);
+    result = hackrf_start_rx(device->dev, rx_callback, &device->capture_ctx);
+    if (result != HACKRF_SUCCESS) {
+        set_error("Failed to start RX: %s", hackrf_error_name(result));
+        return -1;
+    }
+    struct timespec timeout;
+    clock_gettime(CLOCK_REALTIME, &timeout);
+    timeout.tv_sec += (dwell_ms / 1000) + 2;
+    pthread_mutex_lock(&device->capture_ctx.mutex);
+    while (!device->capture_ctx.capture_complete) {
+        int ret = pthread_cond_timedwait(&device->capture_ctx.cond, &device->capture_ctx.mutex, &timeout);
+        if (ret != 0) { pthread_mutex_unlock(&device->capture_ctx.mutex); hackrf_stop_rx(device->dev); set_error("Capture timeout"); return -1; }
+    }
+    uint32_t captured_samples = device->capture_ctx.samples_captured;
+    pthread_mutex_unlock(&device->capture_ctx.mutex);
+    hackrf_stop_rx(device->dev);
+    if (captured_samples == 0) { set_error("No samples captured"); return -1; }
+    uint32_t fft_samples = (captured_samples / device->fft_size) * device->fft_size;
+    uint32_t num_ffts = fft_samples / device->fft_size;
+    if (num_ffts == 0) { set_error("Insufficient samples for FFT"); return -1; }
+    float* avg_psd = calloc(device->fft_size, sizeof(float));
+    if (!avg_psd) { set_error("Memory allocation failed"); return -1; }
+    // Частотная ось
+    for (uint32_t i = 0; i < device->fft_size; i++) {
         double freq_offset = ((double)i - device->fft_size / 2.0) * device->config.sample_rate / device->fft_size;
         freqs_out[i] = center_hz + freq_offset;
-        powers_out[i] = dummy_measurement.band_rssi_dbm; // Упрощенно
     }
-    
+    // Обработка всех блоков
+    for (uint32_t fft_idx = 0; fft_idx < num_ffts; fft_idx++) {
+        uint32_t offset = fft_idx * device->fft_size;
+        convert_iq_to_complex(&device->capture_ctx.buffer[offset * 2], device->fft_in, device->window, device->fft_size, &device->config);
+        fftwf_execute(device->fft_plan);
+        float* block_psd = malloc(device->fft_size * sizeof(float));
+        if (!block_psd) { free(avg_psd); set_error("Memory allocation failed"); return -1; }
+        compute_psd(device->fft_out, block_psd, device->window, device->fft_size, device->config.sample_rate);
+        for (uint32_t i = 0; i < device->fft_size; i++) {
+            uint32_t shifted_idx = (i + device->fft_size / 2) % device->fft_size;
+            avg_psd[shifted_idx] += block_psd[i];
+        }
+        free(block_psd);
+    }
+    // Усреднение и применение аппаратной калибровки (calibration_db)
+    for (uint32_t i = 0; i < device->fft_size; i++) {
+        avg_psd[i] = (avg_psd[i] / num_ffts) + device->config.calibration_db;
+    }
+    // Сглаживание при необходимости
+    if (device->config.spectral_smoothing && device->config.smoothing_factor > 1) {
+        apply_spectral_smoothing(avg_psd, device->fft_size, device->config.smoothing_factor);
+    }
+    int points_to_return = (max_points < (int)device->fft_size) ? max_points : device->fft_size;
+    for (int i = 0; i < points_to_return; i++) powers_out[i] = avg_psd[i];
+    free(avg_psd);
     return points_to_return;
 }
 

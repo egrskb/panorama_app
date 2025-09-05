@@ -201,6 +201,16 @@ class HackRFQSABackend(SourceBackend):
             // Диспетчер устройств
             int  hq_device_count(void);
             int  hq_get_device_serial(int idx, char* out, int cap);
+
+            // --- Видео-детектор
+            void hq_set_video_params(double hi_db, double lo_db, int bridge_bins,
+                                     double end_delta_db, int edge_run_bins,
+                                     int median_bins, double min_occupancy,
+                                     double min_area, int min_width_bins,
+                                     double merge_gap_hz);
+            int  hq_detect_video_bands(double* starts_hz, double* stops_hz,
+                                       double* centers_hz, float* peaks_dbm,
+                                       int max_bands);
         """)
     
     def _load_config(self):
@@ -528,6 +538,38 @@ class HackRFQSABackend(SourceBackend):
                 self._emit_status(f"Detector params updated: threshold={threshold_db:.1f}dB")
             except:
                 pass
+
+    # ---- Видео-детектор (C side) ----
+    def set_video_params(self, hi_db: float, lo_db: float, bridge_bins: int,
+                          end_delta_db: float, edge_run_bins: int, median_bins: int,
+                          min_occupancy: float, min_area: float,
+                          min_width_bins: int, merge_gap_hz: float):
+        if not self._configured:
+            return
+        try:
+            self._lib.hq_set_video_params(float(hi_db), float(lo_db), int(bridge_bins),
+                                          float(end_delta_db), int(edge_run_bins), int(median_bins),
+                                          float(min_occupancy), float(min_area), int(min_width_bins),
+                                          float(merge_gap_hz))
+        except Exception as e:
+            self._emit_status(f"hq_set_video_params unavailable: {e}")
+
+    def detect_video_bands(self, max_bands: int = 16):
+        try:
+            starts = self._ffi.new("double[]", int(max_bands))
+            stops = self._ffi.new("double[]", int(max_bands))
+            centers = self._ffi.new("double[]", int(max_bands))
+            peaks = self._ffi.new("float[]", int(max_bands))
+            n = int(self._lib.hq_detect_video_bands(starts, stops, centers, peaks, int(max_bands)))
+            if n <= 0:
+                return []
+            out = []
+            for i in range(min(n, max_bands)):
+                out.append((float(starts[i]), float(stops[i]), float(centers[i]), float(peaks[i])))
+            return out
+        except Exception as e:
+            self._emit_status(f"hq_detect_video_bands unavailable: {e}")
+            return []
     
     @QtCore.pyqtSlot(int, str)
     def _on_worker_finished(self, code: int, msg: str):

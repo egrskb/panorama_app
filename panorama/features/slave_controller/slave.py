@@ -561,12 +561,17 @@ class SlaveManager(QObject):
     # Новый сигнал для онлайновых апдейтов по мере готовности измерений
     measurement_progress = pyqtSignal(object)  # RSSIMeasurement
     slaves_updated = pyqtSignal(dict)  # {slave_id: {"uri": str, "is_initialized": bool}}
+    # Сигналы калибровки
+    calibration_progress = pyqtSignal(dict)  # {stage, current, total, slave_id}
+    calibration_finished = pyqtSignal(bool)  # успех/неуспех
 
     def __init__(self, logger: logging.Logger):
         super().__init__()
         self.log = logger
         self.slaves: Dict[str, SlaveSDR] = {}
         self._lock = threading.Lock()
+        # Признак активной калибровки, чтобы временно приостановить измерения
+        self._calibrating: bool = False
         
         # Система калибровки и синхронизации
         self.calibrator = None
@@ -628,6 +633,9 @@ class SlaveManager(QObject):
         Returns:
             List of RMS measurements from all slaves
         """
+        if getattr(self, '_calibrating', False):
+            self.log.info("Calibration in progress: skip target RMS measurements")
+            return []
         if not self.slaves:
             self.log.warning("No slaves available for target RMS measurement")
             return []
@@ -663,6 +671,9 @@ class SlaveManager(QObject):
 
     def measure_all_bands(self, windows: List[MeasurementWindow],
                           k_cal_db: Dict[str, float]) -> bool:
+        if getattr(self, '_calibrating', False):
+            self.log.info("Calibration in progress: skip band measurements")
+            return False
         if not self.slaves:
             self.log.warning("No slaves available")
             return False
@@ -810,6 +821,7 @@ class SlaveManager(QObject):
             return False
         
         self.log.info(f"Начало калибровки {len(self.slaves)} slave устройств")
+        self._calibrating = True
         
         # Подготавливаем словарь устройств для калибровки
         slave_devices = {}
@@ -824,8 +836,29 @@ class SlaveManager(QObject):
             self.log.error("Нет готовых устройств для калибровки")
             return False
         
-        # Выполняем калибровку
-        success = self.calibrator.calibrate_all_slaves(master_device, slave_devices)
+        # Выполняем калибровку по одному устройству, отдавая прогресс
+        success = True
+        try:
+            total = len(slave_devices)
+            idx = 0
+            for serial, slave_device in slave_devices.items():
+                idx += 1
+                self.calibration_progress.emit({
+                    'stage': 'start_device', 'current': idx, 'total': total, 'serial': serial
+                })
+                ok = self.calibrator.calibrate_device_pair(master_device, slave_device, serial)
+                self.calibration_progress.emit({
+                    'stage': 'device_done', 'current': idx, 'total': total, 'serial': serial, 'ok': ok
+                })
+                if not ok:
+                    success = False
+            if success:
+                self.calibrator.save_calibrations()
+        except Exception as e:
+            self.log.error(f"Ошибка калибровки: {e}")
+            success = False
+        finally:
+            self._calibrating = False
         
         if success:
             # Применяем калибровку к устройствам
@@ -836,6 +869,10 @@ class SlaveManager(QObject):
                         self.calibrator.apply_calibration(slave_obj.device, serial)
             
             self.log.info("Калибровка завершена и применена ко всем устройствам")
+        try:
+            self.calibration_finished.emit(bool(success))
+        except Exception:
+            pass
         
         return success
     
