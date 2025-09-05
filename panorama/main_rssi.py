@@ -841,6 +841,12 @@ class PanoramaAppWindow(QMainWindow):
                             pass
                 except Exception:
                     pass
+                # Прокидываем режим центра в SlaveManager на лету
+                try:
+                    if self.slave_manager and hasattr(self.slave_manager, 'set_center_mode'):
+                        self.slave_manager.set_center_mode(getattr(s, 'center_mode', 'fmax'))
+                except Exception:
+                    pass
             dlg.settingsChanged.connect(_on_changed)
             dlg.exec_()
         except Exception as e:

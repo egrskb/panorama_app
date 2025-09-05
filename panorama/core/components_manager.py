@@ -110,6 +110,12 @@ class ComponentsManager:
                         self.orchestrator.set_measure_interval_sec(float(getattr(det_settings, 'measurement_interval_sec', 1.0)))
                     except Exception:
                         pass
+                # Прокидываем режим центра в SlaveManager
+                try:
+                    if self.slave_manager and hasattr(det_settings, 'center_mode'):
+                        self.slave_manager.set_center_mode(det_settings.center_mode)
+                except Exception:
+                    pass
                 self.trilateration_coordinator.set_user_span(float(det_settings.rms_halfspan_mhz))
         except Exception as e:
             self.log.warning(f"Failed to load detector settings: {e}")

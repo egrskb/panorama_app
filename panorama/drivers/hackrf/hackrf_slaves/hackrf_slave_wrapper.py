@@ -181,8 +181,8 @@ class HackRFSlaveDevice:
                                                    double center_hz, double halfspan_hz, double guard_hz,
                                                    uint32_t dwell_ms, hackrf_slave_rms_measurement_t* measurement);
                 int hackrf_slave_get_spectrum(hackrf_slave_device_t* device, double center_hz, double span_hz,
-                                             uint32_t dwell_ms, float* freqs_out, float* powers_out, 
-                                             int max_points, int* points_returned);
+                                             uint32_t dwell_ms, double* freqs_out, float* powers_out, 
+                                             int max_points);
                 int hackrf_slave_get_config(hackrf_slave_device_t* device, hackrf_slave_config_t* config_out);
             """)
             
@@ -340,6 +340,46 @@ class HackRFSlaveDevice:
             import traceback
             self.logger.error(f"Traceback: {traceback.format_exc()}")
             return None
+
+    def get_spectrum(self, center_hz: float, span_hz: float, dwell_ms: int = 400, max_points: int = 8192) -> Tuple[list, list]:
+        """Acquire spectrum in the specified band.
+        Returns (freqs_hz, powers_dbm) lists.
+        """
+        try:
+            with self._lock:
+                if not self._device_handle:
+                    raise HackRFSlaveDeviceError("Device not opened")
+
+                freqs_array = self._ffi.new("double[]", int(max_points))
+                powers_array = self._ffi.new("float[]", int(max_points))
+
+                self.logger.debug(f"Requesting spectrum: f={center_hz/1e6:.1f}MHz, span={span_hz/1e6:.1f}MHz, dwell={int(dwell_ms)}ms, max_points={int(max_points)}")
+
+                ret = self._lib.hackrf_slave_get_spectrum(
+                    self._device_handle,
+                    float(center_hz),
+                    float(span_hz),
+                    int(dwell_ms),
+                    freqs_array,
+                    powers_array,
+                    int(max_points)
+                )
+
+                if int(ret) < 0:
+                    # Fetch last error from the library if available
+                    try:
+                        error_msg = self._ffi.string(self._lib.hackrf_slave_last_error()).decode('utf-8')
+                    except Exception:
+                        error_msg = "Unknown error"
+                    raise HackRFSlaveProcessingError(f"Spectrum acquisition failed: {error_msg} ({ret})")
+
+                num_points = int(ret)
+                freqs = [float(freqs_array[i]) for i in range(num_points)]
+                powers = [float(powers_array[i]) for i in range(num_points)]
+                return freqs, powers
+        except Exception as e:
+            self.logger.error(f"Spectrum acquisition failed: {e}")
+            return [], []
     
     def is_streaming(self) -> bool:
         """Check if device is currently streaming."""

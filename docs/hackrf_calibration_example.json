@@ -1,0 +1,32 @@
+{
+  "calibrations": {
+    "1234567890abcdef": {
+      "serial": "1234567890abcdef",
+      "frequency_offset_hz": -2350.0,
+      "amplitude_offset_db": -1.2,
+      "phase_offset_deg": 0.0,
+      "temperature_coefficient": 0.0,
+      "last_calibration_time": 1704067200.0,
+      "reference_temperature": 25.0
+    },
+    "fedcba0987654321": {
+      "serial": "fedcba0987654321", 
+      "frequency_offset_hz": 1820.0,
+      "amplitude_offset_db": 0.8,
+      "phase_offset_deg": 0.0,
+      "temperature_coefficient": 0.0,
+      "last_calibration_time": 1704067200.0,
+      "reference_temperature": 25.0
+    },
+    "abcdef1234567890": {
+      "serial": "abcdef1234567890",
+      "frequency_offset_hz": -890.0,
+      "amplitude_offset_db": -0.5,
+      "phase_offset_deg": 0.0,
+      "temperature_coefficient": 0.0,
+      "last_calibration_time": 1704067200.0,
+      "reference_temperature": 25.0
+    }
+  },
+  "last_update": 1704067200.0
+}

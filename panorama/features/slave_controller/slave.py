@@ -17,6 +17,13 @@ from PyQt5.QtCore import QObject, pyqtSignal, QMutex, QMutexLocker
 
 from panorama.shared.rms_utils import compute_band_rssi_dbm, RMSCalculator, RMSMeasurement
 
+# Импорт системы калибровки
+try:
+    from panorama.features.calibration import HackRFSyncCalibrator
+    CALIBRATION_AVAILABLE = True
+except ImportError:
+    CALIBRATION_AVAILABLE = False
+
 # Импорт нашей нативной C библиотеки
 try:
     from panorama.drivers.hackrf.hackrf_slaves.hackrf_slave_wrapper import (
@@ -88,6 +95,12 @@ class SlaveSDR(QObject):
         # Per-slave baseline estimation (noise tracking around measurement band)
         self.noise_baseline_dbm: float = -90.0
         self._noise_alpha: float = 0.1  # EMA for noise baseline
+
+        # Center selection mode for local recentering: 'fmax' or 'centroid'
+        self.center_mode: str = 'fmax'
+        # Thresholds for centroid computation
+        self.centroid_snr_threshold_db: float = 3.0  # over median baseline
+        self.centroid_db_down: float = 6.0  # region within max-6 dB as fallback
 
         # Отслеживание ошибок и автоматическое отключение
         self.error_count = 0
@@ -270,6 +283,15 @@ class SlaveSDR(QObject):
             return False
 
     # --- band measurement ---
+    def set_center_mode(self, mode: str):
+        """Устанавливает режим выбора локального центра: 'fmax' или 'centroid'."""
+        try:
+            m = str(mode).strip().lower()
+            self.center_mode = 'centroid' if m == 'centroid' else 'fmax'
+            self.log.info(f"{self.slave_id}: center_mode set to {self.center_mode}")
+        except Exception:
+            self.center_mode = 'fmax'
+            self.log.info(f"{self.slave_id}: center_mode fallback to fmax")
     def measure_band_rssi(self, center_hz: float, span_hz: float, dwell_ms: int,
                           k_cal_db: Optional[float] = None) -> RSSIMeasurement:
         """Измеряет RMS в заданном окне. Здесь же закладываем крючок для локального
@@ -323,60 +345,111 @@ class SlaveSDR(QObject):
             bw = max(200000, min(int(span_hz), int(self.sample_rate * 0.8)))
             self._reconfigure_device(bw)
 
-            # Реалтайм локальный центр: быстрый мини‑скан по нескольким смещениям
+            # Один захват спектра: определяем локальный центр (F_max или centroid) и сразу считаем RMS
             f_local = float(center_hz)
             try:
-                halfspan = float(span_hz) * 0.5
-                # 5 точек от -halfspan до +halfspan
-                offsets = np.linspace(-halfspan, halfspan, 5)
-                per_point_sec = max(0.003, min(0.008, (dwell_ms / 1000.0) * 0.05))
-                rssi_samples: List[float] = []
-                freq_samples: List[float] = []
-                for off in offsets:
-                    try:
-                        r_scan = self.device.measure_rssi(
-                            center_hz=float(center_hz + off),
-                            span_hz=float(max(200000, span_hz * 0.5)),
-                            duration_sec=per_point_sec
-                        )
-                        if r_scan is not None:
-                            rssi_samples.append(float(r_scan.rssi_dbm))
-                            freq_samples.append(float(center_hz + off))
-                    except Exception:
-                        continue
-                if rssi_samples:
-                    # Fmax по измеренным точкам
-                    idx_max = int(np.argmax(np.array(rssi_samples)))
-                    f_local = freq_samples[idx_max]
-            except Exception:
-                f_local = float(center_hz)
+                # Захват спектра в рабочем окне
+                freqs_hz_list, power_dbm_list = self.device.get_spectrum(
+                    center_hz=float(center_hz),
+                    span_hz=float(span_hz),
+                    dwell_ms=int(max(5, dwell_ms)),
+                    max_points=4096
+                )
+                if not freqs_hz_list or not power_dbm_list:
+                    raise RuntimeError("Empty spectrum returned")
 
-            # Измерение RMS вокруг локального центра
-            duration_sec = dwell_ms / 1000.0
-            result = self.device.measure_rssi(
-                center_hz=f_local,
-                span_hz=span_hz,
-                duration_sec=duration_sec
-            )
-            if result is None:
-                raise RuntimeError("RSSI measurement returned None")
-            measurement = RSSIMeasurement(
-                slave_id=self.slave_id,
-                # Важно: для согласования с идентификацией задачи оставляем исходный центр окна,
-                # а локальный центр прокидываем в flags['local_center_hz']
-                center_hz=float(center_hz),
-                span_hz=float(span_hz),
-                band_rssi_dbm=result.rssi_dbm,
-                band_noise_dbm=result.noise_floor_dbm,
-                snr_db=result.snr_db,
-                n_samples=result.sample_count,
-                ts=result.timestamp,
-                flags={"direct_device": True, "local_center_hz": float(f_local)},
-            )
+                freqs_hz = np.asarray(freqs_hz_list, dtype=np.float64)
+                power_dbm = np.asarray(power_dbm_list, dtype=np.float32)
+
+                # Находим локальный максимум
+                idx_max = int(np.argmax(power_dbm))
+                f_peak = float(freqs_hz[idx_max])
+                p_max_dbm = float(power_dbm[idx_max])
+
+                # Полуширина окна для RMS
+                halfspan = float(span_hz) * 0.5
+
+                # Выбор центра в зависимости от режима
+                if self.center_mode == 'centroid':
+                    try:
+                        # Грубая оценка baseline по всему спектру
+                        global_noise_dbm = float(np.median(power_dbm))
+                        thresh_dbm = global_noise_dbm + float(self.centroid_snr_threshold_db)
+                        # Ограничиваемся окном ±halfspan вокруг пика
+                        mask_win = (freqs_hz >= (f_peak - halfspan)) & (freqs_hz <= (f_peak + halfspan))
+                        # Бины над порогом SNR
+                        mask_sig = mask_win & (power_dbm >= thresh_dbm)
+                        if not np.any(mask_sig):
+                            # Fallback: в пределах (max-Δ) дБ
+                            mask_sig = mask_win & (power_dbm >= (p_max_dbm - float(self.centroid_db_down)))
+                        if not np.any(mask_sig):
+                            # Последний fallback: 5 бинов вокруг максимума
+                            left = max(0, idx_max - 2)
+                            right = min(power_dbm.size, idx_max + 3)
+                            mask_sig = np.zeros_like(power_dbm, dtype=bool)
+                            mask_sig[left:right] = True
+
+                        pw_lin = np.power(10.0, power_dbm[mask_sig] / 10.0, dtype=np.float64)
+                        # Защита от нулевой суммы весов
+                        if pw_lin.size == 0 or float(np.sum(pw_lin)) <= 0.0:
+                            f_local = f_peak
+                        else:
+                            f_local = float(np.sum(freqs_hz[mask_sig] * pw_lin) / np.sum(pw_lin))
+                    except Exception:
+                        f_local = f_peak
+                else:
+                    f_local = f_peak
+
+                # Считаем RMS в окне ±halfspan вокруг выбранного центра
+                band_rssi_dbm = float(compute_band_rssi_dbm(freqs_hz, power_dbm, f_local, halfspan))
+
+                # Оценка шума: вне (halfspan + guard) относительно выбранного центра
+                guard_hz = max(0.0, 0.2 * halfspan)
+                mask_out = (freqs_hz < (f_local - (halfspan + guard_hz))) | (freqs_hz > (f_local + (halfspan + guard_hz)))
+                if np.any(mask_out):
+                    band_noise_dbm = float(np.median(power_dbm[mask_out]))
+                else:
+                    band_noise_dbm = float(np.median(power_dbm))
+
+                snr_db = float(band_rssi_dbm - band_noise_dbm)
+
+                measurement = RSSIMeasurement(
+                    slave_id=self.slave_id,
+                    # Совместимость: оставляем исходный центр, локальный уходит в flags
+                    center_hz=float(center_hz),
+                    span_hz=float(span_hz),
+                    band_rssi_dbm=band_rssi_dbm,
+                    band_noise_dbm=band_noise_dbm,
+                    snr_db=snr_db,
+                    n_samples=int(power_dbm.size),
+                    ts=time.time(),
+                    flags={"direct_device": True, "local_center_hz": float(f_local), "local_center_mode": str(self.center_mode)}
+                )
+            except Exception:
+                # В случае ошибки спектра – падение к прямому измерению вокруг master-центра
+                duration_sec = dwell_ms / 1000.0
+                result = self.device.measure_rssi(
+                    center_hz=float(center_hz),
+                    span_hz=float(span_hz),
+                    duration_sec=duration_sec
+                )
+                if result is None:
+                    raise RuntimeError("RSSI measurement returned None")
+                measurement = RSSIMeasurement(
+                    slave_id=self.slave_id,
+                    center_hz=float(center_hz),
+                    span_hz=float(span_hz),
+                    band_rssi_dbm=result.rssi_dbm,
+                    band_noise_dbm=result.noise_floor_dbm,
+                    snr_db=result.snr_db,
+                    n_samples=result.sample_count,
+                    ts=result.timestamp,
+                    flags={"direct_device": True, "local_center_hz": float(f_local)}
+                )
 
             # Update per-slave noise baseline using EMA of measured noise floor
             try:
-                nf = float(result.noise_floor_dbm)
+                nf = float(measurement.band_noise_dbm)
                 self.noise_baseline_dbm = (
                     (1.0 - self._noise_alpha) * self.noise_baseline_dbm + self._noise_alpha * nf
                 )
@@ -494,6 +567,16 @@ class SlaveManager(QObject):
         self.log = logger
         self.slaves: Dict[str, SlaveSDR] = {}
         self._lock = threading.Lock()
+        
+        # Система калибровки и синхронизации
+        self.calibrator = None
+        if CALIBRATION_AVAILABLE:
+            try:
+                self.calibrator = HackRFSyncCalibrator(logger=self.log)
+                self.log.info("Система калибровки HackRF инициализирована")
+            except Exception as e:
+                self.log.warning(f"Не удалось инициализировать калибратор: {e}")
+                self.calibrator = None
 
     def add_slave(self, slave_id: str, uri: str) -> bool:
         try:
@@ -514,6 +597,15 @@ class SlaveManager(QObject):
         except Exception as e:
             self.log.error(f"Add slave failed: {e}")
             return False
+
+    def set_center_mode(self, mode: str):
+        """Устанавливает центр-режим ('fmax'|'centroid') для всех активных слейвов."""
+        m = str(mode).strip().lower()
+        for sl in list(self.slaves.values()):
+            try:
+                sl.set_center_mode(m)
+            except Exception:
+                pass
 
     def remove_slave(self, slave_id: str):
         try:
@@ -696,3 +788,122 @@ class SlaveManager(QObject):
             self.measurement_error.emit(str(msg))
         except Exception:
             pass
+
+    # --- Методы калибровки и синхронизации ---
+    
+    def calibrate_all_slaves(self, master_device) -> bool:
+        """
+        Калибрует все slave устройства относительно master устройства.
+        
+        Args:
+            master_device: Master HackRF устройство для опорных измерений
+            
+        Returns:
+            bool: True если калибровка прошла успешно
+        """
+        if not self.calibrator:
+            self.log.error("Калибратор не инициализирован")
+            return False
+        
+        if not self.slaves:
+            self.log.warning("Нет slave устройств для калибровки")
+            return False
+        
+        self.log.info(f"Начало калибровки {len(self.slaves)} slave устройств")
+        
+        # Подготавливаем словарь устройств для калибровки
+        slave_devices = {}
+        for slave_id, slave_obj in self.slaves.items():
+            if slave_obj.is_initialized and slave_obj.device:
+                # Извлекаем серийный номер из URI
+                serial = slave_obj._parse_serial_from_uri(slave_obj.uri)
+                if serial:
+                    slave_devices[serial] = slave_obj.device
+        
+        if not slave_devices:
+            self.log.error("Нет готовых устройств для калибровки")
+            return False
+        
+        # Выполняем калибровку
+        success = self.calibrator.calibrate_all_slaves(master_device, slave_devices)
+        
+        if success:
+            # Применяем калибровку к устройствам
+            for slave_id, slave_obj in self.slaves.items():
+                if slave_obj.is_initialized and slave_obj.device:
+                    serial = slave_obj._parse_serial_from_uri(slave_obj.uri)
+                    if serial:
+                        self.calibrator.apply_calibration(slave_obj.device, serial)
+            
+            self.log.info("Калибровка завершена и применена ко всем устройствам")
+        
+        return success
+    
+    def setup_synchronized_measurements(self) -> bool:
+        """
+        Настраивает синхронные измерения для всех активных slaves.
+        
+        Returns:
+            bool: True если синхронизация настроена успешно
+        """
+        if not self.calibrator:
+            self.log.warning("Калибратор не доступен, синхронизация отключена")
+            return False
+        
+        active_count = sum(1 for sl in self.slaves.values() 
+                          if sl.is_initialized and not sl.is_disabled())
+        
+        if active_count < 2:
+            self.log.info("Недостаточно устройств для синхронизации")
+            return False
+        
+        return self.calibrator.setup_synchronous_measurement(active_count)
+    
+    def wait_for_sync_start(self) -> bool:
+        """
+        Ожидание синхронного старта измерений.
+        Вызывается каждым slave перед началом измерения.
+        """
+        if self.calibrator:
+            return self.calibrator.wait_for_sync_start()
+        return True
+    
+    def get_calibration_info(self) -> Dict[str, Dict]:
+        """
+        Возвращает информацию о калибровке всех устройств.
+        
+        Returns:
+            Dict: {slave_id: calibration_info}
+        """
+        if not self.calibrator:
+            return {}
+        
+        calibration_info = {}
+        for slave_id, slave_obj in self.slaves.items():
+            serial = slave_obj._parse_serial_from_uri(slave_obj.uri)
+            if serial:
+                info = self.calibrator.get_calibration_info(serial)
+                if info:
+                    calibration_info[slave_id] = info
+        
+        return calibration_info
+    
+    def is_calibration_valid(self, max_age_hours: float = 24.0) -> Dict[str, bool]:
+        """
+        Проверяет актуальность калибровки всех устройств.
+        
+        Returns:
+            Dict: {slave_id: is_valid}
+        """
+        if not self.calibrator:
+            return {}
+        
+        validity = {}
+        for slave_id, slave_obj in self.slaves.items():
+            serial = slave_obj._parse_serial_from_uri(slave_obj.uri)
+            if serial:
+                validity[slave_id] = self.calibrator.is_calibration_valid(serial, max_age_hours)
+            else:
+                validity[slave_id] = False
+        
+        return validity
